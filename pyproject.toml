@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-pdf-remediation"
+version = "0.1.0"
+description = "LLM-first accessibility remediation for fixed-layout archival PDFs"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+  "fonttools>=4.0",
+  "openai>=2.0",
+  "pikepdf>=10.0",
+  "pydantic>=2.8",
+  "PyMuPDF>=1.26",
+]
+
+[project.scripts]
+remediate-pdf = "pdf_accessibility.cli:main"
+remediate-newsletter = "pdf_accessibility.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pdf_accessibility*"]

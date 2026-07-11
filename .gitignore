@@ -1,0 +1,9 @@
+.venv/
+build/
+*.egg-info/
+*.pyc
+__pycache__/
+.DS_Store
+.pytest_cache/
+.env
+/src/*.pdf
