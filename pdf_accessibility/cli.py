@@ -6,40 +6,23 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
-from .compiler import compile_tagged_pdf, merge_column_continuations
+from .compiler import compile_tagged_pdf
 from .extract import extract_page_packets
+from .models import RemediationMode
 from .planner import build_document_plan
-from .validate import write_validation_report
-
-
-def _write_ambiguities(plan, path: Path, threshold: float) -> int:
-    records: list[dict[str, object]] = []
-    for page in plan.pages:
-        for message in page.page_ambiguities:
-            records.append({"page": page.page_number, "type": "page", "message": message})
-        for index, element in enumerate(page.elements):
-            if element.ambiguity or element.confidence < threshold:
-                records.append(
-                    {
-                        "page": page.page_number,
-                        "element": index,
-                        "role": element.role.value,
-                        "confidence": element.confidence,
-                        "message": element.ambiguity or "low-confidence semantic decision",
-                        "chosen_text": element.text[:240],
-                    }
-                )
-    text = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
-    path.write_text(text, encoding="utf-8")
-    return len(records)
+from .plans import load_document_plan, write_document_plan
+from .preflight import inspect_pdf, write_preflight
+from .reporting import build_manifest, wcag_evidence, write_anomaly_reports
+from .validate import release_pdfua, validate_output, write_validation_report
 
 
 def _ensure_ocr_base(source: Path, output: Path, jobs: int) -> None:
     if output.exists():
         return
     if shutil.which("ocrmypdf") is None:
-        raise RuntimeError("--ocr requires the ocrmypdf command")
+        raise RuntimeError("facsimile mode requires the ocrmypdf command")
     temp_dir = output.parent / "ocr-tmp"
     temp_dir.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
@@ -68,83 +51,238 @@ def _ensure_ocr_base(source: Path, output: Path, jobs: int) -> None:
     )
 
 
-def remediate(args: argparse.Namespace) -> int:
-    source = args.input.resolve()
+def _paths(source: Path, output_dir: Path) -> dict[str, Path]:
+    workdir = output_dir.resolve() / source.stem
     stem = source.stem
-    workdir = args.output_dir.resolve() / stem
-    workdir.mkdir(parents=True, exist_ok=True)
-    if args.ocr:
-        base_pdf = workdir / f"{stem}.ocr-base.pdf"
+    return {
+        "workdir": workdir,
+        "preflight": workdir / f"{stem}.preflight.json",
+        "base": workdir / f"{stem}.ocr-base.pdf",
+        "plan": workdir / f"{stem}.plan.json",
+        "draft": workdir / f"{stem}.draft.pdf",
+        "output": workdir / f"{stem}.accessible.pdf",
+        "validation": workdir / f"{stem}.validation.json",
+        "anomalies": workdir / f"{stem}.anomalies.jsonl",
+        "anomaly_html": workdir / f"{stem}.anomalies.html",
+        "wcag": workdir / f"{stem}.wcag.json",
+        "manifest": workdir / f"{stem}.manifest.json",
+    }
+
+
+def preflight_command(args: argparse.Namespace) -> int:
+    source = args.input.resolve()
+    report = inspect_pdf(source, RemediationMode(args.mode))
+    path = _paths(source, args.output_dir)["preflight"]
+    write_preflight(report, path)
+    print(f"mode: {report.selected_mode.value}")
+    for reason in report.reasons:
+        print(f"reason: {reason}")
+    print(f"report: {path}")
+    return 1 if report.selected_mode == RemediationMode.UNSUPPORTED else 0
+
+
+def run_command(args: argparse.Namespace) -> int:
+    source = args.input.resolve()
+    paths = _paths(source, args.output_dir)
+    paths["workdir"].mkdir(parents=True, exist_ok=True)
+    requested_mode = RemediationMode.FACSIMILE if args.ocr else RemediationMode(args.mode)
+    preflight = inspect_pdf(source, requested_mode)
+    write_preflight(preflight, paths["preflight"])
+    if preflight.selected_mode == RemediationMode.UNSUPPORTED:
+        raise RuntimeError("preflight selected unsupported mode: " + "; ".join(preflight.reasons))
+    if preflight.selected_mode == RemediationMode.PASS_THROUGH:
+        report = {
+            "source": str(source),
+            "pass_through": True,
+            "verapdf_pdfua_ok": preflight.pdfua_valid,
+            "released": True,
+            "note": "The input PDF was not modified.",
+        }
+        paths["validation"].write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"pass-through: {source}")
+        print(f"validation: {paths['validation']}")
+        return 0
+
+    if args.base_pdf:
+        base_pdf = args.base_pdf.resolve()
+    elif preflight.selected_mode == RemediationMode.FACSIMILE:
+        base_pdf = paths["base"]
         _ensure_ocr_base(source, base_pdf, args.ocr_jobs)
     else:
-        base_pdf = args.base_pdf.resolve() if args.base_pdf else source
-    plan_path = workdir / f"{stem}.plan.json"
-    output_pdf = workdir / f"{stem}.accessible.pdf"
-    ambiguity_path = workdir / f"{stem}.ambiguities.jsonl"
-    validation_path = workdir / f"{stem}.validation.json"
+        base_pdf = source
 
-    packets = extract_page_packets(source, dpi=args.dpi)
+    packets = extract_page_packets(source, dpi=args.dpi, evidence_pdf=base_pdf)
     if args.max_pages:
         packets = packets[: args.max_pages]
+    planner_model = args.model or args.planner_model
     plan = build_document_plan(
         source=source,
         packets=packets,
-        model=args.model,
-        checkpoint_path=plan_path,
+        checkpoint_path=paths["plan"],
+        planner_model=planner_model,
+        reviewer_model=args.review_model,
+        planner_reasoning=args.planner_reasoning,
+        reviewer_reasoning=args.review_reasoning,
         workers=args.workers,
+        force_replan=args.force_replan,
+        force_review=args.force_review,
     )
-    continuation_records = merge_column_continuations(
-        plan, base_pdf, geometry_source=source
-    )
-    plan_path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
-    ambiguity_count = _write_ambiguities(plan, ambiguity_path, args.ambiguity_threshold)
     geometry_sources = compile_tagged_pdf(
-        base_pdf, output_pdf, plan, geometry_source=source
+        base_pdf, paths["draft"], plan, geometry_source=source, declare_pdfua=False
     )
-    report = write_validation_report(base_pdf, output_pdf, validation_path)
+    write_document_plan(plan, paths["plan"])
+    draft_report = validate_output(base_pdf, paths["draft"], plan)
+    if args.max_pages:
+        validation = dict(draft_report)
+        validation.update(
+            {
+                "verapdf_pdfua_ok": None,
+                "released": False,
+                "release_note": "Partial --max-pages runs produce an undeclared draft only.",
+            }
+        )
+    else:
+        if len(plan.pages) != preflight.page_count:
+            raise RuntimeError(
+                f"canonical plan contains {len(plan.pages)} of {preflight.page_count} source pages"
+            )
+        if paths["output"].exists():
+            shutil.move(paths["output"], paths["output"].with_suffix(".previous.pdf"))
+        validation = release_pdfua(base_pdf, paths["draft"], paths["output"], plan)
+    validation["draft_validation"] = draft_report
+    paths["validation"].write_text(json.dumps(validation, indent=2) + "\n", encoding="utf-8")
 
-    print(f"output: {output_pdf}")
-    print(f"plan: {plan_path}")
-    print(f"ambiguities: {ambiguity_count} ({ambiguity_path})")
-    print(f"column continuations merged: {len(continuation_records)}")
-    print(
-        "geometry pages: "
-        f"original={geometry_sources.count('original')}, ocr={geometry_sources.count('ocr')}"
+    anomalies = write_anomaly_reports(
+        plan,
+        packets,
+        paths["anomalies"],
+        paths["anomaly_html"],
+        args.ambiguity_threshold,
+        paths["workdir"] / "pages",
     )
-    print(f"visual match: {report['visual_match']}")
-    print(f"qpdf valid: {report['qpdf_ok']}")
-    return 0 if report["visual_match"] and report["qpdf_ok"] else 1
+    wcag = wcag_evidence(plan, preflight.selected_mode, validation)
+    paths["wcag"].write_text(json.dumps(wcag, indent=2) + "\n", encoding="utf-8")
+    manifest = build_manifest(
+        source,
+        plan,
+        preflight,
+        packets,
+        planner_model,
+        args.review_model,
+        args.planner_reasoning,
+        args.review_reasoning,
+        validation,
+        paths["workdir"] / "pages",
+        geometry_sources,
+    )
+    paths["manifest"].write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    print(f"draft: {paths['draft']}")
+    print(f"plan: {paths['plan']}")
+    print(f"anomalies: {len(anomalies)} ({paths['anomaly_html']})")
+    print(f"validation: {paths['validation']}")
+    if validation["released"]:
+        print(f"output: {paths['output']}")
+        return 0
+    print("release withheld: machine gates did not all pass; inspect the draft and validation report")
+    return 1
+
+
+def validate_command(args: argparse.Namespace) -> int:
+    plan = load_document_plan(args.plan.resolve())
+    source = args.source.resolve() if args.source else args.pdf.resolve()
+    report = write_validation_report(source, args.pdf.resolve(), args.report.resolve(), plan)
+    print(f"structure matches plan: {report['structure_matches_plan']}")
+    print(f"report: {args.report.resolve()}")
+    return 0 if report["qpdf_ok"] and report["structure_matches_plan"] else 1
+
+
+def report_command(args: argparse.Namespace) -> int:
+    workdir = args.workdir.resolve()
+    plan_path = next(workdir.glob("*.plan.json"))
+    preflight_path = next(workdir.glob("*.preflight.json"))
+    preflight_data = json.loads(preflight_path.read_text(encoding="utf-8"))
+    source = Path(preflight_data["source"])
+    plan = load_document_plan(plan_path, source)
+    packets = extract_page_packets(source, dpi=args.dpi)
+    stem = plan_path.name.removesuffix(".plan.json")
+    records = write_anomaly_reports(
+        plan,
+        packets,
+        workdir / f"{stem}.anomalies.jsonl",
+        workdir / f"{stem}.anomalies.html",
+        args.ambiguity_threshold,
+        workdir / "pages",
+    )
+    print(f"anomalies: {len(records)} ({workdir / f'{stem}.anomalies.html'})")
+    return 0
+
+
+def _add_input_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("input", type=Path)
+    parser.add_argument("--output-dir", type=Path, default=Path("build"))
+    parser.add_argument(
+        "--mode",
+        choices=[mode.value for mode in RemediationMode if mode != RemediationMode.UNSUPPORTED],
+        default=RemediationMode.AUTO.value,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Create an LLM-planned, tagged accessible PDF"
-    )
-    parser.add_argument("input", type=Path)
-    base_group = parser.add_mutually_exclusive_group()
-    base_group.add_argument(
-        "--base-pdf",
-        type=Path,
-        help="PDF whose unchanged pages receive the tags (for example, an OCRmyPDF output)",
-    )
-    base_group.add_argument(
-        "--ocr",
-        action="store_true",
-        help="create or reuse an OCRmyPDF raster base before adding corrected text and tags",
-    )
-    parser.add_argument("--ocr-jobs", type=int, default=4)
-    parser.add_argument("--output-dir", type=Path, default=Path("build"))
-    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"))
-    parser.add_argument("--dpi", type=int, default=150)
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--max-pages", type=int, default=None)
-    parser.add_argument("--ambiguity-threshold", type=float, default=0.8)
+    parser = argparse.ArgumentParser(description="LLM-first accessibility remediation for fixed-layout PDFs")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    preflight_parser = subparsers.add_parser("preflight", help="classify a PDF before remediation")
+    _add_input_options(preflight_parser)
+    preflight_parser.set_defaults(handler=preflight_command)
+
+    run_parser = subparsers.add_parser("run", help="plan, compile, validate, and report")
+    _add_input_options(run_parser)
+    base_group = run_parser.add_mutually_exclusive_group()
+    base_group.add_argument("--base-pdf", type=Path)
+    base_group.add_argument("--ocr", action="store_true", help=argparse.SUPPRESS)
+    run_parser.add_argument("--ocr-jobs", type=int, default=4)
+    run_parser.add_argument("--planner-model", default=os.getenv("OPENAI_PLANNER_MODEL", "gpt-5.6-terra"))
+    run_parser.add_argument("--review-model", default=os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.6-sol"))
+    run_parser.add_argument("--model", default=None, help="deprecated alias for --planner-model")
+    run_parser.add_argument("--planner-reasoning", choices=["low", "medium", "high"], default="medium")
+    run_parser.add_argument("--review-reasoning", choices=["low", "medium", "high"], default="high")
+    run_parser.add_argument("--dpi", type=int, default=150)
+    run_parser.add_argument("--workers", type=int, default=2)
+    run_parser.add_argument("--max-pages", type=int, default=None)
+    run_parser.add_argument("--ambiguity-threshold", type=float, default=0.8)
+    run_parser.add_argument("--force-replan", action="store_true")
+    run_parser.add_argument("--force-review", action="store_true")
+    run_parser.set_defaults(handler=run_command)
+
+    validate_parser = subparsers.add_parser("validate", help="compare a tagged PDF with a canonical plan")
+    validate_parser.add_argument("pdf", type=Path)
+    validate_parser.add_argument("--plan", type=Path, required=True)
+    validate_parser.add_argument("--source", type=Path)
+    validate_parser.add_argument("--report", type=Path, default=Path("validation.json"))
+    validate_parser.set_defaults(handler=validate_command)
+
+    report_parser = subparsers.add_parser("report", help="regenerate anomaly reports for a work directory")
+    report_parser.add_argument("workdir", type=Path)
+    report_parser.add_argument("--dpi", type=int, default=120)
+    report_parser.add_argument("--ambiguity-threshold", type=float, default=0.8)
+    report_parser.set_defaults(handler=report_command)
     return parser
 
 
 def main() -> None:
-    args = build_parser().parse_args()
-    raise SystemExit(remediate(args))
+    argv = sys.argv[1:]
+    commands = {"preflight", "run", "validate", "report"}
+    if argv and argv[0] not in commands and argv[0] not in {"-h", "--help"}:
+        print("warning: direct invocation is deprecated; use 'remediate-pdf run INPUT'", file=sys.stderr)
+        argv.insert(0, "run")
+    args = build_parser().parse_args(argv)
+    try:
+        status = args.handler(args)
+    except RuntimeError as error:
+        print(f"error: {error}", file=sys.stderr)
+        status = 2
+    raise SystemExit(status)
 
 
 if __name__ == "__main__":

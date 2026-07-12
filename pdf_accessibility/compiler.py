@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import textwrap
 import unicodedata
 from dataclasses import dataclass
@@ -13,7 +12,7 @@ import pymupdf
 from fontTools.ttLib import TTFont
 from pikepdf import Array, Dictionary, Name, OutlineItem, Stream, String
 
-from .models import DocumentPlan, ElementRole, PageElement
+from .models import DocumentPlan, ElementRole, PageElement, exact_text_tokens
 
 
 ROLE_NAMES = {
@@ -30,6 +29,7 @@ ROLE_NAMES = {
 class AnchorChunk:
     element: PageElement
     text: str
+    token_text: str
     mcid: int
     offset: int
 
@@ -115,7 +115,7 @@ def _make_anchor_font(pdf: pikepdf.Pdf, plan: DocumentPlan) -> AnchorFont:
         for page in plan.pages
         for element in page.elements
         for character in (
-            element.alt_text if element.role == ElementRole.FIGURE else element.text
+            element.semantic_text
         ) or ""
         if ord(character) <= 0xFFFF
     }
@@ -238,11 +238,6 @@ def _unicode_lines(
     ]
 
 
-def _split_actual_text(text: str) -> list[str]:
-    words = text.split()
-    return [word + "\u00a0" for word in words] or [""]
-
-
 def _token_key(token: str) -> str:
     decomposed = unicodedata.normalize("NFKD", token).lower()
     letters_and_numbers = "".join(
@@ -295,9 +290,9 @@ def _align_corrected_words(
     ocr_words: list[tuple[float, float, float, float, str]],
 ) -> dict[int, list[WordPlacement]]:
     corrected = [
-        (token, chunk.mcid)
+        (chunk.token_text, chunk.mcid)
         for chunk in chunks
-        for token in chunk.text.split()
+        if chunk.token_text
     ]
     ocr_keys = [_token_key(word[4]) for word in ocr_words]
     corrected_keys = [_token_key(token) for token, _ in corrected]
@@ -366,7 +361,7 @@ def _alignment_quality(
     words: list[tuple[float, float, float, float, str]],
 ) -> float:
     corrected_keys = [
-        _token_key(token) for chunk in chunks for token in chunk.text.split()
+        _token_key(chunk.token_text) for chunk in chunks if chunk.token_text
     ]
     word_keys = [_token_key(word[4]) for word in words]
     if not corrected_keys:
@@ -384,6 +379,8 @@ def _select_geometry_words(
     plan: DocumentPlan,
     base_words: list[list[tuple[float, float, float, float, str]]],
     candidate_words: list[list[tuple[float, float, float, float, str]]] | None,
+    primary_label: str = "ocr",
+    candidate_label: str = "native",
 ) -> tuple[
     list[list[tuple[float, float, float, float, str]]],
     list[str],
@@ -400,7 +397,7 @@ def _select_geometry_words(
         )
         if page_plan is None or alternative is None:
             selected.append(primary)
-            sources.append("ocr")
+            sources.append(primary_label)
             continue
         chunks = [
             chunk
@@ -411,10 +408,10 @@ def _select_geometry_words(
         alternative_quality = _alignment_quality(chunks, alternative)
         if alternative_quality > primary_quality:
             selected.append(alternative)
-            sources.append("original")
+            sources.append(candidate_label)
         else:
             selected.append(primary)
-            sources.append("ocr")
+            sources.append(primary_label)
     return selected, sources
 
 
@@ -427,134 +424,22 @@ def _suppress_ocr_text(page: pikepdf.Page) -> bool:
     return suppressed
 
 
-def _is_column_continuation(
-    previous: PageElement,
-    following: PageElement,
-    previous_last_bbox: tuple[float, float, float, float],
-    following_first_bbox: tuple[float, float, float, float],
-    page_width: float,
-    page_height: float,
-) -> bool:
-    if previous.role != ElementRole.P or following.role != ElementRole.P:
-        return False
-    previous_text = previous.text.rstrip()
-    following_text = following.text.lstrip()
-    if len(previous_text.split()) < 8 or not following_text:
-        return False
-    if re.search(r"[.!?](?:[\"'’”\])]+)?$", previous_text):
-        return False
-
-    crosses_columns = (
-        previous_last_bbox[0] < page_width * 0.5
-        and previous_last_bbox[1] > page_height * 0.62
-        and following_first_bbox[0] > page_width * 0.5
-        and following_first_bbox[1] < page_height * 0.45
-    )
-    if not crosses_columns:
-        return False
-
-    starts_lowercase = following_text[0].islower()
-    has_continuation_punctuation = previous_text.endswith((",", ";", ":", "-", "–", "—"))
-    return starts_lowercase or has_continuation_punctuation
-
-
-def merge_column_continuations(
-    plan: DocumentPlan,
-    source: Path,
-    geometry_source: Path | None = None,
-) -> list[dict[str, object]]:
-    base_words = _extract_ocr_words(source)
-    candidate_words = (
-        _extract_ocr_words(geometry_source)
-        if geometry_source and geometry_source.resolve() != source.resolve()
-        else None
-    )
-    words_by_page, _ = _select_geometry_words(plan, base_words, candidate_words)
-    records: list[dict[str, object]] = []
-    with pymupdf.open(source) as document:
-        dimensions = [(page.rect.width, page.rect.height) for page in document]
-
-    for page_plan in plan.pages:
-        page_index = page_plan.page_number - 1
-        if page_index >= len(words_by_page):
-            continue
-        page_width, page_height = dimensions[page_index]
-        while True:
-            chunks_by_element = _page_anchor_chunks(page_plan.elements)
-            all_chunks = [chunk for chunks in chunks_by_element for chunk in chunks]
-            placements = _align_corrected_words(
-                all_chunks, words_by_page[page_index]
-            )
-            boundaries: list[
-                tuple[
-                    tuple[float, float, float, float] | None,
-                    tuple[float, float, float, float] | None,
-                ]
-            ] = []
-            for chunks in chunks_by_element:
-                words = [word for chunk in chunks for word in placements[chunk.mcid]]
-                boundaries.append(
-                    (words[0].bbox if words else None, words[-1].bbox if words else None)
-                )
-
-            merged = False
-            for index in range(len(page_plan.elements) - 1):
-                previous = page_plan.elements[index]
-                following = page_plan.elements[index + 1]
-                _, previous_last = boundaries[index]
-                following_first, _ = boundaries[index + 1]
-                if not previous_last or not following_first:
-                    continue
-                if not _is_column_continuation(
-                    previous,
-                    following,
-                    previous_last,
-                    following_first,
-                    page_width,
-                    page_height,
-                ):
-                    continue
-
-                previous_ending = previous.text[-100:]
-                following_beginning = following.text[:100]
-                previous.text = f"{previous.text.rstrip()} {following.text.lstrip()}"
-                previous.bbox = [
-                    min(previous.bbox[0], following.bbox[0]),
-                    min(previous.bbox[1], following.bbox[1]),
-                    max(previous.bbox[2], following.bbox[2]),
-                    max(previous.bbox[3], following.bbox[3]),
-                ]
-                previous.confidence = min(previous.confidence, following.confidence)
-                page_plan.elements.pop(index + 1)
-                record = {
-                    "page": page_plan.page_number,
-                    "element": index,
-                    "type": "column_continuation",
-                    "previous_ending": previous_ending,
-                    "following_beginning": following_beginning,
-                }
-                records.append(record)
-                page_plan.page_ambiguities.append(
-                    "Merged an incomplete paragraph from the bottom of the left column "
-                    "with its continuation at the top of the right column."
-                )
-                merged = True
-                break
-            if not merged:
-                break
-    return records
-
-
 def _page_anchor_chunks(elements: list[PageElement]) -> list[list[AnchorChunk]]:
     by_element: list[list[AnchorChunk]] = []
     next_mcid = 0
     for element in elements:
-        actual_text = element.alt_text if element.role == ElementRole.FIGURE else element.text
+        actual_text = element.semantic_text
         element_chunks: list[AnchorChunk] = []
-        split_chunks = _split_actual_text(actual_text or "")
-        for offset, chunk in enumerate(split_chunks):
+        tokens = exact_text_tokens(actual_text)
+        for offset, token in enumerate(tokens):
             element_chunks.append(
-                AnchorChunk(element=element, text=chunk, mcid=next_mcid, offset=offset)
+                AnchorChunk(
+                    element=element,
+                    text=actual_text[token.start : token.actual_end],
+                    token_text=token.text,
+                    mcid=next_mcid,
+                    offset=offset,
+                )
             )
             next_mcid += 1
         by_element.append(element_chunks)
@@ -616,11 +501,6 @@ def _anchor_stream(
     return ("\n".join(commands) + "\n").encode("ascii")
 
 
-def _artifact_stream(stream: pikepdf.Stream) -> None:
-    original = stream.read_bytes()
-    stream.write(b"/Artifact BMC\n" + original + b"\nEMC\n")
-
-
 def _make_role_element(
     pdf: pikepdf.Pdf,
     element: PageElement,
@@ -641,7 +521,7 @@ def _make_role_element(
     role_element[Name.K] = content_items
     if element.role == ElementRole.FIGURE:
         role_element[Name.Alt] = String(
-            element.alt_text or "Historical newsletter image"
+            element.alt_text or "Historical document image"
         )
     return role_element, [role_element] * len(chunks)
 
@@ -651,6 +531,7 @@ def compile_tagged_pdf(
     output: Path,
     plan: DocumentPlan,
     geometry_source: Path | None = None,
+    declare_pdfua: bool = False,
 ) -> list[str]:
     base_words = _extract_ocr_words(source)
     candidate_words = (
@@ -659,8 +540,28 @@ def compile_tagged_pdf(
         else None
     )
     geometry_words_by_page, geometry_sources = _select_geometry_words(
-        plan, base_words, candidate_words
+        plan,
+        base_words,
+        candidate_words,
+        primary_label=(
+            "native"
+            if geometry_source and geometry_source.resolve() == source.resolve()
+            else "ocr"
+        ),
+        candidate_label="native",
     )
+    for page_plan in plan.pages:
+        page_index = page_plan.page_number - 1
+        if page_index >= len(geometry_words_by_page):
+            continue
+        chunks = [
+            chunk
+            for element_chunks in _page_anchor_chunks(page_plan.elements)
+            for chunk in element_chunks
+        ]
+        coverage = _alignment_quality(chunks, geometry_words_by_page[page_index])
+        for element in page_plan.elements:
+            element.evidence.alignment_coverage = coverage
     with pikepdf.Pdf.open(source) as pdf:
         anchor_font = _make_anchor_font(pdf, plan)
         structure_root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
@@ -678,24 +579,26 @@ def compile_tagged_pdf(
                 continue
 
             original_contents = _as_contents_array(page.obj.get(Name.Contents))
-            for content_stream in original_contents:
-                _artifact_stream(content_stream)
+            artifact_start = Stream(pdf, b"q\n/Artifact BMC\n")
+            artifact_end = Stream(pdf, b"EMC\nQ\n")
             width = float(page.mediabox[2]) - float(page.mediabox[0])
             height = float(page.mediabox[3]) - float(page.mediabox[1])
             _ensure_anchor_font(page, anchor_font)
             chunks_by_element = _page_anchor_chunks(page_plan.elements)
             all_chunks = [chunk for chunks in chunks_by_element for chunk in chunks]
-            has_ocr_layer = _suppress_ocr_text(page)
+            _suppress_ocr_text(page)
             placements = (
                 _align_corrected_words(all_chunks, geometry_words_by_page[page_index])
-                if has_ocr_layer
+                if geometry_words_by_page[page_index]
                 else None
             )
             anchors = Stream(
                 pdf,
                 _anchor_stream(all_chunks, width, height, anchor_font, placements),
             )
-            page.obj[Name.Contents] = Array([*original_contents, anchors])
+            page.obj[Name.Contents] = Array(
+                [artifact_start, *original_contents, artifact_end, anchors]
+            )
             page.obj[Name.StructParents] = page_index
             page.obj[Name.Tabs] = Name.S
 
@@ -721,7 +624,10 @@ def compile_tagged_pdf(
         with pdf.open_metadata(set_pikepdf_as_editor=False) as metadata:
             metadata["dc:title"] = plan.title
             metadata["dc:language"] = [plan.language]
-            metadata["pdfuaid:part"] = "1"
+            if declare_pdfua:
+                metadata["pdfuaid:part"] = "1"
+            elif "pdfuaid:part" in metadata:
+                del metadata["pdfuaid:part"]
 
         with pdf.open_outline() as outline:
             outline.root.clear()
@@ -732,7 +638,9 @@ def compile_tagged_pdf(
                         ElementRole.H1,
                         ElementRole.H2,
                     }:
-                        outline.root.append(OutlineItem(element.text[:240], page_index))
+                        outline.root.append(
+                            OutlineItem(element.accessible_text[:240], page_index)
+                        )
 
         output.parent.mkdir(parents=True, exist_ok=True)
         pdf.save(output, min_version="1.4", linearize=True)

@@ -4,77 +4,209 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import shutil
 
 from openai import OpenAI
+import pymupdf
+from pydantic import BaseModel, Field
 
+from .evidence import (
+    PageEvidence,
+    PlanningDiagnostics,
+    diagnostics_for,
+    evidence_from_packet,
+    text_agreement,
+)
 from .extract import PagePacket
-from .models import DocumentPlan, ElementRole, PagePlan
+from .models import (
+    DocumentPlan,
+    ElementRole,
+    PagePlan,
+    PageReview,
+    ReviewFinding,
+    ReviewStatus,
+    ConfidenceProfile,
+    TextFragment,
+    TextTransformation,
+    TransformationKind,
+    exact_text_tokens,
+)
+from .plans import load_document_plan, sha256_file, write_document_plan
 
 
-SYSTEM_PROMPT = """You remediate historical fixed-layout PDFs for screen-reader access.
-Transcribe and semantically structure the supplied page without changing, summarizing,
-modernizing, or correcting its authored wording. The page image is authoritative.
-Embedded text is advisory and may contain incorrect characters or reading order.
+PLANNER_PROMPT_VERSION = "proposal-v2"
+REVIEW_PROMPT_VERSION = "review-v2"
 
-Return every meaningful item in exact screen-reader reading order. Use:
-- DocumentTitle only for the document title on its first page.
-- H1 for article titles, H2/H3 for real nested headings, P for body text, bylines,
-  continuations, contents entries, and other meaningful text.
-- Figure for informative photographs, illustrations, charts, or graphical quotations.
-  Give each Figure concise alt text; do not transcribe text inside a Figure into alt text
-  when it also needs to be read as normal text.
-- Omit decorative rules, ornaments, and repeated running headers/footers. Include a page
-  number only when it helps preserve the newsletter's explicit pagination.
+PROPOSAL_SYSTEM_PROMPT = """You propose an accessibility transcription and semantic plan for a
+historical fixed-layout PDF page. The printed page is the historical source of record. Preserve
+its spelling, punctuation, capitalization, names, numbers, formula notation, and authored errors.
+Never silently regularize or correct it.
 
-Join line-broken and hyphenated body copy into natural paragraphs. Preserve intentional
-punctuation, names, dates, mathematical notation, article continuations, and column order.
-Use normalized 0..1000 coordinates for approximate bounding boxes. Assign confidence to
-each decision. Record ambiguity, but always choose a result and continue."""
+For every meaningful item, record visible_text exactly as printed and accessible_text as spoken.
+They should be identical except for a declared mechanical transformation: line-break
+dehyphenation, ligature expansion, soft-hyphen removal, formula spoken equivalent, decorative
+leader omission, or whitespace normalization. Record every such transformation. Native and OCR
+text are evidence only and can be corrupt. Always choose a result, preserve visual page order,
+and record uncertainty in findings rather than stopping.
+
+Use DocumentTitle once on the first page; H1 for article titles; H2/H3 for genuine nested
+headings; P for body copy, bylines, quotations, contents entries, captions, and other meaningful
+text; Figure for meaningful graphics with concise alt text. Omit repeated headers, footers,
+page numbers that add no meaning, and decoration. Join line-broken body copy into paragraphs.
+Use approximate normalized 0..1000 bounding boxes. Give separate transcription, semantic-role,
+geometry, and reading-order confidence values."""
+
+REVIEW_SYSTEM_PROMPT = """You are the independent final semantic reviewer for a historical PDF
+accessibility plan. The page image and printed content are authoritative. Evidence text may be
+corrupt. Inspect the image and evidence before considering the first model's proposal. Return one
+canonical PagePlan, choosing explicitly among plausible readings. Do not modernize, summarize,
+correct spelling, expand abbreviations, or invent obscured words. Preserve visible wording and
+declare every allowed accessibility-only transformation. Preserve visual page order. Findings,
+including critical findings, are advisories: always choose a canonical result and continue.
+Use separate confidence dimensions and log alternatives for names, dates, numbers, URLs,
+formulas, uncertain transcription, roles, geometry, and reading order."""
 
 
-def _page_prompt(packet: PagePacket) -> str:
-    candidate = packet.embedded_text or "(No usable embedded text was recovered.)"
-    return f"""Analyze document page {packet.page_number}.
-Page size: {packet.width:.1f} by {packet.height:.1f} PDF points.
+class ModelPageElement(BaseModel):
+    role: ElementRole
+    visible_fragments: list[TextFragment] = Field(default_factory=list)
+    visible_text: str
+    accessible_text: str
+    transformations: list[TextTransformation] = Field(default_factory=list)
+    alt_text: str | None = None
+    bbox: list[float] = Field(min_length=4, max_length=4)
+    confidence: ConfidenceProfile
+    findings: list[ReviewFinding] = Field(default_factory=list)
 
-Candidate embedded blocks follow. They may be accurate, partially encoded, or garbage.
-Use them to verify spelling only when they agree with the rendered page:
 
-{candidate}
+class ModelPagePlan(BaseModel):
+    page_number: int = Field(ge=1)
+    elements: list[ModelPageElement]
+    page_ambiguities: list[str] = Field(default_factory=list)
+    findings: list[ReviewFinding] = Field(default_factory=list)
+
+
+class ModelReviewDecision(BaseModel):
+    canonical_page: ModelPagePlan
+    findings: list[ReviewFinding] = Field(default_factory=list)
+
+
+class ReviewDecision(BaseModel):
+    canonical_page: PagePlan
+    findings: list[ReviewFinding] = Field(default_factory=list)
+
+
+def _page_prompt(packet: PagePacket, evidence: PageEvidence) -> str:
+    return f"""Analyze page {packet.page_number}, size {packet.width:.1f} by {packet.height:.1f} points.
+
+NATIVE EVIDENCE (advisory):
+{evidence.native_text or '(none)'}
+
+OCR EVIDENCE (advisory):
+{evidence.ocr_text or '(none)'}
 """
 
 
-def plan_page(client: OpenAI, model: str, packet: PagePacket) -> PagePlan:
+def propose_page(
+    client: OpenAI,
+    model: str,
+    reasoning_effort: str,
+    packet: PagePacket,
+    evidence: PageEvidence,
+) -> tuple[PagePlan, str | None]:
     response = client.responses.parse(
         model=model,
+        reasoning={"effort": reasoning_effort},
         input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": PROPOSAL_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": _page_prompt(packet)},
+                    {"type": "input_image", "image_url": packet.image_data_url, "detail": "high"},
+                    {"type": "input_text", "text": _page_prompt(packet, evidence)},
+                ],
+            },
+        ],
+        text_format=ModelPagePlan,
+    )
+    if response.output_parsed is None:
+        raise RuntimeError(f"{model} returned no parsed proposal for page {packet.page_number}")
+    page = PagePlan.model_validate(response.output_parsed.model_dump())
+    page.page_number = packet.page_number
+    page.review_status = ReviewStatus.PROPOSAL
+    for element in page.elements:
+        element.review_status = ReviewStatus.PROPOSAL
+    return page, response.id
+
+
+def review_page(
+    client: OpenAI,
+    model: str,
+    reasoning_effort: str,
+    packet: PagePacket,
+    evidence: PageEvidence,
+    diagnostics: PlanningDiagnostics,
+    proposal: PagePlan,
+) -> tuple[ReviewDecision, str | None]:
+    response = client.responses.parse(
+        model=model,
+        reasoning={"effort": reasoning_effort},
+        input=[
+            {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": packet.image_data_url, "detail": "high"},
                     {
-                        "type": "input_image",
-                        "image_url": packet.image_data_url,
-                        "detail": "high",
+                        "type": "input_text",
+                        "text": (
+                            "EVIDENCE FIRST:\n"
+                            f"Page size: {evidence.width:.1f} by {evidence.height:.1f} points\n"
+                            f"Native word count: {len(evidence.native_words)}\n"
+                            f"OCR word count: {len(evidence.ocr_words)}\n"
+                            f"NATIVE TEXT:\n{evidence.native_text or '(none)'}\n\n"
+                            f"OCR TEXT:\n{evidence.ocr_text or '(none)'}"
+                        ),
+                    },
+                    {
+                        "type": "input_text",
+                        "text": "DETERMINISTIC DIAGNOSTICS:\n" + diagnostics.model_dump_json(indent=2),
+                    },
+                    {
+                        "type": "input_text",
+                        "text": "FIRST-MODEL PROPOSAL:\n"
+                        + json.dumps(
+                            proposal.model_dump(
+                                mode="json",
+                                exclude={
+                                    "elements": {
+                                        "__all__": {"tokens", "evidence", "review_status"}
+                                    }
+                                },
+                            ),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
                     },
                 ],
             },
         ],
-        text_format=PagePlan,
+        text_format=ModelReviewDecision,
     )
     if response.output_parsed is None:
-        raise RuntimeError(f"model returned no parsed plan for page {packet.page_number}")
-    plan = response.output_parsed
-    plan.page_number = packet.page_number
-    return plan
+        raise RuntimeError(f"{model} returned no parsed review for page {packet.page_number}")
+    parsed = response.output_parsed
+    return ReviewDecision(
+        canonical_page=PagePlan.model_validate(parsed.canonical_page.model_dump()),
+        findings=parsed.findings,
+    ), response.id
 
 
 def infer_title(source: Path, pages: list[PagePlan]) -> str:
     for page in pages:
         for element in page.elements:
             if element.role == ElementRole.DOCUMENT_TITLE:
-                return element.text.strip()
+                return element.accessible_text.strip()
     return source.stem.replace("_", " ").strip().title()
 
 
@@ -86,10 +218,22 @@ def normalize_document_pages(source: Path, pages: list[PagePlan]) -> list[PagePl
     for page in pages:
         cleaned = []
         for element in page.elements:
-            if element.text.lower().startswith(("inside this issue", "contents ")):
-                element.text = re.sub(r"(?:\s*\.\s*){3,}", " ", element.text)
-                element.text = " ".join(element.text.split())
-            text = " ".join(element.text.lower().split())
+            if element.accessible_text.lower().startswith(("inside this issue", "contents ")):
+                original = element.accessible_text
+                normalized = re.sub(r"(?:\s*\.\s*){3,}", " ", original)
+                normalized = " ".join(normalized.split())
+                if normalized != original:
+                    element.accessible_text = normalized
+                    element.tokens = exact_text_tokens(normalized)
+                    element.transformations.append(
+                        TextTransformation(
+                            kind=TransformationKind.DECORATIVE_LEADER_OMISSION,
+                            source_text=original,
+                            replacement_text=normalized,
+                            rationale="Dot leaders are visual navigation and create noisy speech.",
+                        )
+                    )
+            text = " ".join(element.accessible_text.lower().split())
             is_running_header = (
                 (normalized_title and normalized_title in text and "spring" in text)
                 or "univ of florida mathematics newsletter" in text
@@ -117,45 +261,220 @@ def normalize_document_pages(source: Path, pages: list[PagePlan]) -> list[PagePl
     return pages
 
 
+def _read_page_artifact(
+    path: Path, key: str, source_hash: str
+) -> tuple[PagePlan, str | None]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("source_sha256") not in {None, source_hash}:
+        raise RuntimeError(f"checkpoint {path} belongs to a different source PDF")
+    if key in data:
+        return PagePlan.model_validate(data[key]), data.get("response_id")
+    return PagePlan.model_validate(data), None
+
+
+def _write_once(path: Path, data: dict[str, object]) -> None:
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _archive(path: Path) -> None:
+    if path.exists():
+        destination = path.with_suffix(path.suffix + ".previous")
+        shutil.copy2(path, destination)
+        path.unlink()
+
+
 def build_document_plan(
     source: Path,
     packets: list[PagePacket],
-    model: str,
     checkpoint_path: Path,
+    planner_model: str = "gpt-5.6-terra",
+    reviewer_model: str = "gpt-5.6-sol",
+    planner_reasoning: str = "medium",
+    reviewer_reasoning: str = "high",
     workers: int = 2,
+    force_replan: bool = False,
+    force_review: bool = False,
 ) -> DocumentPlan:
-    existing: dict[int, PagePlan] = {}
-    if checkpoint_path.exists():
-        data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-        existing = {p["page_number"]: PagePlan.model_validate(p) for p in data.get("pages", [])}
+    source_hash = sha256_file(source)
+    with pymupdf.open(source) as source_document:
+        source_page_count = source_document.page_count
+    requested_pages = {packet.page_number for packet in packets}
+    legacy_pages: dict[int, PagePlan] = {}
+    if checkpoint_path.exists() and not force_replan:
+        existing_plan = load_document_plan(checkpoint_path, source)
+        if existing_plan.source_sha256 and existing_plan.source_sha256 != source_hash:
+            raise RuntimeError("saved plan source hash does not match the input PDF")
+        existing_pages = {page.page_number for page in existing_plan.pages}
+        if (
+            existing_plan.review_status
+            in {ReviewStatus.MODEL_REVIEWED, ReviewStatus.MANUAL_MODIFIED}
+            and requested_pages <= existing_pages
+            and not force_review
+        ):
+            return existing_plan
+        legacy_pages = {page.page_number: page for page in existing_plan.pages}
+    elif force_replan:
+        _archive(checkpoint_path)
 
-    pending = [packet for packet in packets if packet.page_number not in existing]
-    def save_checkpoint() -> None:
-        ordered = [existing[key] for key in sorted(existing)]
-        payload = {
-            "source_file": source.name,
-            "title": infer_title(source, ordered),
-            "language": "en-US",
-            "pages": [page.model_dump(mode="json") for page in ordered],
+    page_dir = checkpoint_path.parent / "pages"
+    page_dir.mkdir(parents=True, exist_ok=True)
+    client = OpenAI()
+    packet_by_page = {packet.page_number: packet for packet in packets}
+    evidence_by_page = {number: evidence_from_packet(packet) for number, packet in packet_by_page.items()}
+    proposals: dict[int, tuple[PagePlan, str | None]] = {}
+
+    for number, evidence in evidence_by_page.items():
+        evidence_path = page_dir / f"{number:04d}.evidence.json"
+        if evidence_path.exists():
+            saved_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            if saved_evidence.get("source_sha256") not in {None, source_hash}:
+                raise RuntimeError(
+                    f"checkpoint {evidence_path} belongs to a different source PDF"
+                )
+        _write_once(
+            evidence_path,
+            {
+                "schema_version": 2,
+                "source_sha256": source_hash,
+                "evidence": evidence.model_dump(mode="json"),
+            },
+        )
+        proposal_path = page_dir / f"{number:04d}.proposal.json"
+        if force_replan:
+            _archive(proposal_path)
+        if proposal_path.exists():
+            proposals[number] = _read_page_artifact(
+                proposal_path, "proposal", source_hash
+            )
+        elif number in legacy_pages:
+            proposals[number] = (legacy_pages[number], None)
+            _write_once(
+                proposal_path,
+                {
+                    "schema_version": 2,
+                    "source_sha256": source_hash,
+                    "model": "legacy-plan-migration",
+                    "response_id": None,
+                    "prompt_version": "legacy-v1",
+                    "proposal": legacy_pages[number].model_dump(mode="json"),
+                },
+            )
+
+    pending = [number for number in sorted(packet_by_page) if number not in proposals]
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = {
+            executor.submit(
+                propose_page,
+                client,
+                planner_model,
+                planner_reasoning,
+                packet_by_page[number],
+                evidence_by_page[number],
+            ): number
+            for number in pending
         }
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        for future in as_completed(futures):
+            number = futures[future]
+            proposal, response_id = future.result()
+            proposals[number] = (proposal, response_id)
+            _write_once(
+                page_dir / f"{number:04d}.proposal.json",
+                {
+                    "schema_version": 2,
+                    "source_sha256": source_hash,
+                    "model": planner_model,
+                    "reasoning_effort": planner_reasoning,
+                    "response_id": response_id,
+                    "prompt_version": PLANNER_PROMPT_VERSION,
+                    "proposal": proposal.model_dump(mode="json"),
+                },
+            )
+            print(f"proposed page {number}/{len(packets)}")
 
-    if pending:
-        client = OpenAI()
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-            futures = {executor.submit(plan_page, client, model, packet): packet for packet in pending}
-            for future in as_completed(futures):
-                packet = futures[future]
-                plan = future.result()
-                existing[packet.page_number] = plan
-                save_checkpoint()
-                print(f"planned page {packet.page_number}/{len(packets)}")
+    reviews: dict[int, PageReview] = {}
+    for number in sorted(packet_by_page):
+        review_path = page_dir / f"{number:04d}.review.json"
+        if force_review or force_replan:
+            _archive(review_path)
+        if review_path.exists():
+            data = json.loads(review_path.read_text(encoding="utf-8"))
+            if data.get("source_sha256") not in {None, source_hash}:
+                raise RuntimeError(f"checkpoint {review_path} belongs to a different source PDF")
+            reviews[number] = PageReview.model_validate(data.get("review", data))
 
-    pages = normalize_document_pages(source, [existing[key] for key in sorted(existing)])
-    return DocumentPlan(
+    pending_reviews = [number for number in sorted(packet_by_page) if number not in reviews]
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = {}
+        for number in pending_reviews:
+            proposal, _ = proposals[number]
+            diagnostics = diagnostics_for(proposal, evidence_by_page[number])
+            futures[
+                executor.submit(
+                    review_page,
+                    client,
+                    reviewer_model,
+                    reviewer_reasoning,
+                    packet_by_page[number],
+                    evidence_by_page[number],
+                    diagnostics,
+                    proposal,
+                )
+            ] = (number, diagnostics)
+        for future in as_completed(futures):
+            number, diagnostics = futures[future]
+            decision, response_id = future.result()
+            canonical = decision.canonical_page
+            canonical.page_number = number
+            canonical.review_status = ReviewStatus.MODEL_REVIEWED
+            proposal, proposal_response_id = proposals[number]
+            planner_reviewer_agreement = text_agreement(
+                "\n".join(element.semantic_text for element in proposal.elements),
+                "\n".join(element.semantic_text for element in canonical.elements),
+            )
+            for element in canonical.elements:
+                element.review_status = ReviewStatus.MODEL_REVIEWED
+                element.evidence.native_agreement = diagnostics.proposal_native_agreement
+                element.evidence.ocr_agreement = diagnostics.proposal_ocr_agreement
+                element.evidence.planner_reviewer_agreement = planner_reviewer_agreement
+            review = PageReview(
+                page_number=number,
+                canonical_page=canonical,
+                findings=decision.findings,
+                proposal_model=planner_model,
+                reviewer_model=reviewer_model,
+                proposal_response_id=proposal_response_id,
+                reviewer_response_id=response_id,
+            )
+            reviews[number] = review
+            _write_once(
+                page_dir / f"{number:04d}.review.json",
+                {
+                    "schema_version": 2,
+                    "source_sha256": source_hash,
+                    "model": reviewer_model,
+                    "reasoning_effort": reviewer_reasoning,
+                    "response_id": response_id,
+                    "prompt_version": REVIEW_PROMPT_VERSION,
+                    "review": review.model_dump(mode="json"),
+                },
+            )
+            print(f"reviewed page {number}/{len(packets)}")
+
+    pages = normalize_document_pages(
+        source, [reviews[number].canonical_page for number in sorted(reviews)]
+    )
+    plan = DocumentPlan(
         source_file=source.name,
+        source_sha256=source_hash,
+        source_page_count=source_page_count,
         title=infer_title(source, pages),
         language="en-US",
         pages=pages,
+        review_status=ReviewStatus.MODEL_REVIEWED,
+        plan_revision=2,
     )
+    write_document_plan(plan, checkpoint_path)
+    return plan

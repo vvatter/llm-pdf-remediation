@@ -1,25 +1,23 @@
 # LLM-First PDF Accessibility Remediation
 
-See [APPROACH.md](APPROACH.md) for a detailed description of the architecture, design
-decisions, validation strategy, tradeoffs, and lessons from the proof of concept.
+This project adds a deterministic semantic layer to visually fixed archival PDFs. A
+vision model proposes a transcription and reading order, a second model reviews every
+page, and ordinary Python code owns PDF structure, fonts, MCIDs, metadata, validation,
+and serialization. The original visible page is not redesigned.
 
-This project uses a vision-capable OpenAI model to transcribe and order historical
-fixed-layout document pages, then writes a tagged PDF without changing the selected
-visible page base. The included proof corpus consists of departmental newsletters, but
-the planning, alignment, compilation, and validation pipeline is intended to be general.
+The current corpus is departmental newsletters, but the pipeline is organized around
+fixed-layout PDFs rather than newsletter-specific file formats. See
+[APPROACH.md](APPROACH.md) for the architecture, trust model, validation gates, and known
+limitations.
 
-The proof of concept preserves each visible page as an artifact and adds ordered,
-invisible Unicode text runs in marked-content sequences. The accessibility font is an
-embedded Noto Sans TrueType font with explicit glyph and `/ToUnicode` maps. Long semantic
-elements remain paragraph-level tags whose ordered content references point to individual
-word MCIDs. Each word carries the exact model-approved transcript through `/ActualText`.
-It currently supports headings, paragraphs, figures, alternative text, reading order,
-document language, title metadata, ambiguity logging, and conservative merging of
-paragraphs that continue from the bottom of a left column to the top of a right column.
+## Requirements
 
-The default model is `gpt-5.4-mini`; set `OPENAI_MODEL` or pass `--model` to override it.
-
-## Setup
+- Python 3.11 or later
+- `qpdf`
+- `veraPDF`
+- `ocrmypdf` and Tesseract for facsimile mode
+- `OPENAI_API_KEY`
+- An open TrueType font such as Noto Sans or DejaVu Sans
 
 ```sh
 python3 -m venv .venv
@@ -27,72 +25,89 @@ python3 -m venv .venv
 source ~/.zshrc  # or otherwise export OPENAI_API_KEY
 ```
 
-## Run
+The default model pair is deliberately fixed:
+
+- Proposal: `gpt-5.6-terra`, medium reasoning
+- Independent review: `gpt-5.6-sol`, high reasoning
+
+Override these with `--planner-model`, `--review-model`, or the
+`OPENAI_PLANNER_MODEL` and `OPENAI_REVIEW_MODEL` environment variables. There is no
+automatic fallback to another model.
+
+## Commands
+
+Preflight selects pass-through, native-preserving, facsimile, or unsupported mode and
+saves its evidence:
 
 ```sh
-.venv/bin/remediate-pdf src/96_newsletter.pdf --ocr
-.venv/bin/remediate-pdf src/2004_newsletter.pdf --ocr
+.venv/bin/remediate-pdf preflight src/document.pdf
 ```
 
-`--ocr` creates a visually equivalent raster base with OCRmyPDF, uses its word boxes to
-position the corrected LLM transcript, and suppresses Tesseract's uncorrected text form.
-The base is cached under `build/<source-name>/` for subsequent runs. This path is used for
-all newsletters, including PDFs that already contain selectable legacy text.
-OCRmyPDF's image optimization is enabled to limit the size increase from rasterization;
-lossy JBIG2 character substitution is deliberately not enabled.
-
-When the original PDF already has usable native text, the compiler compares its word
-geometry with OCRmyPDF's geometry page by page and uses the better-aligned source. Every
-marked-content sequence also carries the canonical LLM `/ActualText`, so assistive
-technology does not need to reconstruct words from fitted glyph positions.
-
-After planning, the pipeline uses those same word boxes to merge incomplete cross-column
-paragraph fragments. Each automatic merge is recorded in the ambiguity log and does not
-require interactive review.
-
-The equivalent explicit two-step form is:
+Run the complete pipeline:
 
 ```sh
-mkdir -p build/ocr-tmp build/96_newsletter
-TMPDIR="$PWD/build/ocr-tmp" ocrmypdf \
-  --force-ocr --output-type pdf --optimize 3 --jpeg-quality 88 --png-quality 90 \
-  --jobs 4 --oversample 300 \
-  src/96_newsletter.pdf build/96_newsletter/96_newsletter.ocr-base.pdf
-.venv/bin/remediate-pdf src/96_newsletter.pdf \
-  --base-pdf build/96_newsletter/96_newsletter.ocr-base.pdf
+.venv/bin/remediate-pdf run src/document.pdf
 ```
 
-`A11Y_FONT_PATH` can point to another open TrueType font when Noto Sans or DejaVu Sans
-is not installed in one of the compiler's standard locations.
-
-For a short API and compiler test:
+Force a mode only when the preflight result has been reviewed:
 
 ```sh
-.venv/bin/remediate-pdf src/96_newsletter.pdf --max-pages 1
+.venv/bin/remediate-pdf run src/document.pdf --mode native
+.venv/bin/remediate-pdf run src/document.pdf --mode facsimile
 ```
 
-Outputs are checkpointed under `build/<source-name>/`. Re-running resumes from the
-existing plan. Delete the plan JSON to request fresh model results.
+Re-run model stages explicitly:
 
-The validation report checks qpdf syntax and exact rendered-pixel equality against the
-selected base PDF. It does not replace PAC, veraPDF, Acrobat, or human screen-reader
-testing.
+```sh
+.venv/bin/remediate-pdf run src/document.pdf --force-review
+.venv/bin/remediate-pdf run src/document.pdf --force-replan
+```
 
-## Current proof-of-concept results
+Validate an existing candidate against its canonical plan or regenerate the read-only
+anomaly report:
 
-Both example newsletters have complete page plans and generated PDFs under `build/`.
-Their rendered page pixels exactly match their OCR bases, qpdf reports no syntax errors,
-and all semantic elements carry `/ActualText` or `/Alt` payloads. Pages from both OCR
-bases were also visually inspected against their sources.
+```sh
+.venv/bin/remediate-pdf validate build/document/document.draft.pdf \
+  --plan build/document/document.plan.json --source src/document.pdf
+.venv/bin/remediate-pdf report build/document
+```
 
-An open-source veraPDF 1.30.2 PDF/UA-1 run is saved as `build/verapdf-ua1.json`:
+The old direct invocation remains available with a deprecation warning. `--ocr` is a
+compatibility alias for `--mode facsimile`.
 
-- `96_newsletter`: compliant; 106 rules pass and zero checks fail.
-- `2004_newsletter`: compliant; 106 rules pass and zero checks fail.
+## Outputs
 
-Acrobat Read Out Loud and human screen-reader testing remain separate acceptance checks.
+Each input receives a work directory under `build/` containing:
+
+- `*.preflight.json`: source classification and font/text evidence
+- `pages/*.evidence.json`: native and OCR evidence
+- `pages/*.proposal.json`: immutable Terra proposal checkpoint
+- `pages/*.review.json`: immutable Sol decision checkpoint
+- `*.plan.json`: schema-v2 canonical plan used by the compiler
+- `*.draft.pdf`: tagged draft without a PDF/UA declaration
+- `*.accessible.pdf`: published only after every machine gate passes
+- `*.validation.json`: render, qpdf, structure-tree, and veraPDF results
+- `*.anomalies.jsonl` and `*.anomalies.html`: nonblocking review advisories
+- `*.wcag.json`: per-criterion WCAG 2.1 AA evidence matrix
+- `*.manifest.json`: hashes, models, prompts, tools, font, and compiler strategy
+
+Old schema-v1 plans migrate automatically. The original is preserved as
+`*.plan.legacy.json`. Existing reviewed or manually modified canonical plans are not
+overwritten unless a force option is supplied.
+
+## Release Semantics
+
+The compiler first creates an undeclared draft. It then verifies exact rendered-page
+equality, qpdf integrity, every MCID and ParentTree relationship, and an exact
+element-by-element structure-tree transcript. Only a temporary candidate receives
+`pdfuaid:part=1`. The final accessible filename is published only if veraPDF PDF/UA-1
+also passes.
+
+Model findings, including critical findings, are logged but do not interrupt a batch.
+They remain visible in the anomaly report. Human approval, NVDA or JAWS testing, Acrobat
+reflow, and manual WCAG checks are still needed for an institutional conformance claim.
 
 ## License
 
-This project is licensed under the GNU Affero General Public License v3.0 or later.
-Third-party dependencies and external tools retain their own licenses.
+GNU Affero General Public License v3.0 or later. Third-party tools retain their own
+licenses.
