@@ -6,7 +6,7 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class ElementRole(str, Enum):
@@ -24,6 +24,12 @@ class RemediationMode(str, Enum):
     NATIVE = "native"
     FACSIMILE = "facsimile"
     UNSUPPORTED = "unsupported"
+
+
+class CoordinateSpace(str, Enum):
+    NORMALIZED = "normalized_0_1000"
+    PDF_POINTS = "pdf_points"
+    UNKNOWN = "unknown"
 
 
 class ReviewSeverity(str, Enum):
@@ -45,7 +51,40 @@ class TransformationKind(str, Enum):
     SOFT_HYPHEN_REMOVAL = "soft_hyphen_removal"
     FORMULA_SPOKEN_EQUIVALENT = "formula_spoken_equivalent"
     DECORATIVE_LEADER_OMISSION = "decorative_leader_omission"
+    DECORATIVE_MARKER_OMISSION = "decorative_marker_omission"
+    STRUCTURAL_SEPARATOR_NORMALIZATION = "structural_separator_normalization"
     WHITESPACE_NORMALIZATION = "whitespace_normalization"
+    UNVERIFIED = "unverified"
+
+
+class FindingCategory(str, Enum):
+    TRANSCRIPTION = "transcription"
+    NAME = "name"
+    DATE_NUMBER = "date_number"
+    FORMULA = "formula"
+    GEOMETRY = "geometry"
+    READING_ORDER = "reading_order"
+    SEMANTIC_ROLE = "semantic_role"
+    CONTINUATION = "continuation"
+    DECORATION = "decoration"
+    ARTIFACT = "artifact"
+    ALT_TEXT = "alt_text"
+    EVIDENCE = "evidence"
+    TRANSFORMATION = "transformation"
+    CONTENT_COVERAGE = "content_coverage"
+    LOW_CONFIDENCE = "low_confidence"
+    MODEL_DISAGREEMENT = "model_disagreement"
+    LEGACY_AMBIGUITY = "legacy_ambiguity"
+    PAGE = "page"
+    OTHER = "other"
+
+
+class ArtifactReason(str, Enum):
+    PAGE_NUMBER = "page_number"
+    RUNNING_FURNITURE = "running_furniture"
+    DECORATION = "decoration"
+    WRITING_LINE = "writing_line"
+    OTHER = "other"
 
 
 class TextFragment(BaseModel):
@@ -59,6 +98,10 @@ class TextTransformation(BaseModel):
     source_text: str
     replacement_text: str
     rationale: str
+    source_start: int | None = Field(default=None, ge=0)
+    source_end: int | None = Field(default=None, ge=0)
+    target_start: int | None = Field(default=None, ge=0)
+    target_end: int | None = Field(default=None, ge=0)
 
 
 class ConfidenceProfile(BaseModel):
@@ -86,10 +129,75 @@ class EvidenceMetrics(BaseModel):
 
 class ReviewFinding(BaseModel):
     severity: ReviewSeverity
-    category: str
+    category: FindingCategory
     message: str
     alternatives: list[str] = Field(default_factory=list)
     chosen: str | None = None
+    original_category: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_category(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        raw = str(data.get("category", "other"))
+        normalized = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+        direct = {category.value for category in FindingCategory}
+        if normalized in direct:
+            data["category"] = normalized
+            return data
+
+        if any(term in normalized for term in ("reading", "column")):
+            category = FindingCategory.READING_ORDER
+        elif any(term in normalized for term in ("geometry", "coordinate")):
+            category = FindingCategory.GEOMETRY
+        elif any(term in normalized for term in ("role", "caption", "page_type")):
+            category = FindingCategory.SEMANTIC_ROLE
+        elif any(term in normalized for term in ("formula", "currency", "math")):
+            category = FindingCategory.FORMULA
+        elif any(term in normalized for term in ("date", "number", "pagination", "address")):
+            category = FindingCategory.DATE_NUMBER
+        elif any(term in normalized for term in ("name", "place", "institution")):
+            category = FindingCategory.NAME
+        elif any(term in normalized for term in ("continu", "paragraph_structure")):
+            category = FindingCategory.CONTINUATION
+        elif any(term in normalized for term in ("decor", "ornament", "footer", "furniture", "running")):
+            category = FindingCategory.DECORATION
+        elif any(term in normalized for term in ("alt_text", "figure", "graphic")):
+            category = FindingCategory.ALT_TEXT
+        elif any(term in normalized for term in ("transform", "hyphen", "spacing", "ligature")):
+            category = FindingCategory.TRANSFORMATION
+        elif any(term in normalized for term in ("evidence", "ocr", "source_reliability")):
+            category = FindingCategory.EVIDENCE
+        elif any(term in normalized for term in ("omission", "coverage", "content_scope")):
+            category = FindingCategory.CONTENT_COVERAGE
+        elif any(
+            term in normalized
+            for term in (
+                "transcription",
+                "spelling",
+                "wording",
+                "punctuation",
+                "capitalization",
+                "abbreviation",
+                "typography",
+                "glyph",
+            )
+        ):
+            category = FindingCategory.TRANSCRIPTION
+        else:
+            category = FindingCategory.OTHER
+        data["category"] = category.value
+        data.setdefault("original_category", raw)
+        return data
+
+
+class ArtifactRecord(BaseModel):
+    id: str = ""
+    reason: ArtifactReason
+    bbox: list[float] = Field(min_length=4, max_length=4)
+    text: str = ""
 
 
 class TextToken(BaseModel):
@@ -169,8 +277,6 @@ class PageElement(BaseModel):
             self.accessible_text = self.visible_text
         if not self.visible_fragments and self.visible_text:
             self.visible_fragments = [TextFragment(text=self.visible_text, bbox=self.bbox)]
-        if self.role == ElementRole.FIGURE and not self.alt_text:
-            self.alt_text = "Historical document image"
         if self.role != ElementRole.FIGURE and not self.accessible_text.strip():
             raise ValueError("non-figure elements require accessible text")
         token_text = self.alt_text or "" if self.role == ElementRole.FIGURE else self.accessible_text
@@ -202,9 +308,11 @@ class PageElement(BaseModel):
 
 class PagePlan(BaseModel):
     page_number: int = Field(ge=1)
+    coordinate_space: CoordinateSpace = CoordinateSpace.UNKNOWN
     elements: list[PageElement] = Field(
         description="Elements in the exact logical reading order for assistive technology"
     )
+    artifacts: list[ArtifactRecord] = Field(default_factory=list)
     page_ambiguities: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
     review_status: ReviewStatus = ReviewStatus.PROPOSAL
@@ -214,6 +322,9 @@ class PagePlan(BaseModel):
         for index, element in enumerate(self.elements, start=1):
             if not element.id:
                 element.id = f"p{self.page_number:04d}-e{index:04d}"
+        for index, artifact in enumerate(self.artifacts, start=1):
+            if not artifact.id:
+                artifact.id = f"p{self.page_number:04d}-a{index:04d}"
         return self
 
 

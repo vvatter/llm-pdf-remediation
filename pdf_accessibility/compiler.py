@@ -520,10 +520,29 @@ def _make_role_element(
     )
     role_element[Name.K] = content_items
     if element.role == ElementRole.FIGURE:
-        role_element[Name.Alt] = String(
-            element.alt_text or "Historical document image"
-        )
+        role_element[Name.Alt] = String(element.alt_text or "")
     return role_element, [role_element] * len(chunks)
+
+
+def _placement_bbox(
+    chunks: list[AnchorChunk],
+    placements: dict[int, list[WordPlacement]],
+    width: float,
+    height: float,
+) -> list[float] | None:
+    boxes = [
+        placement.bbox
+        for chunk in chunks
+        for placement in placements.get(chunk.mcid, [])
+    ]
+    if not boxes:
+        return None
+    return [
+        round(min(box[0] for box in boxes) / width * 1000, 3),
+        round(min(box[1] for box in boxes) / height * 1000, 3),
+        round(max(box[2] for box in boxes) / width * 1000, 3),
+        round(max(box[3] for box in boxes) / height * 1000, 3),
+    ]
 
 
 def compile_tagged_pdf(
@@ -592,6 +611,15 @@ def compile_tagged_pdf(
                 if geometry_words_by_page[page_index]
                 else None
             )
+            if placements:
+                for element, chunks in zip(
+                    page_plan.elements, chunks_by_element, strict=True
+                ):
+                    if element.role == ElementRole.FIGURE:
+                        continue
+                    derived_bbox = _placement_bbox(chunks, placements, width, height)
+                    if derived_bbox:
+                        element.bbox = derived_bbox
             anchors = Stream(
                 pdf,
                 _anchor_stream(all_chunks, width, height, anchor_font, placements),
@@ -620,6 +648,9 @@ def compile_tagged_pdf(
         pdf.Root[Name.MarkInfo] = Dictionary(Marked=True)
         pdf.Root[Name.Lang] = String(plan.language)
         pdf.Root[Name.ViewerPreferences] = Dictionary(DisplayDocTitle=True)
+        pdf.Root[Name.PageLabels] = Dictionary(
+            Nums=Array([0, Dictionary(S=Name("/D"), St=1)])
+        )
         pdf.docinfo[Name.Title] = String(plan.title)
         with pdf.open_metadata(set_pikepdf_as_editor=False) as metadata:
             metadata["dc:title"] = plan.title

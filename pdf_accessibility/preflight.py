@@ -34,6 +34,7 @@ class PreflightReport(BaseModel):
     source: str
     source_sha256: str
     requested_mode: RemediationMode
+    automatic_mode: RemediationMode
     selected_mode: RemediationMode
     page_count: int
     encrypted: bool
@@ -215,6 +216,7 @@ def inspect_pdf(
         source=str(source),
         source_sha256=sha256_file(source),
         requested_mode=requested_mode,
+        automatic_mode=automatic,
         selected_mode=selected,
         page_count=len(pages),
         encrypted=encrypted,

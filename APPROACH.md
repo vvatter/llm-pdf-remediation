@@ -15,7 +15,8 @@ The data model distinguishes:
 2. **Accessible text:** the spoken form, normally identical to the visible text.
 3. **Declared transformations:** narrow mechanical changes such as line-break
    dehyphenation, ligature expansion, soft-hyphen removal, formula speech, decorative
-   leader omission, or whitespace normalization.
+   leader/marker omission, structural separator normalization, or whitespace
+   normalization.
 4. **Canonical reviewed plan:** the exact input accepted by the deterministic compiler.
 
 Each element records four confidence dimensions: transcription, semantic role,
@@ -72,18 +73,22 @@ Preflight records the source SHA-256, encryption state, qpdf result, renderabili
 count, blank pages, native text coverage, invalid-character ratios, font embedding,
 font encodings, existing tags, and existing PDF/UA validity.
 
-Automatic classification is conservative:
+Automatic classification and execution are conservative:
 
 - **Pass-through:** the input already has tags and passes veraPDF PDF/UA-1. It is
   validated and left byte-for-byte unchanged.
-- **Native:** at least 95% of nonblank pages have usable native text and all used fonts
-  are embedded with a reliable encoding.
+- **Native candidate:** at least 95% of nonblank pages have usable native text and all
+  used fonts are embedded with a reliable encoding. The current batch-safe policy still
+  compiles this as facsimile unless `--native-experimental` is supplied, because the
+  existing native text is not yet incorporated into the new structure tree and ordinary
+  extractors otherwise report it in addition to the semantic anchors.
 - **Facsimile:** the PDF renders but legacy fonts, mappings, or text extraction make the
   native content unsafe. OCRmyPDF creates an optimized raster base.
 - **Unsupported:** encryption, structural damage, or render failure prevents safe work.
 
-An operator can override the selected mode, and the override is recorded. This is useful
-for unusual files but does not erase the failed automatic criteria.
+An operator can override the selected mode, and the override is recorded. Experimental
+native mode requires both `--mode native` and `--native-experimental`; the extraction
+compatibility gate still measures the result.
 
 Native mode preserves the source page objects. Facsimile mode uses OCRmyPDF with forced
 OCR, 300 DPI oversampling, and conservative image optimization. Lossy JBIG2 substitution
@@ -118,7 +123,7 @@ source/page hashes are retained in the build record.
 
 ## Canonical Schema
 
-Schema version 2 gives every element a stable `pNNNN-eNNNN` identifier and records:
+Schema version 3 gives every element a stable `pNNNN-eNNNN` identifier and records:
 
 - visible fragments and their evidence references;
 - exact visible and accessible text;
@@ -130,15 +135,26 @@ Schema version 2 gives every element a stable `pNNNN-eNNNN` identifier and recor
 - review status;
 - deterministic word offsets.
 
+Every page declares its coordinate space. Model output is constrained to
+`normalized_0_1000`, OCR/native evidence boxes are normalized before prompting, and
+legacy schema-v2 point boxes are deterministically migrated. The compiler replaces
+non-figure element boxes with the union of aligned word evidence when available.
+
+Artifacts are explicit records with a bounding box and reason. The deterministic
+post-review pass currently identifies printed page numbers, repeated top/bottom
+furniture, writing lines, and small decorative figures. These items remain visible in
+the page facsimile but do not enter the semantic reading stream.
+
 Word offsets are computed from the exact accessible string. For each non-whitespace
 token, the model stores `start`, `end`, and `actual_end`, where `actual_end` reaches to
 the next token. Concatenating `text[start:actual_end]` exactly reconstructs punctuation,
 newlines, nonbreaking spaces, and other joiners. This replaces the earlier practice of
 appending a generic space to every word.
 
-Schema-v1 plans migrate automatically and are marked `legacy_unreviewed`. Their original
-JSON is backed up. The next ordinary run can use each legacy page as a proposal and put
-it through the independent review stage.
+Schema-v1 plans migrate automatically and are marked `legacy_unreviewed`. Reviewed
+schema-v2 plans retain their approval while their point-space geometry is migrated.
+Original JSON is backed up. The next ordinary run can use each schema-v1 page as a
+proposal and put it through the independent review stage.
 
 ## Deterministic Compilation
 
@@ -156,6 +172,7 @@ It:
 - creates paragraph- or heading-level structure elements owning ordered MCRs;
 - builds the ParentTree and page `StructParents` values;
 - adds `/Tabs /S`, document language, title, viewer preference, and bookmarks.
+- adds decimal PDF page labels matching the printed pagination.
 
 The word-level strategy is an Acrobat compatibility profile, not part of the semantic
 plan. It is recorded in the manifest so another compiler strategy can be compared later
@@ -179,15 +196,22 @@ The draft deliberately omits the PDF/UA identification metadata. Validation then
 7. Verifies every ParentTree entry and detects missing, duplicate, or orphan MCIDs.
 8. Requires nonempty semantic elements and alternate text for figures.
 9. Compares role and exact element text with the canonical plan.
+10. Reconstructs accessible text from exact transformation source/target spans.
+11. Compares Poppler `pdftotext -raw` tokens with the canonical transcript and rejects
+    duplicated or substantially missing ordinary extraction.
+12. Samples original-to-base renders at 72 and 150 DPI and requires every page's mean
+    normalized channel difference to be at most 0.05 and material-difference fraction
+    to be at most 0.25.
 
 Only after these checks does a temporary candidate receive `pdfuaid:part=1`. veraPDF
 then runs its PDF/UA-1 profile. The accessible output path is published only if all
 machine checks pass. On failure, the temporary candidate is discarded and the
 undeclared draft plus validation report remain.
 
-The structure serializer is the deterministic reading-order test. `pdftotext` and
-Acrobat Read Out Loud remain useful compatibility regressions, but neither proves that
-assistive technology will traverse the tag tree correctly.
+The structure serializer is the deterministic reading-order test. `pdftotext` is also a
+release compatibility gate because it exposed native-layer duplication. Acrobat Read
+Out Loud remains a useful compatibility regression, but neither proves that assistive
+technology will traverse the tag tree correctly.
 
 ## Reports and Acceptance Evidence
 
@@ -213,7 +237,8 @@ dates, formulas, alternative text, and high-severity findings.
 
 The present roles are `DocumentTitle`, `H1`, `H2`, `H3`, `P`, and `Figure`. The next
 semantic layer should add a document-level article graph plus captions, lists, table of
-contents entries, formulas, quotations, references, explicit artifacts, and page labels.
+contents entries, formulas, quotations, and references. Explicit artifacts and page
+labels are now implemented.
 
 Other deferred work includes region/line dynamic-programming alignment, a write-back
 human reviewer, PAC automation, formal NVDA/JAWS scripts, native image-object tagging,

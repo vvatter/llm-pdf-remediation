@@ -12,10 +12,14 @@ import pymupdf
 
 from pdf_accessibility.compiler import compile_tagged_pdf
 from pdf_accessibility.models import (
+    ArtifactReason,
+    CoordinateSpace,
     DocumentPlan,
     ElementRole,
     PageElement,
     PagePlan,
+    ReviewStatus,
+    TransformationKind,
     exact_text_tokens,
 )
 from pdf_accessibility.plans import load_document_plan
@@ -29,6 +33,7 @@ from pdf_accessibility.planner import (
     propose_page,
     review_page,
 )
+from pdf_accessibility.refine import refine_document_plan, transformation_errors
 from pdf_accessibility.validate import (
     add_pdfua_declaration,
     plan_is_approved,
@@ -139,7 +144,7 @@ class CompileTests(unittest.TestCase):
                 ],
             )
             compile_tagged_pdf(source, output, plan)
-            report = validate_output(source, output, plan)
+            report = validate_output(source, output, plan, reference_source=source)
 
             self.assertTrue(report["visual_match"])
             self.assertTrue(report["qpdf_ok"])
@@ -149,6 +154,9 @@ class CompileTests(unittest.TestCase):
             self.assertGreaterEqual(report["bookmark_count"], 1)
             self.assertTrue(report["structure_matches_plan"])
             self.assertFalse(report["declares_pdfua"])
+            self.assertFalse(report["extraction_compatible"])
+            self.assertTrue(report["transformations_valid"])
+            self.assertTrue(report["source_visual_fidelity_ok"])
             extracted = subprocess.run(
                 ["pdftotext", str(output), "-"],
                 capture_output=True,
@@ -164,6 +172,7 @@ class CompileTests(unittest.TestCase):
                 self.assertTrue(pdf.Root.MarkInfo.Marked)
                 self.assertEqual(str(pdf.Root.Lang), "en-US")
                 self.assertEqual(str(pdf.pages[0].obj.Tabs), "/S")
+                self.assertIn("/PageLabels", pdf.Root)
                 anchor_font = pdf.pages[0].Resources.Font.A11yAnchor
                 self.assertEqual(str(anchor_font.Subtype), "/Type0")
                 self.assertIn("/ToUnicode", anchor_font)
@@ -262,12 +271,147 @@ class PlanMigrationTests(unittest.TestCase):
 
             plan = load_document_plan(path)
 
-            self.assertEqual(plan.schema_version, 2)
+            self.assertEqual(plan.schema_version, 3)
             self.assertEqual(plan.pages[0].elements[0].visible_text, "Authored sucess.")
             self.assertEqual(plan.pages[0].elements[0].accessible_text, "Authored sucess.")
             self.assertTrue(path.with_suffix(".legacy.json").exists())
             self.assertEqual(plan.pages[0].elements[0].id, "p0001-e0001")
             self.assertFalse(plan_is_approved(plan))
+
+    def test_migrates_reviewed_v2_geometry_without_revoking_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "reviewed.plan.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "source_file": "sample.pdf",
+                        "title": "Sample",
+                        "review_status": "model_reviewed",
+                        "pages": [
+                            {
+                                "page_number": 1,
+                                "review_status": "model_reviewed",
+                                "elements": [
+                                    {
+                                        "role": "P",
+                                        "visible_text": "Text",
+                                        "accessible_text": "Text",
+                                        "bbox": [36, 72, 200, 90],
+                                        "review_status": "model_reviewed",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            plan = load_document_plan(path)
+
+            self.assertEqual(plan.schema_version, 3)
+            self.assertEqual(plan.pages[0].coordinate_space, CoordinateSpace.PDF_POINTS)
+            self.assertTrue(plan_is_approved(plan))
+
+
+class DeterministicRefinementTests(unittest.TestCase):
+    def test_normalizes_geometry_and_records_repeated_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page(width=612, height=792)
+            document.new_page(width=612, height=792)
+            document.save(source)
+            document.close()
+
+            footer = "Little by Little, Department of Mathematics, Volume 20, Spring 2007"
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Sample",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        coordinate_space=CoordinateSpace.PDF_POINTS,
+                        elements=[
+                            element(ElementRole.P, "Body", top=100),
+                            PageElement(role=ElementRole.P, text="1", bbox=[36, 765, 43, 776]),
+                            PageElement(role=ElementRole.P, text=footer, bbox=[72, 765, 500, 776]),
+                            PageElement(
+                                role=ElementRole.FIGURE,
+                                alt_text="Historical document image",
+                                bbox=[558, 658, 576, 672],
+                            ),
+                        ],
+                    ),
+                    PagePlan(
+                        page_number=2,
+                        coordinate_space=CoordinateSpace.PDF_POINTS,
+                        elements=[
+                            element(ElementRole.P, "More body", top=100),
+                            PageElement(role=ElementRole.P, text="2", bbox=[36, 765, 43, 776]),
+                            PageElement(role=ElementRole.P, text=footer, bbox=[72, 765, 500, 776]),
+                            PageElement(role=ElementRole.P, text=". . . . . . . .", bbox=[72, 300, 500, 340]),
+                        ],
+                    ),
+                ],
+            )
+
+            refine_document_plan(source, plan)
+
+            self.assertTrue(
+                all(page.coordinate_space == CoordinateSpace.NORMALIZED for page in plan.pages)
+            )
+            reasons = [artifact.reason for page in plan.pages for artifact in page.artifacts]
+            self.assertEqual(reasons.count(ArtifactReason.PAGE_NUMBER), 2)
+            self.assertEqual(reasons.count(ArtifactReason.RUNNING_FURNITURE), 2)
+            self.assertIn(ArtifactReason.DECORATION, reasons)
+            self.assertIn(ArtifactReason.WRITING_LINE, reasons)
+            self.assertTrue(
+                all(0 <= value <= 1000 for page in plan.pages for element in page.elements for value in element.bbox)
+            )
+
+    def test_transformations_have_exact_reconstructable_spans(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page(width=612, height=792)
+            document.save(source)
+            document.close()
+            dehyphenated = PageElement(
+                role=ElementRole.P,
+                visible_text="mathe-\nmatics",
+                accessible_text="mathematics",
+                bbox=[100, 100, 900, 200],
+                review_status=ReviewStatus.MODEL_REVIEWED,
+            )
+            unverified = PageElement(
+                role=ElementRole.P,
+                visible_text="sucess",
+                accessible_text="success",
+                bbox=[100, 300, 900, 400],
+                review_status=ReviewStatus.MODEL_REVIEWED,
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Sample",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        coordinate_space=CoordinateSpace.NORMALIZED,
+                        elements=[dehyphenated, unverified],
+                    )
+                ],
+            )
+
+            refine_document_plan(source, plan)
+
+            self.assertEqual(
+                dehyphenated.transformations[0].kind,
+                TransformationKind.LINE_BREAK_DEHYPHENATION,
+            )
+            self.assertEqual(unverified.transformations[0].kind, TransformationKind.UNVERIFIED)
+            self.assertEqual(transformation_errors(plan), [])
 
 
 class ModelPipelineTests(unittest.TestCase):

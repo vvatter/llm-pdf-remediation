@@ -6,7 +6,7 @@ from difflib import SequenceMatcher
 from pydantic import BaseModel, Field
 
 from .extract import PagePacket
-from .models import PagePlan
+from .models import CoordinateSpace, PagePlan
 
 
 class WordEvidence(BaseModel):
@@ -18,6 +18,7 @@ class PageEvidence(BaseModel):
     page_number: int
     width: float
     height: float
+    coordinate_space: CoordinateSpace = CoordinateSpace.NORMALIZED
     native_text: str
     ocr_text: str
     native_words: list[WordEvidence]
@@ -32,14 +33,27 @@ class PlanningDiagnostics(BaseModel):
 
 
 def evidence_from_packet(packet: PagePacket) -> PageEvidence:
+    def normalized(word: tuple[float, float, float, float, str]) -> WordEvidence:
+        x0, y0, x1, y1, text = word
+        return WordEvidence(
+            bbox=[
+                x0 / packet.width * 1000,
+                y0 / packet.height * 1000,
+                x1 / packet.width * 1000,
+                y1 / packet.height * 1000,
+            ],
+            text=text,
+        )
+
     return PageEvidence(
         page_number=packet.page_number,
         width=packet.width,
         height=packet.height,
         native_text=packet.embedded_text,
         ocr_text=packet.ocr_text,
-        native_words=[WordEvidence(bbox=list(word[:4]), text=word[4]) for word in packet.native_words],
-        ocr_words=[WordEvidence(bbox=list(word[:4]), text=word[4]) for word in packet.ocr_words],
+        coordinate_space=CoordinateSpace.NORMALIZED,
+        native_words=[normalized(word) for word in packet.native_words],
+        ocr_words=[normalized(word) for word in packet.ocr_words],
     )
 
 

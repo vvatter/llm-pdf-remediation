@@ -5,6 +5,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import shutil
+from typing import Literal
 
 from openai import OpenAI
 import pymupdf
@@ -20,6 +21,8 @@ from .evidence import (
 from .extract import PagePacket
 from .models import (
     DocumentPlan,
+    ArtifactReason,
+    ArtifactRecord,
     ElementRole,
     PagePlan,
     PageReview,
@@ -34,8 +37,8 @@ from .models import (
 from .plans import load_document_plan, sha256_file, write_document_plan
 
 
-PLANNER_PROMPT_VERSION = "proposal-v2"
-REVIEW_PROMPT_VERSION = "review-v2"
+PLANNER_PROMPT_VERSION = "proposal-v3"
+REVIEW_PROMPT_VERSION = "review-v3"
 
 PROPOSAL_SYSTEM_PROMPT = """You propose an accessibility transcription and semantic plan for a
 historical fixed-layout PDF page. The printed page is the historical source of record. Preserve
@@ -45,7 +48,8 @@ Never silently regularize or correct it.
 For every meaningful item, record visible_text exactly as printed and accessible_text as spoken.
 They should be identical except for a declared mechanical transformation: line-break
 dehyphenation, ligature expansion, soft-hyphen removal, formula spoken equivalent, decorative
-leader omission, or whitespace normalization. Record every such transformation. Native and OCR
+leader/marker omission, structural separator normalization, or whitespace normalization. Record
+every such transformation. Native and OCR
 text are evidence only and can be corrupt. Always choose a result, preserve visual page order,
 and record uncertainty in findings rather than stopping.
 
@@ -53,8 +57,10 @@ Use DocumentTitle once on the first page; H1 for article titles; H2/H3 for genui
 headings; P for body copy, bylines, quotations, contents entries, captions, and other meaningful
 text; Figure for meaningful graphics with concise alt text. Omit repeated headers, footers,
 page numbers that add no meaning, and decoration. Join line-broken body copy into paragraphs.
-Use approximate normalized 0..1000 bounding boxes. Give separate transcription, semantic-role,
-geometry, and reading-order confidence values."""
+Every bbox must use normalized_0_1000 coordinates: left and right are percentages of page width
+times 1000; top and bottom are percentages of page height times 1000. Never return PDF points or
+image pixels. Give separate transcription, semantic-role, geometry, and reading-order confidence
+values."""
 
 REVIEW_SYSTEM_PROMPT = """You are the independent final semantic reviewer for a historical PDF
 accessibility plan. The page image and printed content are authoritative. Evidence text may be
@@ -81,6 +87,7 @@ class ModelPageElement(BaseModel):
 
 class ModelPagePlan(BaseModel):
     page_number: int = Field(ge=1)
+    coordinate_space: Literal["normalized_0_1000"] = "normalized_0_1000"
     elements: list[ModelPageElement]
     page_ambiguities: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
@@ -162,6 +169,7 @@ def review_page(
                         "text": (
                             "EVIDENCE FIRST:\n"
                             f"Page size: {evidence.width:.1f} by {evidence.height:.1f} points\n"
+                            "Canonical bbox coordinate space: normalized_0_1000 only\n"
                             f"Native word count: {len(evidence.native_words)}\n"
                             f"OCR word count: {len(evidence.ocr_words)}\n"
                             f"NATIVE TEXT:\n{evidence.native_text or '(none)'}\n\n"
@@ -244,10 +252,24 @@ def normalize_document_pages(source: Path, pages: list[PagePlan]) -> list[PagePl
                 if page.page_number == 1 and not kept_document_title:
                     kept_document_title = True
                 elif is_running_header:
+                    page.artifacts.append(
+                        ArtifactRecord(
+                            reason=ArtifactReason.RUNNING_FURNITURE,
+                            bbox=element.bbox,
+                            text=element.visible_text or element.accessible_text,
+                        )
+                    )
                     continue
                 else:
                     element.role = ElementRole.H1
             elif is_running_header and element.bbox[1] < 180:
+                page.artifacts.append(
+                    ArtifactRecord(
+                        reason=ArtifactReason.RUNNING_FURNITURE,
+                        bbox=element.bbox,
+                        text=element.visible_text or element.accessible_text,
+                    )
+                )
                 continue
 
             if (
@@ -255,6 +277,13 @@ def normalize_document_pages(source: Path, pages: list[PagePlan]) -> list[PagePl
                 and element.alt_text
                 and any(word in element.alt_text.lower() for word in ("decorative", "flourish", "ornament"))
             ):
+                page.artifacts.append(
+                    ArtifactRecord(
+                        reason=ArtifactReason.DECORATION,
+                        bbox=element.bbox,
+                        text=element.alt_text,
+                    )
+                )
                 continue
             cleaned.append(element)
         page.elements = cleaned

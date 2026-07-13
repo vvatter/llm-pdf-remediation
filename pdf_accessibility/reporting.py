@@ -11,7 +11,7 @@ import subprocess
 
 from .compiler import _find_anchor_font
 from .extract import PagePacket
-from .models import DocumentPlan, RemediationMode
+from .models import DocumentPlan, FindingCategory, RemediationMode
 from .plans import plan_sha256, sha256_file
 from .preflight import PreflightReport
 
@@ -34,7 +34,7 @@ def collect_anomalies(plan: DocumentPlan, threshold: float = 0.8) -> list[dict[s
     records: list[dict[str, object]] = []
     for page in plan.pages:
         for message in page.page_ambiguities:
-            records.append({"page": page.page_number, "severity": "warning", "category": "page", "message": message})
+            records.append({"page": page.page_number, "severity": "warning", "category": FindingCategory.PAGE.value, "message": message})
         for finding in page.findings:
             records.append({"page": page.page_number, **finding.model_dump(mode="json")})
         for element in page.elements:
@@ -54,25 +54,41 @@ def collect_anomalies(plan: DocumentPlan, threshold: float = 0.8) -> list[dict[s
                         "element_id": element.id,
                         "role": element.role.value,
                         "severity": "warning",
-                        "category": "low_confidence",
+                        "category": FindingCategory.LOW_CONFIDENCE.value,
                         "message": "One or more confidence dimensions are below threshold.",
                         "confidence": element.confidence.model_dump(),
                         "chosen": element.semantic_text[:300],
                     }
                 )
-            if element.evidence.planner_reviewer_agreement is not None and element.evidence.planner_reviewer_agreement < 0.9:
-                records.append(
-                    {
-                        "page": page.page_number,
-                        "element_id": element.id,
-                        "severity": "info",
-                        "category": "model_disagreement",
-                        "message": "The proposal and canonical review differ materially.",
-                        "agreement": element.evidence.planner_reviewer_agreement,
-                        "chosen": element.semantic_text[:300],
-                    }
-                )
-    return records
+        agreements = [
+            element.evidence.planner_reviewer_agreement
+            for element in page.elements
+            if element.evidence.planner_reviewer_agreement is not None
+        ]
+        if agreements and min(agreements) < 0.9:
+            records.append(
+                {
+                    "page": page.page_number,
+                    "severity": "info",
+                    "category": FindingCategory.MODEL_DISAGREEMENT.value,
+                    "message": "The proposal and canonical review differ materially on this page.",
+                    "agreement": min(agreements),
+                }
+            )
+    deduplicated: list[dict[str, object]] = []
+    seen: set[tuple[object, ...]] = set()
+    for record in records:
+        key = (
+            record.get("page"),
+            record.get("element_id"),
+            record.get("severity"),
+            record.get("category"),
+            " ".join(str(record.get("message", "")).split()),
+        )
+        if key not in seen:
+            seen.add(key)
+            deduplicated.append(record)
+    return deduplicated
 
 
 def write_anomaly_reports(
@@ -102,12 +118,19 @@ def write_anomaly_reports(
             if packet
             else ""
         )
-        entries = "".join(
+        priority_entries = "".join(
             f"<li><strong>{html.escape(str(item.get('severity', 'info')))}: "
             f"{html.escape(str(item.get('category', 'finding')))}</strong> "
             f"{html.escape(str(item.get('message', '')))}"
             f"<pre>{html.escape(json.dumps(item, ensure_ascii=False, indent=2))}</pre></li>"
             for item in by_page[page_number]
+            if item.get("severity") != "info"
+        )
+        info_entries = "".join(
+            f"<li><strong>{html.escape(str(item.get('category', 'finding')))}</strong> "
+            f"{html.escape(str(item.get('message', '')))}</li>"
+            for item in by_page[page_number]
+            if item.get("severity") == "info"
         )
         canonical = "\n\n".join(
             f"[{element.role.value}] {element.semantic_text}"
@@ -143,13 +166,15 @@ def write_anomaly_reports(
             else ""
         )
         details = (
+            (f"<details><summary>Informational findings ({sum(item.get('severity') == 'info' for item in by_page[page_number])})</summary><ul>{info_entries}</ul></details>" if info_entries else "")
+            +
             f"<details open><summary>Canonical transcript</summary><pre>{html.escape(canonical)}</pre></details>"
             f"<details><summary>Proposal/review diff</summary><pre>{html.escape(diff or '(no difference)')}</pre></details>"
             f"<details><summary>Native and OCR evidence</summary><pre>{html.escape(evidence_text)}</pre></details>"
         )
         sections.append(
             f"<section><h2>Page {page_number}</h2><div class=\"columns\"><div>{image}</div>"
-            f"<div><ol>{entries}</ol>{details}</div></div></section>"
+            f"<div><ol>{priority_entries}</ol>{details}</div></div></section>"
         )
     html_path.write_text(
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Remediation anomalies</title>"
@@ -240,8 +265,8 @@ def build_manifest(
         "plan_schema_version": plan.schema_version,
         "mode": preflight.selected_mode.value,
         "models": {
-            "proposal": {"id": planner_model, "reasoning_effort": planner_reasoning, "prompt_version": "proposal-v2"},
-            "review": {"id": reviewer_model, "reasoning_effort": reviewer_reasoning, "prompt_version": "review-v2"},
+            "proposal": {"id": planner_model, "reasoning_effort": planner_reasoning, "prompt_version": "proposal-v3"},
+            "review": {"id": reviewer_model, "reasoning_effort": reviewer_reasoning, "prompt_version": "review-v3"},
         },
         "responses": responses,
         "ocr": {
@@ -269,7 +294,10 @@ def build_manifest(
         "validation": {
             "released": validation.get("released", False),
             "visual_match": validation.get("visual_match"),
+            "source_visual_fidelity_ok": validation.get("source_visual_fidelity_ok"),
             "structure_matches_plan": validation.get("structure_matches_plan"),
+            "extraction_compatible": validation.get("extraction_compatible"),
+            "transformations_valid": validation.get("transformations_valid"),
             "verapdf_pdfua_ok": validation.get("verapdf_pdfua_ok"),
         },
     }

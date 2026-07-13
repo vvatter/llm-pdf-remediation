@@ -14,6 +14,7 @@ from .models import RemediationMode
 from .planner import build_document_plan
 from .plans import load_document_plan, write_document_plan
 from .preflight import inspect_pdf, write_preflight
+from .refine import refine_document_plan
 from .reporting import build_manifest, wcag_evidence, write_anomaly_reports
 from .validate import release_pdfua, validate_output, write_validation_report
 
@@ -69,9 +70,27 @@ def _paths(source: Path, output_dir: Path) -> dict[str, Path]:
     }
 
 
+def _apply_native_policy(report, native_experimental: bool) -> None:
+    if report.selected_mode != RemediationMode.NATIVE or native_experimental:
+        return
+    if report.requested_mode == RemediationMode.NATIVE:
+        report.selected_mode = RemediationMode.UNSUPPORTED
+        report.reasons.append(
+            "Native mode is experimental because existing text may duplicate semantic anchors; "
+            "rerun with --native-experimental to accept that risk."
+        )
+    else:
+        report.selected_mode = RemediationMode.FACSIMILE
+        report.reasons.append(
+            "Batch-safe policy changed automatic native mode to facsimile; native mode remains "
+            "available with --native-experimental."
+        )
+
+
 def preflight_command(args: argparse.Namespace) -> int:
     source = args.input.resolve()
     report = inspect_pdf(source, RemediationMode(args.mode))
+    _apply_native_policy(report, args.native_experimental)
     path = _paths(source, args.output_dir)["preflight"]
     write_preflight(report, path)
     print(f"mode: {report.selected_mode.value}")
@@ -87,6 +106,7 @@ def run_command(args: argparse.Namespace) -> int:
     paths["workdir"].mkdir(parents=True, exist_ok=True)
     requested_mode = RemediationMode.FACSIMILE if args.ocr else RemediationMode(args.mode)
     preflight = inspect_pdf(source, requested_mode)
+    _apply_native_policy(preflight, args.native_experimental)
     write_preflight(preflight, paths["preflight"])
     if preflight.selected_mode == RemediationMode.UNSUPPORTED:
         raise RuntimeError("preflight selected unsupported mode: " + "; ".join(preflight.reasons))
@@ -127,11 +147,14 @@ def run_command(args: argparse.Namespace) -> int:
         force_replan=args.force_replan,
         force_review=args.force_review,
     )
+    refine_document_plan(source, plan)
     geometry_sources = compile_tagged_pdf(
         base_pdf, paths["draft"], plan, geometry_source=source, declare_pdfua=False
     )
     write_document_plan(plan, paths["plan"])
-    draft_report = validate_output(base_pdf, paths["draft"], plan)
+    draft_report = validate_output(
+        base_pdf, paths["draft"], plan, reference_source=source
+    )
     if args.max_pages:
         validation = dict(draft_report)
         validation.update(
@@ -148,7 +171,13 @@ def run_command(args: argparse.Namespace) -> int:
             )
         if paths["output"].exists():
             shutil.move(paths["output"], paths["output"].with_suffix(".previous.pdf"))
-        validation = release_pdfua(base_pdf, paths["draft"], paths["output"], plan)
+        validation = release_pdfua(
+            base_pdf,
+            paths["draft"],
+            paths["output"],
+            plan,
+            reference_source=source,
+        )
     validation["draft_validation"] = draft_report
     paths["validation"].write_text(json.dumps(validation, indent=2) + "\n", encoding="utf-8")
 
@@ -193,8 +222,16 @@ def validate_command(args: argparse.Namespace) -> int:
     source = args.source.resolve() if args.source else args.pdf.resolve()
     report = write_validation_report(source, args.pdf.resolve(), args.report.resolve(), plan)
     print(f"structure matches plan: {report['structure_matches_plan']}")
+    print(f"extraction compatible: {report['extraction_compatible']}")
     print(f"report: {args.report.resolve()}")
-    return 0 if report["qpdf_ok"] and report["structure_matches_plan"] else 1
+    return 0 if all(
+        [
+            report["qpdf_ok"],
+            report["structure_matches_plan"],
+            report["transformations_valid"],
+            report["extraction_compatible"],
+        ]
+    ) else 1
 
 
 def report_command(args: argparse.Namespace) -> int:
@@ -225,6 +262,11 @@ def _add_input_options(parser: argparse.ArgumentParser) -> None:
         "--mode",
         choices=[mode.value for mode in RemediationMode if mode != RemediationMode.UNSUPPORTED],
         default=RemediationMode.AUTO.value,
+    )
+    parser.add_argument(
+        "--native-experimental",
+        action="store_true",
+        help="allow native mode despite possible duplicate ordinary text extraction",
     )
 
 
