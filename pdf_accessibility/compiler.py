@@ -912,7 +912,7 @@ def _element_structure_regions(
         fragment_chunks = _chunks_by_fragment(element, chunks)
         groups = fragment_region_groups(element.visible_fragments)
         if len(groups) > 1:
-            regions = []
+            candidate_regions = []
             for group in groups:
                 grouped_chunks = [
                     chunk
@@ -920,13 +920,19 @@ def _element_structure_regions(
                     for chunk in fragment_chunks[fragment_index][1]
                 ]
                 if grouped_chunks:
-                    regions.append(
+                    candidate_regions.append(
                         (
                             element.visible_fragments[group[0]].id,
                             grouped_chunks,
                             [element.visible_fragments[index] for index in group],
                         )
                     )
+            if "".join(
+                chunk.text
+                for _, region_chunks, _ in candidate_regions
+                for chunk in region_chunks
+            ) == "".join(chunk.text for chunk in chunks):
+                regions = candidate_regions
     return regions
 
 

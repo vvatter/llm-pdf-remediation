@@ -15,8 +15,9 @@ continue from one column to another. The compiler uses those blocks for local ge
 and emits them in reviewed tag-tree order; disjoint paragraph continuations receive
 consecutive direct `/P` regions because Acrobat reverses or loses independently placed
 MCIDs when they share one paragraph parent. This preserves clicking and order at the
-cost of a longer pause between fragments. Each region owns one PDF MCID and one ordered
-content stream. Corrected Unicode text is
+cost of a longer pause between fragments. When visual columns must be interleaved to
+preserve the approved transcript, the compiler instead retains one ordered region.
+Each region owns one PDF MCID and one ordered content stream. Corrected Unicode text is
 encoded directly in line-level strings positioned from OCR/native word geometry; the
 facsimile page remains visually unchanged underneath. `/ActualText` is reserved for
 the uncommon character that the embedded font cannot represent. Figures use structural

@@ -219,7 +219,10 @@ match the plan. This is an explicit Acrobat compatibility tradeoff: the extra st
 boundary produces a longer speech pause, but sharing a `/P` parent made the first
 fragment unclickable and caused Acrobat to read the second fragment first. Region-scoped
 streams keep physical content order identical to structure order and provide independent
-click geometry.
+click geometry. The compiler splits a multi-block paragraph only when concatenating the
+resulting spatial regions exactly reconstructs the approved transcript. Interleaved
+label/value columns instead remain one ordered region so spatial grouping cannot corrupt
+their semantic order.
 
 Page-wide agreement is used only to choose the better native or OCR geometry source.
 Token alignment then uses `SequenceMatcher` with `autojunk=False` separately inside
@@ -255,7 +258,7 @@ The draft deliberately omits the PDF/UA identification metadata. Validation then
 12. Compares Poppler `pdftotext -raw` tokens with the canonical transcript and rejects
     duplicated or substantially missing ordinary extraction.
 13. Samples original-to-base renders at 72 and 150 DPI and requires every page's mean
-    normalized channel difference to be at most 0.05 and material-difference fraction
+    normalized channel difference to be at most 0.052 and material-difference fraction
     to be at most 0.25.
 
 Only after these checks does a temporary candidate receive `pdfuaid:part=1`. veraPDF

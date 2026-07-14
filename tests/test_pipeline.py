@@ -329,6 +329,54 @@ class CompileTests(unittest.TestCase):
             )
             self.assertEqual(compare_structure_to_plan(serialized, plan), [])
 
+    def test_interleaved_multiblock_text_remains_one_ordered_region(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=100, height=100)
+            document.save(source)
+            document.close()
+            paragraph = PageElement(
+                role=ElementRole.P,
+                visible_fragments=[
+                    TextFragment(
+                        text="Chair",
+                        bbox=[0, 0, 400, 200],
+                    ),
+                    TextFragment(
+                        text="Joseph Glover",
+                        bbox=[500, 0, 900, 200],
+                    ),
+                    TextFragment(
+                        text="Editor",
+                        bbox=[0, 210, 400, 400],
+                    ),
+                    TextFragment(
+                        text="Paul Ehrlich",
+                        bbox=[500, 210, 900, 400],
+                    ),
+                ],
+                visible_text="Chair Joseph Glover. Editor Paul Ehrlich.",
+                accessible_text="Chair Joseph Glover. Editor Paul Ehrlich.",
+                bbox=[0, 0, 900, 900],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Interleaved regions",
+                pages=[PagePlan(page_number=1, elements=[paragraph])],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+
+            serialized = serialize_structure_tree(output)
+            self.assertEqual(len(serialized["elements"]), 1)
+            self.assertEqual(
+                serialized["elements"][0]["text"],
+                "Chair Joseph Glover. Editor Paul Ehrlich.",
+            )
+            self.assertEqual(compare_structure_to_plan(serialized, plan), [])
+
     def test_direct_unicode_stream_uses_ocr_line_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"
