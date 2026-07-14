@@ -15,6 +15,7 @@ from .models import (
     ElementRole,
     FindingCategory,
     PageElement,
+    PagePlan,
     ReviewFinding,
     ReviewSeverity,
     TextTransformation,
@@ -30,6 +31,12 @@ _GENERIC_ALT_TEXT = {
     "historical image",
     "document image",
 }
+_MONTH_DATE_RANGE = re.compile(
+    r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|"
+    r"Dec(?:ember)?)\s+(\d{1,2})–(\d{1,2})\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _normalized_bbox(
@@ -94,6 +101,8 @@ def _transformation_kind(source: str, replacement: str) -> TransformationKind:
         return TransformationKind.DECORATIVE_MARKER_OMISSION
     if source.isspace() and replacement in {"; ", ": "}:
         return TransformationKind.STRUCTURAL_SEPARATOR_NORMALIZATION
+    if source == "–" and replacement == " to ":
+        return TransformationKind.DATE_RANGE_EXPANSION
     if any(character in _FORMULA_CHARACTERS for character in source + replacement) or re.search(
         r"[\u0370-\u03ff]", source + replacement
     ):
@@ -118,9 +127,22 @@ def _transformation_rationale(kind: TransformationKind) -> str:
         TransformationKind.DECORATIVE_LEADER_OMISSION: "Omits visual leader characters from speech.",
         TransformationKind.DECORATIVE_MARKER_OMISSION: "Omits a visual direction marker that is not needed in linear speech.",
         TransformationKind.STRUCTURAL_SEPARATOR_NORMALIZATION: "Supplies spoken punctuation between adjacent labeled entries.",
+        TransformationKind.DATE_RANGE_EXPANSION: "Expands an en dash in a month-and-day range to the spoken word 'to'.",
         TransformationKind.WHITESPACE_NORMALIZATION: "Normalizes layout whitespace for continuous reading.",
         TransformationKind.UNVERIFIED: "The textual change is not one of the approved mechanical transformations.",
     }[kind]
+
+
+def normalize_spoken_date_ranges(element: PageElement) -> None:
+    if element.role == ElementRole.FIGURE:
+        return
+    accessible = _MONTH_DATE_RANGE.sub(
+        lambda match: f"{match.group(1)} {match.group(2)} to {match.group(3)}",
+        element.accessible_text,
+    )
+    if accessible != element.accessible_text:
+        element.accessible_text = accessible
+        element.tokens = exact_text_tokens(accessible)
 
 
 def canonicalize_transformations(element: PageElement) -> None:
@@ -281,6 +303,44 @@ def _dedupe_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:
     return result
 
 
+def _order_first_page_epigraph(page: PagePlan) -> None:
+    if page.page_number != 1:
+        return
+    first_heading = next(
+        (
+            index
+            for index, element in enumerate(page.elements)
+            if element.role in {ElementRole.H1, ElementRole.H2, ElementRole.H3}
+        ),
+        len(page.elements),
+    )
+    preamble = page.elements[:first_heading]
+    epigraphs = [
+        element
+        for element in preamble
+        if element.role == ElementRole.P
+        and re.search(r"[.!?][\"'”’]?\s*[–—]\s*\S", element.semantic_text)
+    ]
+    if not epigraphs:
+        return
+    ordinary = [element for element in preamble if element not in epigraphs]
+    reordered = [*ordinary, *epigraphs]
+    if reordered == preamble:
+        return
+    page.elements = [*reordered, *page.elements[first_heading:]]
+    page.findings.append(
+        ReviewFinding(
+            severity=ReviewSeverity.INFO,
+            category=FindingCategory.READING_ORDER,
+            message=(
+                "Deterministic masthead order places an attributed epigraph after "
+                "publication and issue metadata."
+            ),
+            chosen="Title, publication descriptor, issue metadata, epigraph, article content.",
+        )
+    )
+
+
 def _mark_resolved_findings(findings: list[ReviewFinding]) -> None:
     for finding in findings:
         message = finding.message.lower()
@@ -339,6 +399,7 @@ def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
                     existing_artifact_keys.add(key)
                 continue
 
+            normalize_spoken_date_ranges(element)
             canonicalize_transformations(element)
             semantic_fragments = []
             for fragment in element.visible_fragments:
@@ -372,6 +433,7 @@ def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
             element.findings = _dedupe_findings(element.findings)
             kept.append(element)
         page.elements = kept
+        _order_first_page_epigraph(page)
         page.reconcile_flows()
         _mark_resolved_findings(page.findings)
         page.findings = _dedupe_findings(page.findings)

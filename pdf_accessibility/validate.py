@@ -444,30 +444,27 @@ def compare_structure_to_plan(serialized: dict[str, object], plan: DocumentPlan)
     cursor = 0
     for index, element in enumerate(expected):
         expected_role = EXPECTED_PDF_ROLES[element.role]
-        region_ids = [element.id]
+        region_count = 1
         if element.role == ElementRole.P and len(element.visible_fragments) > 1:
             groups = fragment_region_groups(element.visible_fragments)
             if len(groups) > 1:
-                region_ids = [
-                    element.visible_fragments[group[0]].id for group in groups
-                ]
-        records = actual[cursor : cursor + len(region_ids)]
-        cursor += len(region_ids)
-        if len(records) != len(region_ids):
+                region_count = len(groups)
+        records = actual[cursor : cursor + region_count]
+        cursor += region_count
+        if len(records) != region_count:
             errors.append(
                 f"element {index} has {len(records)} structure regions; "
-                f"expected {len(region_ids)}"
+                f"expected {region_count}"
             )
             continue
-        for region_index, (record, _) in enumerate(
-            zip(records, region_ids, strict=True)
-        ):
+        for region_index, record in enumerate(records):
             if record["role"] != expected_role:
                 errors.append(
                     f"element {index} region {region_index} role "
                     f"{record['role']} != {expected_role}"
                 )
-        if "".join(str(record["text"]) for record in records) != element.semantic_text:
+        expected_text = "" if element.role == ElementRole.FIGURE else element.semantic_text
+        if "".join(str(record["text"]) for record in records) != expected_text:
             errors.append(f"element {index} exact text does not match canonical plan")
         if (
             element.role == ElementRole.FIGURE
@@ -529,7 +526,10 @@ def _extraction_compatibility(
         check=False,
     )
     expected_text = "\n".join(
-        element.semantic_text for page in plan.pages for element in page.elements
+        element.semantic_text
+        for page in plan.pages
+        for element in page.elements
+        if element.role != ElementRole.FIGURE
     )
     expected_tokens = re.findall(r"\w+|[^\w\s]", expected_text.lower(), re.UNICODE)
     actual_tokens = re.findall(r"\w+|[^\w\s]", completed.stdout.lower(), re.UNICODE)

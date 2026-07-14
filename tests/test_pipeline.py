@@ -21,6 +21,7 @@ from pdf_accessibility.models import (
     CoordinateSpace,
     DocumentPlan,
     ElementRole,
+    FindingCategory,
     PageElement,
     PageFlow,
     PagePlan,
@@ -173,10 +174,7 @@ class CompileTests(unittest.TestCase):
                 check=True,
             ).stdout
             self.assertIn("Visible newsletter text", extracted)
-            self.assertIn(
-                "Historical diagram with two labeled curves",
-                " ".join(extracted.split()),
-            )
+            self.assertNotIn("Historical diagram", extracted)
             with pikepdf.Pdf.open(output) as pdf:
                 self.assertTrue(pdf.Root.MarkInfo.Marked)
                 self.assertEqual(str(pdf.Root.Lang), "en-US")
@@ -195,6 +193,13 @@ class CompileTests(unittest.TestCase):
                 self.assertEqual(str(paragraph.A.O), "/Layout")
                 self.assertEqual(len(paragraph.A.BBox), 4)
                 self.assertEqual(int(paragraph.K), 1)
+                figure = pdf.Root.StructTreeRoot.K.K[2]
+                self.assertEqual(str(figure.S), "/Figure")
+                self.assertEqual(
+                    str(figure.Alt), "Historical diagram with two labeled curves"
+                )
+                self.assertEqual(str(figure.A.O), "/Layout")
+                self.assertEqual(len(figure.A.BBox), 4)
                 anchor_streams = [
                     stream.read_bytes() for stream in pdf.pages[0].Contents[-3:]
                 ]
@@ -202,11 +207,14 @@ class CompileTests(unittest.TestCase):
                     anchor_streams[0].startswith(b"/H1 <</MCID 0>> BDC\nBT\n")
                 )
                 self.assertTrue(
-                    all(stream.count(b"BT\n") == 1 for stream in anchor_streams)
+                    all(stream.count(b"BT\n") == 1 for stream in anchor_streams[:2])
                 )
                 self.assertTrue(
-                    all(stream.count(b"ET\n") == 1 for stream in anchor_streams)
+                    all(stream.count(b"ET\n") == 1 for stream in anchor_streams[:2])
                 )
+                self.assertTrue(anchor_streams[2].startswith(b"/Figure <</MCID 2>> BDC\nq\n"))
+                self.assertNotIn(b"BT\n", anchor_streams[2])
+                self.assertNotIn(b" Tj", anchor_streams[2])
                 self.assertNotIn(b"/ActualText", b"".join(anchor_streams))
                 self.assertEqual(
                     pdf.pages[0].Contents[0].read_bytes(), b"q\n/Artifact BMC\n"
@@ -363,6 +371,42 @@ class CompileTests(unittest.TestCase):
             self.assertEqual(
                 compare_structure_to_plan(serialize_structure_tree(output), plan), []
             )
+
+    def test_low_agreement_title_uses_reviewed_region_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            geometry = Path(temp) / "geometry.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=300, height=200)
+            document.save(source)
+            document.close()
+            document = pymupdf.open()
+            page = document.new_page(width=300, height=200)
+            page.insert_text((30, 40), "LIT TLE")
+            document.save(geometry)
+            document.close()
+            title = PageElement(
+                role=ElementRole.DOCUMENT_TITLE,
+                visible_text="LITTLE\nby\nlittle",
+                accessible_text="LITTLE by little",
+                bbox=[50, 50, 950, 300],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="LITTLE by little",
+                pages=[PagePlan(page_number=1, elements=[title])],
+            )
+
+            compile_tagged_pdf(source, output, plan, geometry_source=geometry)
+
+            with pikepdf.Pdf.open(output) as pdf:
+                anchor_stream = pdf.pages[0].Contents[-1].read_bytes()
+                self.assertEqual(anchor_stream.count(b" Tj\n"), 1)
+            with pymupdf.open(output) as document:
+                words = document[0].get_text("words", sort=False)
+                self.assertEqual([word[4] for word in words], ["LITTLE", "by", "little"])
+                self.assertEqual(len({(word[5], word[6]) for word in words}), 1)
 
     def test_drop_cap_fragments_remain_one_paragraph_region(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -593,6 +637,61 @@ class PlanMigrationTests(unittest.TestCase):
 
 
 class DeterministicRefinementTests(unittest.TestCase):
+    def test_moves_first_page_epigraph_after_issue_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page(width=612, height=792)
+            document.save(source)
+            document.close()
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Sample",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[
+                            element(ElementRole.DOCUMENT_TITLE, "LITTLE by little", top=20),
+                            element(
+                                ElementRole.P,
+                                "The essence of mathematics resides in its freedom. – Georg Cantor",
+                                top=60,
+                            ),
+                            element(ElementRole.P, "THE NEWSLETTER OF THE DEPARTMENT", top=80),
+                            element(ElementRole.P, "VOLUME 20, ISSUE 1, SPRING 2007", top=90),
+                            element(ElementRole.H1, "REPORT FROM THE CHAIR", top=120),
+                        ],
+                    )
+                ],
+            )
+
+            refine_document_plan(source, plan)
+
+            self.assertEqual(
+                [item.semantic_text for item in plan.pages[0].elements],
+                [
+                    "LITTLE by little",
+                    "THE NEWSLETTER OF THE DEPARTMENT",
+                    "VOLUME 20, ISSUE 1, SPRING 2007",
+                    "The essence of mathematics resides in its freedom. – Georg Cantor",
+                    "REPORT FROM THE CHAIR",
+                ],
+            )
+            self.assertEqual(
+                plan.pages[0].block_order,
+                [
+                    fragment.id
+                    for item in plan.pages[0].elements
+                    for fragment in item.visible_fragments
+                ],
+            )
+            self.assertTrue(
+                any(
+                    finding.category == FindingCategory.READING_ORDER
+                    for finding in plan.pages[0].findings
+                )
+            )
+
     def test_normalizes_geometry_and_records_repeated_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"
@@ -735,6 +834,13 @@ class DeterministicRefinementTests(unittest.TestCase):
                 bbox=[100, 300, 900, 400],
                 review_status=ReviewStatus.MODEL_REVIEWED,
             )
+            date_range = PageElement(
+                role=ElementRole.P,
+                visible_text="September 15–17, 2006.",
+                accessible_text="September 15–17, 2006.",
+                bbox=[100, 500, 900, 600],
+                review_status=ReviewStatus.MODEL_REVIEWED,
+            )
             plan = DocumentPlan(
                 source_file=source.name,
                 title="Sample",
@@ -742,7 +848,7 @@ class DeterministicRefinementTests(unittest.TestCase):
                     PagePlan(
                         page_number=1,
                         coordinate_space=CoordinateSpace.NORMALIZED,
-                        elements=[dehyphenated, unverified],
+                        elements=[dehyphenated, unverified, date_range],
                     )
                 ],
             )
@@ -754,6 +860,12 @@ class DeterministicRefinementTests(unittest.TestCase):
                 TransformationKind.LINE_BREAK_DEHYPHENATION,
             )
             self.assertEqual(unverified.transformations[0].kind, TransformationKind.UNVERIFIED)
+            self.assertEqual(date_range.visible_text, "September 15–17, 2006.")
+            self.assertEqual(date_range.accessible_text, "September 15 to 17, 2006.")
+            self.assertEqual(
+                date_range.transformations[0].kind,
+                TransformationKind.DATE_RANGE_EXPANSION,
+            )
             self.assertEqual(transformation_errors(plan), [])
 
 

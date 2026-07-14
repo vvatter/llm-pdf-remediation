@@ -13,11 +13,14 @@ Pages are planned as ordered rectangular visual blocks rather than inferred from
 single global column layout. Logical paragraphs may own multiple blocks when they
 continue from one column to another. The compiler uses those blocks for local geometry
 and emits them in reviewed tag-tree order; disjoint paragraph continuations receive
-consecutive direct `/P` regions so Acrobat can target each visual area independently.
-Each region owns one PDF MCID and one ordered content stream. Corrected Unicode text is
+consecutive direct `/P` regions because Acrobat reverses or loses independently placed
+MCIDs when they share one paragraph parent. This preserves clicking and order at the
+cost of a longer pause between fragments. Each region owns one PDF MCID and one ordered
+content stream. Corrected Unicode text is
 encoded directly in line-level strings positioned from OCR/native word geometry; the
 facsimile page remains visually unchanged underneath. `/ActualText` is reserved for
-the uncommon character that the embedded font cannot represent.
+the uncommon character that the embedded font cannot represent. Figures use structural
+`/Alt` alone plus a nonpainting geometric proxy, avoiding duplicate descriptions.
 
 The current corpus is departmental newsletters, but the pipeline is organized around
 fixed-layout PDFs rather than newsletter-specific file formats. See

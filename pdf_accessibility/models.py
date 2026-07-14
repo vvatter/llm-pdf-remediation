@@ -53,6 +53,7 @@ class TransformationKind(str, Enum):
     DECORATIVE_LEADER_OMISSION = "decorative_leader_omission"
     DECORATIVE_MARKER_OMISSION = "decorative_marker_omission"
     STRUCTURAL_SEPARATOR_NORMALIZATION = "structural_separator_normalization"
+    DATE_RANGE_EXPANSION = "date_range_expansion"
     WHITESPACE_NORMALIZATION = "whitespace_normalization"
     UNVERIFIED = "unverified"
 

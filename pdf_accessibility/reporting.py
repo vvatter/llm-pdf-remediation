@@ -12,6 +12,7 @@ import subprocess
 from .compiler import _find_anchor_font
 from .extract import PagePacket
 from .models import DocumentPlan, FindingCategory, RemediationMode
+from .planner import PLANNER_PROMPT_VERSION, REVIEW_PROMPT_VERSION
 from .plans import plan_sha256, sha256_file
 from .preflight import PreflightReport
 
@@ -265,8 +266,8 @@ def build_manifest(
         "plan_schema_version": plan.schema_version,
         "mode": preflight.selected_mode.value,
         "models": {
-            "proposal": {"id": planner_model, "reasoning_effort": planner_reasoning, "prompt_version": "proposal-v4"},
-            "review": {"id": reviewer_model, "reasoning_effort": reviewer_reasoning, "prompt_version": "review-v4"},
+            "proposal": {"id": planner_model, "reasoning_effort": planner_reasoning, "prompt_version": PLANNER_PROMPT_VERSION},
+            "review": {"id": reviewer_model, "reasoning_effort": reviewer_reasoning, "prompt_version": REVIEW_PROMPT_VERSION},
         },
         "responses": responses,
         "ocr": {
@@ -283,8 +284,10 @@ def build_manifest(
             "actual_text_strategy": "exceptional_region_fallback_only",
             "geometry_alignment": "block_local_with_ocr_line_identity",
             "structure_regions": "direct_visual_regions_integer_mcids",
+            "fragmented_paragraph_strategy": "separate_direct_paragraph_regions",
             "text_object_scope": "visual_region",
             "content_stream_scope": "visual_region",
+            "figure_proxy": "nonpainting_geometry_with_structural_alt",
             "layout_attributes": "word_union_bbox",
             "parent_tree_granularity": "visual_region",
             "target_reader_profile": "acrobat",

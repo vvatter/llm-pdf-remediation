@@ -753,3 +753,182 @@ These automated results establish conventional Unicode content, geometry, order,
 tagging, and unchanged appearance. Acrobat click selection and the page-2 byline
 continuous-reading transition remain manual acceptance tests and must not be claimed as
 fixed until the controlled candidate is retested in Acrobat.
+
+## 2026-07-14: Direct-Unicode Acrobat Retest and Polish
+
+### Confirmed interoperability improvement
+
+The direct-Unicode release fixed the principal Acrobat failures. The previously
+unclickable page-1 paragraph fragments became clickable and read in the intended order.
+Page 2 no longer jumped from the byline to page 3; it continued through the full-width
+opening paragraph and the rest of the page logically. This confirms that conventional
+direct Unicode line strings and region-scoped streams, rather than further tag-tree
+wrappers around the synthetic word layer, were the decisive interoperability change.
+
+Three lower-severity defects remained:
+
+1. The first-page masthead began the publication descriptor, interrupted it with the
+   Cantor quotation, and then resumed the descriptor.
+2. Acrobat inserted a long paragraph pause between spatially disjoint fragments of one
+   logical paragraph.
+3. Every image description was announced twice.
+
+### Masthead order
+
+The first defect was present in the canonical plan itself. Page 1 ordered the document
+title, Cantor quotation, publication descriptor, volume/issue/date, and article heading.
+The corrected order is title, publication descriptor, volume/issue/date, quotation, and
+article heading.
+
+Proposal and review prompt version 5 now state this first-page masthead policy. A
+conservative deterministic refinement also recognizes an attributed epigraph ending in
+an en/em-dash attribution and moves it to the end of the pre-heading masthead. The rule
+records an informational reading-order finding and reconciles page flows. This fixes
+existing reviewed plans without making new API calls and remains idempotent.
+
+### One paragraph, multiple region MCIDs
+
+The long pause was caused by the compatibility tree exposing each disjoint continuation
+as a separate direct `/P`. That representation had been necessary while diagnosing the
+unclickable word layer, but direct Unicode streams now supply independent physical hit
+targets without requiring false paragraph boundaries.
+
+The compiler now creates one structure element per canonical logical element. A
+multi-block paragraph owns an ordered `/K` array of its visual-region MCIDs, while every
+region retains its own page content stream, marked-content sequence, direct line text,
+and ParentTree entry. Adobe's logical-structure documentation explicitly permits one
+element to contain multiple marked-content regions. The structure serializer now
+requires one record per plan element and independently verifies the expected number and
+order of MCRs.
+
+On page 1, the two affected paragraphs are now single `/P` elements with `/K [8 9]` and
+`/K [10 11]`. The document contains 204 logical structure elements owning 224 physical
+region MCIDs. This should remove the structural paragraph pause while retaining the
+clickable geometry confirmed in the preceding build; the pause duration remains an
+Acrobat acceptance test.
+
+### Single-source figure descriptions
+
+The duplicate image speech had a direct cause. Each `/Figure` structure element had an
+`/Alt` value, but its marked content also contained hidden Unicode spelling the same
+description. Adobe's accessibility API exposes `/Alt` or `/ActualText` as a node value;
+otherwise it exposes contained marking-command text. Supplying both created two spoken
+sources.
+
+Figures now use a nonpainting clipped rectangle inside their MCID as a geometric proxy.
+The structure element supplies the only spoken value through `/Alt` and retains a
+`/Layout /BBox`. The visible whole-page facsimile remains an artifact. The released 2007
+file contains 29 figure MCIDs, all 29 have alternate text, none contains `BT` or `Tj`,
+and the structure serializer reports empty content text for all figures. Raw text
+extraction correspondingly excludes image descriptions instead of duplicating them.
+
+References used for this decision:
+
+- Adobe states that one logical structure element can contain marked content and that
+  marked-content regions are added to their containing element:
+  <https://opensource.adobe.com/dc-acrobat-sdk-docs/library/pdfmark/pdfmark_Logical.html>
+- Adobe's accessibility API states that a node exposes `Alt`/`ActualText` when present,
+  otherwise its contained marking-command text:
+  <https://opensource.adobe.com/dc-acrobat-sdk-docs/library/accessibility/MSAA%26PDF.html>
+
+### Released result
+
+The ordinary output is
+`build/2007_newsletter/2007_newsletter.accessible.pdf`, SHA-256
+`a6c4fb63e6077cb2242b5e636f0ad5317b274e657b8638cb7cd13a07a3fd9e5d`.
+
+Automated results:
+
+- 20 unit tests pass;
+- exact rendering and sampled source-fidelity checks pass;
+- qpdf, block-plan, transformations, and exact structure-plan checks pass;
+- 204 logical elements own 224 verified region MCIDs with no structure errors;
+- extraction agreement improved to `0.996182` with a `0.995868` token-count ratio;
+- veraPDF PDF/UA-1 passes;
+- the release pipeline published the declared accessible output.
+
+The new masthead order and single-source figure descriptions are deterministic. The
+remaining manual questions are whether Acrobat removes the audible continuation pause
+and whether sharing one `/P` parent changes the already successful click behavior of
+either visual fragment.
+
+## 2026-07-14: Shared-Parent Regression, Rollback, and Geometry Fixes
+
+### Acrobat retest falsified the shared-parent strategy
+
+The Acrobat retest found four regressions in the polish build:
+
+1. The masthead began `Little the newsletter` instead of `Little by little. The
+   newsletter...`.
+2. Date ranges such as `September 15–17` lost the range relationship in speech.
+3. The first `The Annual Meeting...` fragment was no longer clickable.
+4. Acrobat read the second `down to Gainesville...` fragment before the first.
+
+A binary comparison with the immediately preceding, successful PDF showed that the
+list and paragraph-fragment text streams were byte-for-byte equivalent. The material
+change was structural: two separate direct `/P` elements had become one `/P` with
+`/K [8 9]`. The array was standards-valid and the deterministic structure serializer
+resolved it in the correct order, but Acrobat did not expose the first marked-content
+region as an independent click target and traversed the second region first.
+
+The compiler has therefore restored one direct `/P` per spatially disjoint paragraph
+region. The ParentTree again gives each region its own owner, and the structure-plan
+validator concatenates consecutive regions when checking the canonical logical
+paragraph. This intentionally accepts the longer pause at the column break. The prior
+direct-region build had already demonstrated correct Acrobat clicking and order; the
+shared-parent experiment demonstrated that removing the pause by changing ownership is
+not compatible with Acrobat for this document.
+
+The released page-1 structure now again contains:
+
+- MCID 8: `The Annual Meeting of the Association of Symbolic Logic was brought `
+- MCID 9: `down to Gainesville owing to our special year activities...`
+
+Both are direct `/P` children in that order.
+
+### Low-evidence masthead geometry
+
+The title regression had a different cause. `LITTLE by little` had zero useful OCR
+agreement. The word `LITTLE` was positioned near the visible title, while `by little`
+inherited coordinates from an unrelated OCR line much lower on the page. The old
+masthead order happened to conceal that defect; moving the newsletter descriptor next
+to the title exposed it.
+
+The compiler now treats geometry evidence as usable only when the region has source
+words and at least `0.5` alignment agreement. Otherwise it uses the model-reviewed
+region rectangle and creates a bounded synthetic line inside it. The title is now one
+direct Unicode `Tj` string, `LITTLE by little`, within the reviewed masthead box. A
+regression test requires this single-string representation for low-agreement titles.
+
+### Spoken date ranges
+
+The refinement stage now performs an explicit accessibility-only date-range
+normalization. A visible string such as `September 15–17, 2006.` remains unchanged in
+`visible_text`, while `accessible_text` becomes `September 15 to 17, 2006.` The change
+is recorded as `date_range_expansion`, reconstructed by the transformation validator,
+and covered by an exact regression test. This avoids relying on Acrobat's inconsistent
+pronunciation of an en dash between day numbers.
+
+### Retained figure fix and released result
+
+The single-source figure-description fix remains in place: figures have structural
+`/Alt` plus a nonpainting geometric proxy, with no duplicate hidden text.
+
+The ordinary output is
+`build/2007_newsletter/2007_newsletter.accessible.pdf`, SHA-256
+`d51eb9205c07f4ffef3d2c50bfddfd2a28e119a4a5493a3f515243577f33f26d`.
+
+Automated results:
+
+- 21 unit tests pass;
+- exact candidate rendering and sampled source-fidelity checks pass;
+- qpdf, block-plan, transformations, and exact structure-plan checks pass;
+- 224 direct semantic regions have no structure errors;
+- extraction agreement is `0.996182` with a `0.995868` token-count ratio;
+- veraPDF PDF/UA-1 passes with 38,912 successful checks and zero failed checks;
+- the release pipeline published the declared accessible output.
+
+The remaining acceptance tests are Acrobat-specific: the full masthead phrase should
+read before the newsletter descriptor, the date range should contain the spoken word
+`to`, MCID 8 should be clickable and read before MCID 9, and each figure description
+should be announced once.

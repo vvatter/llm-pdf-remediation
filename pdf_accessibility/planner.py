@@ -38,8 +38,8 @@ from .models import (
 from .plans import load_document_plan, sha256_file, write_document_plan
 
 
-PLANNER_PROMPT_VERSION = "proposal-v4"
-REVIEW_PROMPT_VERSION = "review-v4"
+PLANNER_PROMPT_VERSION = "proposal-v5"
+REVIEW_PROMPT_VERSION = "review-v5"
 
 PROPOSAL_SYSTEM_PROMPT = """You propose an accessibility transcription and semantic plan for a
 historical fixed-layout PDF page. The printed page is the historical source of record. Preserve
@@ -49,8 +49,8 @@ Never silently regularize or correct it.
 For every meaningful item, record visible_text exactly as printed and accessible_text as spoken.
 They should be identical except for a declared mechanical transformation: line-break
 dehyphenation, ligature expansion, soft-hyphen removal, formula spoken equivalent, decorative
-leader/marker omission, structural separator normalization, or whitespace normalization. Record
-every such transformation. Native and OCR
+leader/marker omission, structural separator normalization, date-range spoken expansion, or
+whitespace normalization. Record every such transformation. Native and OCR
 text are evidence only and can be corrupt. Always choose a result, preserve visual page order,
 and record uncertainty in findings rather than stopping.
 
@@ -68,7 +68,9 @@ disjoint columns. Give each fragment a unique block ID such as b001. When one pa
 from the bottom of one column to the top of another, keep one logical P element with two ordered
 fragments. Return flows whose block_ids contain every meaningful fragment exactly once in logical
 reading order. Finish an article flow before an independent sidebar or contents flow even when
-strict global top-to-bottom coordinates would interleave them."""
+strict global top-to-bottom coordinates would interleave them. On a first-page masthead, order the
+publication title, descriptive publication line, volume/issue/date metadata, and then any epigraph
+or attributed quotation before the first article heading."""
 
 REVIEW_SYSTEM_PROMPT = """You are the independent final semantic reviewer for a historical PDF
 accessibility plan. The page image and printed content are authoritative. Evidence text may be
@@ -80,7 +82,9 @@ including critical findings, are advisories: always choose a canonical result an
 Use separate confidence dimensions and log alternatives for names, dates, numbers, URLs,
 formulas, uncertain transcription, roles, geometry, and reading order. Return atomic rectangular
 visible fragments with unique block IDs plus flows that own every block exactly once. Preserve a
-single logical paragraph across multiple ordered fragments when it continues between columns."""
+single logical paragraph across multiple ordered fragments when it continues between columns. On
+a first-page masthead, keep any epigraph or attributed quotation after publication and issue
+metadata and before the first article heading."""
 
 
 class ModelPageElement(BaseModel):

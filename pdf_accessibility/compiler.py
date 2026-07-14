@@ -64,6 +64,7 @@ class LinePlacement:
 class StructureRegion:
     element: PageElement
     chunks: list[AnchorChunk]
+    fragments: list[TextFragment]
     mcid: int
 
 
@@ -727,18 +728,70 @@ def _same_visual_line(
     return abs(left_center - right_center) <= maximum_height * 0.3
 
 
+def _reviewed_region_bbox(
+    region: StructureRegion,
+    width: float,
+    height: float,
+) -> tuple[float, float, float, float]:
+    return _union_bbox(
+        [
+            _fragment_bbox_points(fragment, region.element, width, height)
+            for fragment in region.fragments
+        ]
+    )
+
+
+def _has_usable_line_evidence(region: StructureRegion) -> bool:
+    return any(
+        fragment.geometry_word_count > 0
+        and (fragment.alignment_coverage or 0.0) >= 0.5
+        for fragment in region.fragments
+    )
+
+
+def _synthetic_region_lines(
+    chunks: list[AnchorChunk],
+    bbox: tuple[float, float, float, float],
+) -> list[LinePlacement]:
+    x0, y0, x1, y1 = bbox
+    maximum_characters = max(12, int((x1 - x0) / 5.2))
+    wrapped_chunks: list[list[AnchorChunk]] = []
+    current: list[AnchorChunk] = []
+    current_length = 0
+    for chunk in chunks:
+        if current and current_length + len(chunk.text) > maximum_characters:
+            wrapped_chunks.append(current)
+            current = []
+            current_length = 0
+        current.append(chunk)
+        current_length += len(chunk.text)
+        if "\n" in chunk.text:
+            wrapped_chunks.append(current)
+            current = []
+            current_length = 0
+    if current:
+        wrapped_chunks.append(current)
+    if not wrapped_chunks:
+        return []
+    line_height = max(5.0, min(12.0, (y1 - y0) / len(wrapped_chunks)))
+    return [
+        LinePlacement(
+            text="".join(chunk.text for chunk in line_chunks),
+            bbox=(x0, y0 + index * line_height, x1, y0 + (index + 1) * line_height),
+        )
+        for index, line_chunks in enumerate(wrapped_chunks)
+    ]
+
+
 def _region_lines(
     region: StructureRegion,
     placements: dict[int, list[WordPlacement]],
     width: float,
     height: float,
 ) -> list[LinePlacement]:
-    fallback = _fragment_bbox_points(
-        region.element.visible_fragments[0],
-        region.element,
-        width,
-        height,
-    )
+    fallback = _reviewed_region_bbox(region, width, height)
+    if not _has_usable_line_evidence(region):
+        return _synthetic_region_lines(region.chunks, fallback)
     grouped: list[
         tuple[list[AnchorChunk], list[tuple[float, float, float, float]], tuple[int, int] | None]
     ] = []
@@ -781,36 +834,10 @@ def _region_lines(
     ):
         return lines
 
-    x0, y0, x1, y1 = lines[0].bbox
-    maximum_characters = max(12, int((x1 - x0) / 5.2))
+    maximum_characters = max(12, int((lines[0].bbox[2] - lines[0].bbox[0]) / 5.2))
     if len(lines[0].text) <= maximum_characters:
         return lines
-
-    wrapped_chunks: list[list[AnchorChunk]] = []
-    current: list[AnchorChunk] = []
-    current_length = 0
-    for chunk in region.chunks:
-        if current and current_length + len(chunk.text) > maximum_characters:
-            wrapped_chunks.append(current)
-            current = []
-            current_length = 0
-        current.append(chunk)
-        current_length += len(chunk.text)
-        if "\n" in chunk.text:
-            wrapped_chunks.append(current)
-            current = []
-            current_length = 0
-    if current:
-        wrapped_chunks.append(current)
-
-    line_height = max(5.0, min(12.0, (y1 - y0) / len(wrapped_chunks)))
-    return [
-        LinePlacement(
-            text="".join(chunk.text for chunk in chunks),
-            bbox=(x0, y0 + index * line_height, x1, y0 + (index + 1) * line_height),
-        )
-        for index, chunks in enumerate(wrapped_chunks)
-    ]
+    return _synthetic_region_lines(region.chunks, lines[0].bbox)
 
 
 def _text_advance(text: str, font: AnchorFont) -> int:
@@ -826,6 +853,18 @@ def _anchor_stream(
     placements: dict[int, list[WordPlacement]] | None = None,
 ) -> bytes:
     placements = placements or {}
+    if region.element.role == ElementRole.FIGURE:
+        bbox = _reviewed_region_bbox(region, width, height)
+        x0, y0, x1, y1 = bbox
+        pdf_y = height - y1
+        return (
+            f"/Figure <</MCID {region.mcid}>> BDC\n"
+            "q\n"
+            f"{x0:.3f} {pdf_y:.3f} {x1 - x0:.3f} {y1 - y0:.3f} re W n\n"
+            "Q\n"
+            "EMC\n"
+        ).encode("ascii")
+
     lines = _region_lines(region, placements, width, height)
     exact_text = "".join(chunk.text for chunk in region.chunks)
     direct_lines = [
@@ -862,8 +901,10 @@ def _anchor_stream(
 def _element_structure_regions(
     element: PageElement,
     chunks: list[AnchorChunk],
-) -> list[tuple[str, list[AnchorChunk]]]:
-    regions: list[tuple[str, list[AnchorChunk]]] = [(element.id, chunks)]
+) -> list[tuple[str, list[AnchorChunk], list[TextFragment]]]:
+    regions: list[tuple[str, list[AnchorChunk], list[TextFragment]]] = [
+        (element.id, chunks, element.visible_fragments)
+    ]
     if element.role == ElementRole.P and len(element.visible_fragments) > 1:
         fragment_chunks = _chunks_by_fragment(element, chunks)
         groups = fragment_region_groups(element.visible_fragments)
@@ -877,7 +918,11 @@ def _element_structure_regions(
                 ]
                 if grouped_chunks:
                     regions.append(
-                        (element.visible_fragments[group[0]].id, grouped_chunks)
+                        (
+                            element.visible_fragments[group[0]].id,
+                            grouped_chunks,
+                            [element.visible_fragments[index] for index in group],
+                        )
                     )
     return regions
 
@@ -888,37 +933,42 @@ def _make_role_element(
     page_obj: pikepdf.Object,
     parent: pikepdf.Object,
     placements: dict[int, list[WordPlacement]],
+    width: float,
     height: float,
 ) -> pikepdf.Object:
+    element = region.element
     role_element = pdf.make_indirect(
         Dictionary(
             Type=Name.StructElem,
-            S=ROLE_NAMES[region.element.role],
+            S=ROLE_NAMES[element.role],
             P=parent,
             Pg=page_obj,
             K=region.mcid,
         )
     )
-    if region.element.role == ElementRole.FIGURE:
-        role_element[Name.Alt] = String(region.element.alt_text or "")
-    else:
-        boxes = [
+    if element.role == ElementRole.FIGURE:
+        role_element[Name.Alt] = String(element.alt_text or "")
+    boxes = (
+        [_reviewed_region_bbox(region, width, height)]
+        if element.role == ElementRole.FIGURE or not _has_usable_line_evidence(region)
+        else [
             placement.bbox
             for chunk in region.chunks
             for placement in placements.get(chunk.mcid, [])
         ]
-        if boxes:
-            role_element[Name.A] = Dictionary(
-                O=Name.Layout,
-                BBox=Array(
-                    [
-                        round(min(box[0] for box in boxes), 3),
-                        round(height - max(box[3] for box in boxes), 3),
-                        round(max(box[2] for box in boxes), 3),
-                        round(height - min(box[1] for box in boxes), 3),
-                    ]
-                ),
-            )
+    )
+    if boxes:
+        role_element[Name.A] = Dictionary(
+            O=Name.Layout,
+            BBox=Array(
+                [
+                    round(min(box[0] for box in boxes), 3),
+                    round(height - max(box[3] for box in boxes), 3),
+                    round(max(box[2] for box in boxes), 3),
+                    round(height - min(box[1] for box in boxes), 3),
+                ]
+            ),
+        )
     return role_element
 
 
@@ -1009,20 +1059,37 @@ def compile_tagged_pdf(
                 for element, chunks in zip(
                     page_plan.elements, chunks_by_element, strict=True
                 ):
-                    if element.role == ElementRole.FIGURE:
+                    if (
+                        element.role == ElementRole.FIGURE
+                        or element.evidence.alignment_coverage < 0.5
+                    ):
                         continue
                     derived_bbox = _placement_bbox(chunks, placements, width, height)
                     if derived_bbox:
                         element.bbox = derived_bbox
-            regions = [
-                StructureRegion(element=element, chunks=region, mcid=region_mcid)
-                for region_mcid, (element, region) in enumerate(
-                    (element, region)
-                    for element, chunks in zip(
-                        page_plan.elements, chunks_by_element, strict=True
+            regions_by_element: list[list[StructureRegion]] = []
+            next_region_mcid = 0
+            for element, chunks in zip(
+                page_plan.elements, chunks_by_element, strict=True
+            ):
+                element_regions = []
+                for _, region_chunks, region_fragments in _element_structure_regions(
+                    element, chunks
+                ):
+                    element_regions.append(
+                        StructureRegion(
+                            element=element,
+                            chunks=region_chunks,
+                            fragments=region_fragments,
+                            mcid=next_region_mcid,
+                        )
                     )
-                    for _, region in _element_structure_regions(element, chunks)
-                )
+                    next_region_mcid += 1
+                regions_by_element.append(element_regions)
+            regions = [
+                region
+                for element_regions in regions_by_element
+                for region in element_regions
             ]
             anchor_streams = [
                 Stream(
@@ -1051,6 +1118,7 @@ def compile_tagged_pdf(
                     page.obj,
                     document,
                     placements,
+                    width,
                     height,
                 )
                 document[Name.K].append(role_element)
