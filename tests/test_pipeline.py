@@ -408,6 +408,40 @@ class CompileTests(unittest.TestCase):
                 self.assertEqual([word[4] for word in words], ["LITTLE", "by", "little"])
                 self.assertEqual(len({(word[5], word[6]) for word in words}), 1)
 
+    def test_long_low_evidence_line_preserves_poppler_word_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=300, height=200)
+            document.save(source)
+            document.close()
+            text = (
+                "The academic year 2003-2004 was another eventful year highlighted "
+                "by the special year in applied mathematics."
+            )
+            paragraph = PageElement(
+                role=ElementRole.P,
+                visible_text=text,
+                accessible_text=text,
+                bbox=[100, 100, 900, 300],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Sample",
+                pages=[PagePlan(page_number=1, elements=[paragraph])],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+
+            extracted = subprocess.run(
+                ["pdftotext", "-raw", str(output), "-"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertIn("The academic year 2003-2004", " ".join(extracted.split()))
+
     def test_drop_cap_fragments_remain_one_paragraph_region(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"

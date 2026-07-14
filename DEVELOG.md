@@ -932,3 +932,59 @@ The remaining acceptance tests are Acrobat-specific: the full masthead phrase sh
 read before the newsletter descriptor, the date range should contain the spoken word
 `to`, MCID 8 should be clickable and read before MCID 9, and each figure description
 should be announced once.
+
+## 2026-07-14: Three-Document Golden Rebuild
+
+### Checkpoint and scope
+
+The Acrobat-proven 2007 implementation was committed as `47a6e6d` and tagged
+`v0.4.0`. The golden rebuild then reused the saved reviewed plans for the 1996, 2004,
+and 2007 newsletters. No model replanning or review calls were made. This isolated
+compiler and validation behavior from model variability.
+
+### 2004 extraction gate failure
+
+The first 2004 rebuild passed visual, qpdf, structure-tree, transformation, block-plan,
+tagging, and veraPDF checks, but the release gate correctly withheld publication.
+Poppler extraction agreement was `0.987117`, below the required `0.99`, with a token
+count ratio of `0.982451`.
+
+The missing tokens were not absent from the structure tree. Several long corrected text
+runs with weak local geometry had been fitted into a region by keeping a large font and
+compressing it to the compiler's 10% horizontal-scale floor. Poppler collapsed the
+spaces in these runs, producing tokens such as `theacademicyear2003` and
+`thespecialyearinappliedmathematics`.
+
+The compiler now fits a long invisible run by reducing its font size to the available
+width before applying horizontal scaling. This retains the exact Unicode string and
+reviewed region geometry while preserving extractable word boundaries. A regression
+test compiles a long low-evidence line and requires Poppler to recover the words with
+spaces. The suite now contains 22 passing tests.
+
+After the fix, the 2004 extraction agreement rose to `0.998825` and the token-count
+ratio became `1.000000`. All release gates passed.
+
+### Final golden outputs
+
+All three outputs use separate direct paragraph regions, direct Unicode per OCR line,
+and nonpainting figure proxies with structural `/Alt`.
+
+| Issue | Size | Structure regions | Extraction agreement | Token ratio | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 1996 | 1.07 MB | 134 | 0.999801 | 0.999868 | `3ec4c91e6bef5a4efa7aafcf04d0f250c4aabca1d4720211cf5d5c2b0c5b7909` |
+| 2004 | 10.69 MB | 273 | 0.998825 | 1.000000 | `cb8e3ebc1de05b92fc989eaa2d26b4d62e3861da4d60e95f577efdb16c191ebf` |
+| 2007 | 11.43 MB | 224 | 0.998898 | 1.000000 | `955ce0394431ed28ed30ee15ed182f623860cc556546a8f8376c5806f9e362d8` |
+
+For every issue:
+
+- the release was published;
+- exact candidate rendering and sampled source-fidelity checks passed;
+- qpdf passed;
+- the structure tree exactly matched the canonical plan with zero structure errors;
+- transformations and visual-block ownership passed;
+- every page was tagged and the PDF/UA declaration was present;
+- veraPDF PDF/UA-1 passed.
+
+The 1996 and 2004 files remain pending Acrobat acceptance testing. The 2007 output was
+rebuilt because the font-fitting change improved its extraction metrics; its established
+reading order and direct-region structure are unchanged.

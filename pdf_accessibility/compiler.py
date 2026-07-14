@@ -882,10 +882,13 @@ def _anchor_stream(
     for line, direct_text in zip(lines, direct_lines, strict=True):
         x0, y0, x1, y1 = line.bbox
         font_size = max(1.0, min(72.0, (y1 - y0) * 0.82))
-        natural_width = max(_text_advance(direct_text, anchor_font) * font_size / 1000, 0.01)
+        advance_em = max(_text_advance(direct_text, anchor_font) / 1000, 0.01)
+        available_width = max(x1 - x0, 0.01)
+        font_size = max(1.0, min(font_size, available_width / advance_em))
+        natural_width = max(advance_em * font_size, 0.01)
         horizontal_scale = max(
             10.0,
-            min(1000.0, (x1 - x0) / natural_width * 100),
+            min(1000.0, available_width / natural_width * 100),
         )
         baseline = height - y1 + font_size * 0.18
         encoded = direct_text.encode("utf-16-be")
