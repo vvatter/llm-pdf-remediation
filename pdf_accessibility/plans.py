@@ -33,15 +33,16 @@ def load_document_plan(path: Path, source: Path | None = None) -> DocumentPlan:
     raw["schema_version"] = SCHEMA_VERSION
     raw.setdefault("source_sha256", sha256_file(source) if source and source.exists() else "")
     raw.setdefault("source_page_count", len(raw.get("pages", [])))
-    raw["plan_revision"] = max(int(raw.get("plan_revision", 1)), 3)
+    raw["plan_revision"] = max(int(raw.get("plan_revision", 1)), 4)
     for page in raw.get("pages", []):
         page.setdefault(
             "coordinate_space",
             "pdf_points" if previous_version == 2 else "normalized_0_1000",
         )
         page.setdefault("artifacts", [])
+        page.setdefault("flows", [])
 
-    if previous_version not in {2}:
+    if previous_version not in {2, 3}:
         raw["review_status"] = ReviewStatus.LEGACY_UNREVIEWED.value
         for page in raw.get("pages", []):
             page["review_status"] = ReviewStatus.LEGACY_UNREVIEWED.value

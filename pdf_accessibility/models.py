@@ -6,7 +6,7 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class ElementRole(str, Enum):
@@ -88,9 +88,59 @@ class ArtifactReason(str, Enum):
 
 
 class TextFragment(BaseModel):
+    id: str = ""
     text: str
     bbox: list[float] | None = Field(default=None, min_length=4, max_length=4)
     evidence_refs: list[str] = Field(default_factory=list)
+    alignment_coverage: float | None = Field(default=None, ge=0, le=1)
+    geometry_word_count: int = Field(default=0, ge=0)
+    geometry_source: str | None = None
+
+
+def fragment_region_groups(
+    fragments: list[TextFragment], proximity: float = 12.0
+) -> list[list[int]]:
+    """Group visually connected fragments while preserving their semantic order."""
+    neighbors = [set([index]) for index in range(len(fragments))]
+    for left_index, left_fragment in enumerate(fragments):
+        if left_fragment.bbox is None:
+            continue
+        left, top, right, bottom = left_fragment.bbox
+        for right_index in range(left_index + 1, len(fragments)):
+            right_fragment = fragments[right_index]
+            if right_fragment.bbox is None:
+                continue
+            other_left, other_top, other_right, other_bottom = right_fragment.bbox
+            horizontal_gap = max(0.0, max(left, other_left) - min(right, other_right))
+            vertical_gap = max(0.0, max(top, other_top) - min(bottom, other_bottom))
+            if horizontal_gap <= proximity and vertical_gap <= proximity:
+                neighbors[left_index].add(right_index)
+                neighbors[right_index].add(left_index)
+
+    groups: list[list[int]] = []
+    visited: set[int] = set()
+    for start in range(len(fragments)):
+        if start in visited:
+            continue
+        pending = [start]
+        group: list[int] = []
+        while pending:
+            index = pending.pop()
+            if index in visited:
+                continue
+            visited.add(index)
+            group.append(index)
+            pending.extend(neighbors[index] - visited)
+        groups.append(sorted(group))
+    return groups
+
+
+class PageFlow(BaseModel):
+    id: str = ""
+    label: str | None = None
+    block_ids: list[str] = Field(
+        description="Visual block identifiers in exact assistive-technology reading order"
+    )
 
 
 class TextTransformation(BaseModel):
@@ -275,7 +325,7 @@ class PageElement(BaseModel):
             self.visible_text = "".join(fragment.text for fragment in self.visible_fragments)
         if not self.accessible_text and self.role != ElementRole.FIGURE:
             self.accessible_text = self.visible_text
-        if not self.visible_fragments and self.visible_text:
+        if not self.visible_fragments and (self.visible_text or self.role == ElementRole.FIGURE):
             self.visible_fragments = [TextFragment(text=self.visible_text, bbox=self.bbox)]
         if self.role != ElementRole.FIGURE and not self.accessible_text.strip():
             raise ValueError("non-figure elements require accessible text")
@@ -313,19 +363,85 @@ class PagePlan(BaseModel):
         description="Elements in the exact logical reading order for assistive technology"
     )
     artifacts: list[ArtifactRecord] = Field(default_factory=list)
+    flows: list[PageFlow] = Field(default_factory=list)
     page_ambiguities: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
     review_status: ReviewStatus = ReviewStatus.PROPOSAL
 
     @model_validator(mode="after")
     def assign_stable_ids(self) -> "PagePlan":
+        block_ids: list[str] = []
         for index, element in enumerate(self.elements, start=1):
             if not element.id:
                 element.id = f"p{self.page_number:04d}-e{index:04d}"
+            for fragment_index, fragment in enumerate(element.visible_fragments, start=1):
+                if not fragment.id:
+                    fragment.id = f"{element.id}-b{fragment_index:03d}"
+                block_ids.append(fragment.id)
+        if len(block_ids) != len(set(block_ids)):
+            raise ValueError(f"page {self.page_number} has duplicate visual block identifiers")
+        if not self.flows and block_ids:
+            self.flows = [
+                PageFlow(
+                    id=f"p{self.page_number:04d}-flow0001",
+                    label="page reading order",
+                    block_ids=block_ids,
+                )
+            ]
+        for index, flow in enumerate(self.flows, start=1):
+            if not flow.id:
+                flow.id = f"p{self.page_number:04d}-flow{index:04d}"
+        ordered_blocks = [block_id for flow in self.flows for block_id in flow.block_ids]
+        if len(ordered_blocks) != len(set(ordered_blocks)):
+            raise ValueError(f"page {self.page_number} assigns a visual block more than once")
+        if set(ordered_blocks) != set(block_ids):
+            missing = sorted(set(block_ids) - set(ordered_blocks))
+            unknown = sorted(set(ordered_blocks) - set(block_ids))
+            raise ValueError(
+                f"page {self.page_number} flow ownership mismatch; "
+                f"missing={missing}, unknown={unknown}"
+            )
+        if ordered_blocks != block_ids:
+            raise ValueError(
+                f"page {self.page_number} flow order must match semantic element/fragment order"
+            )
         for index, artifact in enumerate(self.artifacts, start=1):
             if not artifact.id:
                 artifact.id = f"p{self.page_number:04d}-a{index:04d}"
         return self
+
+    @property
+    def block_order(self) -> list[str]:
+        return [block_id for flow in self.flows for block_id in flow.block_ids]
+
+    def reconcile_flows(self) -> None:
+        """Remove deleted blocks while preserving valid flow partitions and order."""
+        block_ids = [
+            fragment.id
+            for element in self.elements
+            for fragment in element.visible_fragments
+        ]
+        remaining = set(block_ids)
+        reconciled = [
+            flow.model_copy(
+                update={"block_ids": [item for item in flow.block_ids if item in remaining]}
+            )
+            for flow in self.flows
+        ]
+        reconciled = [flow for flow in reconciled if flow.block_ids]
+        if [item for flow in reconciled for item in flow.block_ids] != block_ids:
+            reconciled = (
+                [
+                    PageFlow(
+                        id=f"p{self.page_number:04d}-flow0001",
+                        label="page reading order",
+                        block_ids=block_ids,
+                    )
+                ]
+                if block_ids
+                else []
+            )
+        self.flows = reconciled
 
 
 class PageReview(BaseModel):

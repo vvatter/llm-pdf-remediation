@@ -25,6 +25,7 @@ from .models import (
     ArtifactRecord,
     ElementRole,
     PagePlan,
+    PageFlow,
     PageReview,
     ReviewFinding,
     ReviewStatus,
@@ -37,8 +38,8 @@ from .models import (
 from .plans import load_document_plan, sha256_file, write_document_plan
 
 
-PLANNER_PROMPT_VERSION = "proposal-v3"
-REVIEW_PROMPT_VERSION = "review-v3"
+PLANNER_PROMPT_VERSION = "proposal-v4"
+REVIEW_PROMPT_VERSION = "review-v4"
 
 PROPOSAL_SYSTEM_PROMPT = """You propose an accessibility transcription and semantic plan for a
 historical fixed-layout PDF page. The printed page is the historical source of record. Preserve
@@ -60,7 +61,14 @@ page numbers that add no meaning, and decoration. Join line-broken body copy int
 Every bbox must use normalized_0_1000 coordinates: left and right are percentages of page width
 times 1000; top and bottom are percentages of page height times 1000. Never return PDF points or
 image pixels. Give separate transcription, semantic-role, geometry, and reading-order confidence
-values."""
+values.
+
+Decompose every logical element into atomic rectangular visible_fragments. A fragment may not span
+disjoint columns. Give each fragment a unique block ID such as b001. When one paragraph continues
+from the bottom of one column to the top of another, keep one logical P element with two ordered
+fragments. Return flows whose block_ids contain every meaningful fragment exactly once in logical
+reading order. Finish an article flow before an independent sidebar or contents flow even when
+strict global top-to-bottom coordinates would interleave them."""
 
 REVIEW_SYSTEM_PROMPT = """You are the independent final semantic reviewer for a historical PDF
 accessibility plan. The page image and printed content are authoritative. Evidence text may be
@@ -70,7 +78,9 @@ correct spelling, expand abbreviations, or invent obscured words. Preserve visib
 declare every allowed accessibility-only transformation. Preserve visual page order. Findings,
 including critical findings, are advisories: always choose a canonical result and continue.
 Use separate confidence dimensions and log alternatives for names, dates, numbers, URLs,
-formulas, uncertain transcription, roles, geometry, and reading order."""
+formulas, uncertain transcription, roles, geometry, and reading order. Return atomic rectangular
+visible fragments with unique block IDs plus flows that own every block exactly once. Preserve a
+single logical paragraph across multiple ordered fragments when it continues between columns."""
 
 
 class ModelPageElement(BaseModel):
@@ -89,6 +99,7 @@ class ModelPagePlan(BaseModel):
     page_number: int = Field(ge=1)
     coordinate_space: Literal["normalized_0_1000"] = "normalized_0_1000"
     elements: list[ModelPageElement]
+    flows: list[PageFlow] = Field(default_factory=list)
     page_ambiguities: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
 
@@ -138,8 +149,9 @@ def propose_page(
     )
     if response.output_parsed is None:
         raise RuntimeError(f"{model} returned no parsed proposal for page {packet.page_number}")
-    page = PagePlan.model_validate(response.output_parsed.model_dump())
-    page.page_number = packet.page_number
+    page_data = response.output_parsed.model_dump()
+    page_data["page_number"] = packet.page_number
+    page = PagePlan.model_validate(page_data)
     page.review_status = ReviewStatus.PROPOSAL
     for element in page.elements:
         element.review_status = ReviewStatus.PROPOSAL
@@ -204,8 +216,10 @@ def review_page(
     if response.output_parsed is None:
         raise RuntimeError(f"{model} returned no parsed review for page {packet.page_number}")
     parsed = response.output_parsed
+    page_data = parsed.canonical_page.model_dump()
+    page_data["page_number"] = packet.page_number
     return ReviewDecision(
-        canonical_page=PagePlan.model_validate(parsed.canonical_page.model_dump()),
+        canonical_page=PagePlan.model_validate(page_data),
         findings=parsed.findings,
     ), response.id
 
@@ -287,6 +301,7 @@ def normalize_document_pages(source: Path, pages: list[PagePlan]) -> list[PagePl
                 continue
             cleaned.append(element)
         page.elements = cleaned
+        page.reconcile_flows()
     return pages
 
 
@@ -366,7 +381,7 @@ def build_document_plan(
         _write_once(
             evidence_path,
             {
-                "schema_version": 2,
+                "schema_version": 4,
                 "source_sha256": source_hash,
                 "evidence": evidence.model_dump(mode="json"),
             },
@@ -383,7 +398,7 @@ def build_document_plan(
             _write_once(
                 proposal_path,
                 {
-                    "schema_version": 2,
+                    "schema_version": 4,
                     "source_sha256": source_hash,
                     "model": "legacy-plan-migration",
                     "response_id": None,
@@ -412,7 +427,7 @@ def build_document_plan(
             _write_once(
                 page_dir / f"{number:04d}.proposal.json",
                 {
-                    "schema_version": 2,
+                    "schema_version": 4,
                     "source_sha256": source_hash,
                     "model": planner_model,
                     "reasoning_effort": planner_reasoning,
@@ -481,7 +496,7 @@ def build_document_plan(
             _write_once(
                 page_dir / f"{number:04d}.review.json",
                 {
-                    "schema_version": 2,
+                    "schema_version": 4,
                     "source_sha256": source_hash,
                     "model": reviewer_model,
                     "reasoning_effort": reviewer_reasoning,

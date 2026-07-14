@@ -245,6 +245,31 @@ def _artifact_reason(
     return None
 
 
+def _fragment_artifact_reason(
+    text: str,
+    element: PageElement,
+) -> ArtifactReason | None:
+    if re.fullmatch(r"[\s_.·…-]{12,}", text):
+        return ArtifactReason.WRITING_LINE
+    stripped = text.strip()
+    decorative_kinds = {
+        TransformationKind.DECORATIVE_LEADER_OMISSION,
+        TransformationKind.DECORATIVE_MARKER_OMISSION,
+    }
+    if (
+        stripped
+        and not re.search(r"[A-Za-z0-9]", stripped)
+        and stripped not in element.accessible_text
+        and any(
+            transformation.kind in decorative_kinds
+            and stripped in transformation.source_text
+            for transformation in element.transformations
+        )
+    ):
+        return ArtifactReason.DECORATION
+    return None
+
+
 def _dedupe_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:
     result: list[ReviewFinding] = []
     seen: set[tuple[str, str, str]] = set()
@@ -315,6 +340,24 @@ def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
                 continue
 
             canonicalize_transformations(element)
+            semantic_fragments = []
+            for fragment in element.visible_fragments:
+                fragment_reason = _fragment_artifact_reason(fragment.text, element)
+                if fragment_reason and fragment.bbox:
+                    key = (fragment_reason.value, tuple(fragment.bbox), fragment.text)
+                    if key not in existing_artifact_keys:
+                        page.artifacts.append(
+                            ArtifactRecord(
+                                reason=fragment_reason,
+                                bbox=fragment.bbox,
+                                text=fragment.text,
+                            )
+                        )
+                        existing_artifact_keys.add(key)
+                    continue
+                semantic_fragments.append(fragment)
+            element.visible_fragments = semantic_fragments
+
             if element.role == ElementRole.FIGURE and not (element.alt_text or "").strip():
                 message = "Meaningful figure requires reviewed alternate text."
                 if not any(finding.message == message for finding in element.findings):
@@ -329,9 +372,10 @@ def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
             element.findings = _dedupe_findings(element.findings)
             kept.append(element)
         page.elements = kept
+        page.reconcile_flows()
         _mark_resolved_findings(page.findings)
         page.findings = _dedupe_findings(page.findings)
         for index, artifact in enumerate(page.artifacts, start=1):
             artifact.id = f"p{page.page_number:04d}-a{index:04d}"
-    plan.plan_revision = max(plan.plan_revision, 3)
+    plan.plan_revision = max(plan.plan_revision, 4)
     return plan

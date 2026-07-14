@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-pdf-remediation"
-version = "0.3.0"
+version = "0.4.0"
 description = "LLM-first accessibility remediation for fixed-layout archival PDFs"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]

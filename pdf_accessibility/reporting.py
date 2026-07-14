@@ -265,8 +265,8 @@ def build_manifest(
         "plan_schema_version": plan.schema_version,
         "mode": preflight.selected_mode.value,
         "models": {
-            "proposal": {"id": planner_model, "reasoning_effort": planner_reasoning, "prompt_version": "proposal-v3"},
-            "review": {"id": reviewer_model, "reasoning_effort": reviewer_reasoning, "prompt_version": "review-v3"},
+            "proposal": {"id": planner_model, "reasoning_effort": planner_reasoning, "prompt_version": "proposal-v4"},
+            "review": {"id": reviewer_model, "reasoning_effort": reviewer_reasoning, "prompt_version": "review-v4"},
         },
         "responses": responses,
         "ocr": {
@@ -278,8 +278,15 @@ def build_manifest(
             "oversample_dpi": 300,
         },
         "compiler_strategy": {
-            "marked_content_granularity": "word",
-            "actual_text_strategy": "per_word_exact_joiners",
+            "marked_content_granularity": "visual_region",
+            "unicode_text_strategy": "direct_unicode_per_ocr_line",
+            "actual_text_strategy": "exceptional_region_fallback_only",
+            "geometry_alignment": "block_local_with_ocr_line_identity",
+            "structure_regions": "direct_visual_regions_integer_mcids",
+            "text_object_scope": "visual_region",
+            "content_stream_scope": "visual_region",
+            "layout_attributes": "word_union_bbox",
+            "parent_tree_granularity": "visual_region",
             "target_reader_profile": "acrobat",
         },
         "geometry_sources": geometry_sources or [],
@@ -298,6 +305,7 @@ def build_manifest(
             "structure_matches_plan": validation.get("structure_matches_plan"),
             "extraction_compatible": validation.get("extraction_compatible"),
             "transformations_valid": validation.get("transformations_valid"),
+            "block_plan_valid": validation.get("block_plan_valid"),
             "verapdf_pdfua_ok": validation.get("verapdf_pdfua_ok"),
         },
     }

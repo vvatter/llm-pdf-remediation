@@ -12,7 +12,7 @@ import pikepdf
 import pymupdf
 from pikepdf import Name
 
-from .models import DocumentPlan, ElementRole, ReviewStatus
+from .models import DocumentPlan, ElementRole, ReviewStatus, fragment_region_groups
 from .preflight import run_verapdf
 from .refine import transformation_errors
 
@@ -161,12 +161,26 @@ def _actual_text(value: object) -> str:
     return str(value)
 
 
+def _identity_unicode(value: object) -> str:
+    try:
+        encoded = bytes(value)
+    except (TypeError, ValueError):
+        return ""
+    if not encoded or len(encoded) % 2:
+        return ""
+    try:
+        return encoded.decode("utf-16-be")
+    except UnicodeDecodeError:
+        return ""
+
+
 def _page_mcids(pdf: pikepdf.Pdf) -> tuple[dict[int, dict[int, str]], list[str]]:
     pages: dict[int, dict[int, str]] = {}
     errors: list[str] = []
     for page_number, page in enumerate(pdf.pages, start=1):
         mcids: dict[int, str] = {}
-        stack: list[tuple[bool, int | None]] = []
+        stack: list[tuple[bool, int | None, bool]] = []
+        active_font = ""
         try:
             instructions = pikepdf.parse_content_stream(page)
         except (pikepdf.PdfError, ValueError) as error:
@@ -177,19 +191,71 @@ def _page_mcids(pdf: pikepdf.Pdf) -> tuple[dict[int, dict[int, str]], list[str]]
             operator = str(instruction.operator)
             operands = instruction.operands
             if operator == "BMC":
-                stack.append((str(operands[0]) == "/Artifact", None))
+                stack.append((str(operands[0]) == "/Artifact", None, False))
             elif operator == "BDC":
                 properties = operands[1] if len(operands) > 1 else None
                 is_artifact = str(operands[0]) == "/Artifact"
                 mcid = None
+                actual_text = (
+                    _actual_text(properties.get("/ActualText"))
+                    if isinstance(properties, pikepdf.Dictionary)
+                    else ""
+                )
+                inside_artifact = any(item[0] for item in stack) or is_artifact
                 if isinstance(properties, pikepdf.Dictionary) and "/MCID" in properties:
                     mcid = int(properties.MCID)
-                    if any(item[0] for item in stack) or is_artifact:
+                    if inside_artifact:
                         errors.append(f"page {page_number} MCID {mcid} is nested in an artifact")
                     if mcid in mcids:
                         errors.append(f"page {page_number} has duplicate MCID {mcid}")
-                    mcids[mcid] = _actual_text(properties.get("/ActualText"))
-                stack.append((is_artifact, mcid))
+                    mcids[mcid] = actual_text
+                elif actual_text and not inside_artifact:
+                    owner_mcid = next(
+                        (item[1] for item in reversed(stack) if item[1] is not None),
+                        None,
+                    )
+                    if owner_mcid is None:
+                        errors.append(
+                            f"page {page_number} ActualText span has no owning MCID"
+                        )
+                    else:
+                        mcids[owner_mcid] = mcids.get(owner_mcid, "") + actual_text
+                stack.append((is_artifact, mcid, bool(actual_text)))
+            elif operator == "Tf" and operands:
+                active_font = str(operands[0])
+            elif operator in {"Tj", "'", '"'}:
+                inside_artifact = any(item[0] for item in stack)
+                owner_mcid = next(
+                    (item[1] for item in reversed(stack) if item[1] is not None),
+                    None,
+                )
+                if (
+                    not inside_artifact
+                    and owner_mcid is not None
+                    and active_font == "/A11yAnchor"
+                    and not any(item[2] for item in stack)
+                ):
+                    text = _identity_unicode(operands[-1]) if operands else ""
+                    mcids[owner_mcid] = mcids.get(owner_mcid, "") + text
+            elif operator == "TJ":
+                inside_artifact = any(item[0] for item in stack)
+                owner_mcid = next(
+                    (item[1] for item in reversed(stack) if item[1] is not None),
+                    None,
+                )
+                if (
+                    not inside_artifact
+                    and owner_mcid is not None
+                    and active_font == "/A11yAnchor"
+                    and not any(item[2] for item in stack)
+                    and operands
+                ):
+                    text = "".join(
+                        _identity_unicode(item)
+                        for item in operands[0]
+                        if not isinstance(item, (int, float))
+                    )
+                    mcids[owner_mcid] = mcids.get(owner_mcid, "") + text
             elif operator == "EMC":
                 if stack:
                     stack.pop()
@@ -221,48 +287,148 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
         if isinstance(children, pikepdf.Dictionary):
             children = [children]
         referenced: set[tuple[int, int]] = set()
-        for element_index, element in enumerate(children):
-            role = str(element.get("/S", ""))
-            content_items = element.get("/K", [])
-            if isinstance(content_items, pikepdf.Dictionary):
+        element_ids: list[str] = []
+
+        def resolve_mcr(
+            content_item: pikepdf.Object | int,
+            owner: pikepdf.Object,
+            logical_index: int,
+        ) -> tuple[str, dict[str, int] | None]:
+            if isinstance(content_item, int):
+                page_obj = owner.get("/Pg")
+                mcid = int(content_item)
+            else:
+                page_obj = content_item.get("/Pg", owner.get("/Pg"))
+                mcid = int(content_item.MCID)
+            page_number = page_numbers.get(page_obj.objgen) if page_obj is not None else None
+            if page_number is None:
+                errors.append(
+                    f"structure element {logical_index} MCR has no resolvable page"
+                )
+                return "", None
+            key = (page_number, mcid)
+            if key in referenced:
+                errors.append(f"page {page_number} MCID {mcid} is referenced more than once")
+            referenced.add(key)
+            text = page_mcids.get(page_number, {}).get(mcid)
+            if text is None:
+                errors.append(
+                    f"structure element {logical_index} references missing "
+                    f"page {page_number} MCID {mcid}"
+                )
+                text = ""
+
+            struct_parent = int(pdf.pages[page_number - 1].obj.get("/StructParents", -1))
+            parent_array = parent_tree_by_key.get(struct_parent)
+            if not isinstance(parent_array, pikepdf.Array) or mcid >= len(parent_array):
+                errors.append(f"page {page_number} MCID {mcid} is absent from ParentTree")
+            elif parent_array[mcid].objgen != owner.objgen:
+                errors.append(f"page {page_number} MCID {mcid} ParentTree points elsewhere")
+            return text, {"page": page_number, "mcid": mcid}
+
+        def resolve_children(
+            owner: pikepdf.Object,
+            logical_index: int,
+        ) -> tuple[list[str], list[dict[str, int]], list[dict[str, object]]]:
+            content_items = owner.get("/K", [])
+            if isinstance(content_items, (int, pikepdf.Dictionary)):
                 content_items = [content_items]
             chunks: list[str] = []
             mcrs: list[dict[str, int]] = []
+            blocks: list[dict[str, object]] = []
             for content_item in content_items:
-                if not isinstance(content_item, pikepdf.Dictionary) or "/MCID" not in content_item:
-                    errors.append(f"structure element {element_index} has a non-MCR child")
+                if isinstance(content_item, int):
+                    text, mcr = resolve_mcr(content_item, owner, logical_index)
+                    chunks.append(text)
+                    if mcr is not None:
+                        mcrs.append(mcr)
                     continue
-                page_obj = content_item.get("/Pg", element.get("/Pg"))
-                page_number = page_numbers.get(page_obj.objgen) if page_obj is not None else None
-                mcid = int(content_item.MCID)
-                if page_number is None:
-                    errors.append(f"structure element {element_index} MCR has no resolvable page")
+                if not isinstance(content_item, pikepdf.Dictionary):
+                    errors.append(
+                        f"structure element {logical_index} has an unsupported child"
+                    )
                     continue
-                key = (page_number, mcid)
-                if key in referenced:
-                    errors.append(f"page {page_number} MCID {mcid} is referenced more than once")
-                referenced.add(key)
-                text = page_mcids.get(page_number, {}).get(mcid)
-                if text is None:
-                    errors.append(f"structure element {element_index} references missing page {page_number} MCID {mcid}")
-                    text = ""
+                if str(content_item.get("/Type", "")) == "/StructElem":
+                    child_id = str(content_item.get("/ID", ""))
+                    if child_id:
+                        element_ids.append(child_id)
+                    parent = content_item.get("/P")
+                    if parent is None or parent.objgen != owner.objgen:
+                        errors.append(
+                            f"structure element {logical_index} has a child with the wrong parent"
+                        )
+                    child_chunks, child_mcrs, descendants = resolve_children(
+                        content_item, logical_index
+                    )
+                    attributes = content_item.get("/A", {})
+                    bbox = (
+                        [float(value) for value in attributes.get("/BBox", [])]
+                        if isinstance(attributes, pikepdf.Dictionary)
+                        else []
+                    )
+                    blocks.append(
+                        {
+                            "id": str(content_item.get("/ID", "")),
+                            "role": str(content_item.get("/S", "")),
+                            "text": "".join(child_chunks),
+                            "bbox": bbox,
+                            "mcrs": child_mcrs,
+                        }
+                    )
+                    blocks.extend(descendants)
+                    chunks.extend(child_chunks)
+                    mcrs.extend(child_mcrs)
+                    continue
+                if "/MCID" not in content_item:
+                    errors.append(
+                        f"structure element {logical_index} has a non-MCR content child"
+                    )
+                    continue
+                text, mcr = resolve_mcr(content_item, owner, logical_index)
                 chunks.append(text)
-                mcrs.append({"page": page_number, "mcid": mcid})
+                if mcr is not None:
+                    mcrs.append(mcr)
+            return chunks, mcrs, blocks
 
-                struct_parent = int(pdf.pages[page_number - 1].obj.get("/StructParents", -1))
-                parent_array = parent_tree_by_key.get(struct_parent)
-                if not isinstance(parent_array, pikepdf.Array) or mcid >= len(parent_array):
-                    errors.append(f"page {page_number} MCID {mcid} is absent from ParentTree")
-                elif parent_array[mcid].objgen != element.objgen:
-                    errors.append(f"page {page_number} MCID {mcid} ParentTree points elsewhere")
-
+        for element_index, element in enumerate(children):
+            role = str(element.get("/S", ""))
+            chunks, mcrs, blocks = resolve_children(element, element_index)
             alt = str(element.get("/Alt", ""))
             text = "".join(chunks)
+            semantic_role = (
+                str(blocks[0].get("role", ""))
+                if role == "/Div" and blocks
+                else role
+            )
+            if role == "/Div" and any(
+                block.get("role") != semantic_role for block in blocks
+            ):
+                errors.append(
+                    f"structure element {element_index} has inconsistent block roles"
+                )
             if role == "/Figure" and not alt.strip():
                 errors.append(f"figure structure element {element_index} has no alternate text")
-            if not text and not (role == "/Figure" and alt):
+            if not text and not (semantic_role == "/Figure" and alt):
                 errors.append(f"structure element {element_index} is empty")
-            records.append({"role": role, "text": text, "alt_text": alt, "mcrs": mcrs})
+            records.append(
+                {
+                    "role": semantic_role,
+                    "container_role": role,
+                    "id": str(element.get("/ID", "")),
+                    "text": text,
+                    "alt_text": alt,
+                    "mcrs": mcrs,
+                    "blocks": blocks,
+                }
+            )
+            element_id = str(element.get("/ID", ""))
+            if element_id:
+                element_ids.append(element_id)
+
+        if element_ids and "/IDTree" not in root:
+            errors.append("structure elements have IDs but StructTreeRoot has no IDTree")
+        if len(element_ids) != len(set(element_ids)):
+            errors.append("structure element IDs are not unique")
 
         for page_number, mcids in page_mcids.items():
             for mcid in mcids:
@@ -275,16 +441,73 @@ def compare_structure_to_plan(serialized: dict[str, object], plan: DocumentPlan)
     errors: list[str] = list(serialized.get("errors", []))
     actual = list(serialized.get("elements", []))
     expected = [element for page in plan.pages for element in page.elements]
-    if len(actual) != len(expected):
-        errors.append(f"structure has {len(actual)} elements; plan has {len(expected)}")
-    for index, (record, element) in enumerate(zip(actual, expected, strict=False)):
+    cursor = 0
+    for index, element in enumerate(expected):
         expected_role = EXPECTED_PDF_ROLES[element.role]
-        if record["role"] != expected_role:
-            errors.append(f"element {index} role {record['role']} != {expected_role}")
-        if record["text"] != element.semantic_text:
+        region_ids = [element.id]
+        if element.role == ElementRole.P and len(element.visible_fragments) > 1:
+            groups = fragment_region_groups(element.visible_fragments)
+            if len(groups) > 1:
+                region_ids = [
+                    element.visible_fragments[group[0]].id for group in groups
+                ]
+        records = actual[cursor : cursor + len(region_ids)]
+        cursor += len(region_ids)
+        if len(records) != len(region_ids):
+            errors.append(
+                f"element {index} has {len(records)} structure regions; "
+                f"expected {len(region_ids)}"
+            )
+            continue
+        for region_index, (record, _) in enumerate(
+            zip(records, region_ids, strict=True)
+        ):
+            if record["role"] != expected_role:
+                errors.append(
+                    f"element {index} region {region_index} role "
+                    f"{record['role']} != {expected_role}"
+                )
+        if "".join(str(record["text"]) for record in records) != element.semantic_text:
             errors.append(f"element {index} exact text does not match canonical plan")
-        if element.role == ElementRole.FIGURE and record["alt_text"] != (element.alt_text or ""):
+        if (
+            element.role == ElementRole.FIGURE
+            and records[0]["alt_text"] != (element.alt_text or "")
+        ):
             errors.append(f"figure {index} alternate text does not match canonical plan")
+    if cursor != len(actual):
+        errors.append(
+            f"structure has {len(actual)} regions; canonical plan accounts for {cursor}"
+        )
+    return errors
+
+
+def block_plan_errors(plan: DocumentPlan) -> list[str]:
+    errors: list[str] = []
+    for page in plan.pages:
+        blocks = [
+            fragment
+            for element in page.elements
+            for fragment in element.visible_fragments
+        ]
+        block_ids = [fragment.id for fragment in blocks]
+        if len(block_ids) != len(set(block_ids)):
+            errors.append(f"page {page.page_number}: duplicate visual block identifiers")
+        if page.block_order != block_ids:
+            errors.append(
+                f"page {page.page_number}: flow order does not match semantic block order"
+            )
+        for fragment in blocks:
+            if fragment.bbox is None:
+                errors.append(f"{fragment.id}: visual block has no bounding box")
+                continue
+            left, top, right, bottom = fragment.bbox
+            if not (
+                0 <= left < right <= 1000
+                and 0 <= top < bottom <= 1000
+            ):
+                errors.append(f"{fragment.id}: visual block box is outside normalized bounds")
+            if fragment.alignment_coverage is None or fragment.geometry_source is None:
+                errors.append(f"{fragment.id}: visual block was not locally aligned")
     return errors
 
 
@@ -347,6 +570,7 @@ def validate_output(
     structure_errors = compare_structure_to_plan(serialized, plan) if plan else serialized["errors"]
     extraction = _extraction_compatibility(output, plan)
     plan_transformation_errors = transformation_errors(plan) if plan else []
+    plan_block_errors = block_plan_errors(plan) if plan else []
     with pikepdf.Pdf.open(output) as pdf:
         has_structure_tree = "/StructTreeRoot" in pdf.Root
         marked = bool(pdf.Root.get("/MarkInfo", {}).get("/Marked", False))
@@ -386,6 +610,8 @@ def validate_output(
         "page_labels_present": page_labels_present,
         "transformation_errors": plan_transformation_errors,
         "transformations_valid": not plan_transformation_errors,
+        "block_plan_errors": plan_block_errors,
+        "block_plan_valid": not plan_block_errors,
         "source_visual_fidelity": source_fidelity,
         "source_visual_fidelity_ok": (
             source_fidelity["within_tolerance"] if source_fidelity else True
@@ -430,6 +656,7 @@ def release_pdfua(
             report["fully_tagged"],
             report["page_labels_present"],
             report["transformations_valid"],
+            report["block_plan_valid"],
             report["extraction_compatible"],
             report["declares_pdfua"],
             vera_ok is True,

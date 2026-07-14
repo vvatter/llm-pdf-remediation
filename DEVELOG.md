@@ -211,7 +211,545 @@ optimization was mixed into this release.
    current fidelity, extraction, structure, Acrobat, and veraPDF result to remain equal
    or better.
 4. Add the document/article graph and the newsletter-relevant roles `Caption`, lists,
-   `TOC`, and `Formula`; then replace page-wide alignment with region/line alignment.
+   `TOC`, and `Formula`; then extend block-local alignment with line-level weighted
+   matching where formulas or insertions need it.
 5. Treat native preservation as a longer-term compiler project: tag or replace existing
    text objects instead of layering duplicate anchors. Keep it experimental until it
    passes the same extraction and reader-behavior gates as facsimile mode.
+
+## 2026-07-13: Nested-Column Reading Order (Version 0.4.0)
+
+### User-observed failure
+
+Acrobat reading of page 1 in the 2007 issue did not reliably finish the narrow lower
+left subcolumn before moving to the middle and right columns. This page does not have a
+single ordinary two-column grid: a full-width introductory paragraph is followed by a
+narrow lower-left list, a middle continuation, a right continuation, and an independent
+two-column contents box below the article.
+
+### Finding: the reviewed model plan was already correct
+
+The saved Sol review had interpreted the page image correctly. In particular:
+
+- `p0001-e0010-b001` is the article text at the bottom of the narrow left subcolumn and
+  `p0001-e0010-b002` is its continuation at the top of the middle subcolumn;
+- `p0001-e0011-b001` continues down the middle subcolumn and
+  `p0001-e0011-b002` resumes at the top of the right column;
+- the remaining right-column article text precedes the independent contents box.
+
+The structure-tree serializer and `pdftotext -raw` also produced that intended logical
+sequence. The failure was therefore downstream of the model's page interpretation.
+The prior compiler flattened all word MCRs directly under each paragraph and aligned
+geometry against a page-wide word stream. A paragraph's union box could span two
+disjoint columns without preserving the model's internal block boundaries in the PDF
+tag tree.
+
+### Intermediate experiment: block-local alignment alone
+
+Schema v4 introduced stable visual-block IDs and page flows. The compiler partitioned
+canonical tokens by fragment and aligned each group only against words inside that
+fragment's bounding box. A regression test deliberately interleaved left- and
+right-block source words and proved that placement remained local.
+
+The first 2007 rebuild passed every machine gate, but forensic comparison with the
+previous PDF showed that the two affected paragraphs already had the same word
+coordinates. Block-local alignment prevented future cross-column misalignment, but it
+did not by itself change the empirical Acrobat case. This negative result is important:
+correct word coordinates and a correct flat transcript are not sufficient evidence of
+robust block traversal.
+
+### First block-structure implementation
+
+- Terra and Sol prompt schemas now require atomic rectangular fragments and explicit
+  flows that own every meaningful block exactly once in reading order.
+- Schema-v1 through schema-v3 plans migrate to schema v4; reviewed plans retain their
+  status and derive a default flow from their existing canonical order.
+- Logical paragraphs remain paragraphs when they cross columns, but the PDF structure
+  now gives each text block an ordered `/Span` child with a stable `/ID` and PDF-space
+  `/BBox`.
+- Each word MCID's ParentTree entry points to its immediate block span. The recursive
+  structure serializer verifies block order, IDs, bounding boxes, MCR ownership, exact
+  logical text, and orphan/duplicate conditions.
+- Decoration-only fragments that contribute no accessible token, such as blank form
+  writing lines and declared decorative pointers, become explicit artifacts instead of
+  empty tagged spans.
+- A zero-area legacy block box may be repaired from page geometry only with at least
+  50% visible-token agreement. Valid reviewed boxes are never replaced by this path.
+- The compiler strategy and prompt versions are recorded as `block_local`,
+  `proposal-v4`, and `review-v4` in the build manifest.
+
+### Regression and golden rebuild results
+
+The test suite now has 16 passing tests, including interleaved nested-column geometry,
+single flow ownership, nested block serialization, ParentTree validation, and removal
+of decoration-only fragments. It also covers invalid legacy-box recovery without
+weakening valid block locality.
+
+The saved 2007 proposal and review checkpoints were reused; no new model calls were
+made. The rebuilt document contains 204 logical semantic elements, 263 visual blocks,
+and 33 artifacts. Page 1 has 21 reviewed fragments in one explicit reading sequence.
+For the affected article, `p0001-e0010` now owns two block spans containing 11 and 31
+word MCRs; `p0001-e0011` owns two block spans containing 75 and 16 word MCRs. The prior
+PDF exposed each paragraph as one flat MCR array.
+The release passed:
+
+- exact selected-base rendering and source-to-base fidelity;
+- qpdf integrity and complete tagging;
+- recursive logical-element and block-level structure comparison;
+- transformation reconstruction;
+- `pdftotext -raw` agreement and token-count ratio of 1.000000;
+- veraPDF PDF/UA-1.
+
+The global compiler change was also run against the 1996 and 2004 golden documents. It
+found two useful cross-corpus edge cases: an omitted arrow before a 2004 photograph
+caption, and one 2004 caption box that an older mixed-coordinate migration had collapsed
+to zero height. The arrow is now a declared decoration artifact. The invalid caption
+box was recovered from all 33 matching native words with 1.000 alignment coverage.
+
+| Input | Logical elements | Visual blocks | Artifacts | Extraction agreement/ratio | Released |
+| --- | ---: | ---: | ---: | --- | --- |
+| 1996 | 125 | 141 | 5 | 1.000000 / 1.000000 | yes |
+| 2004 | 260 | 283 | 39 | 1.000000 / 1.000000 | yes |
+| 2007 | 204 | 263 | 33 | 1.000000 / 1.000000 | yes |
+
+All three reused their saved proposal and review checkpoints, preserved their existing
+facsimile sizes, and passed block validation, recursive structure comparison, source
+fidelity, and veraPDF PDF/UA-1.
+
+The resulting accessible PDF remained approximately 11.9 MB because the visible
+facsimile base was unchanged.
+
+### Acrobat retest: nested spans were not separate reading regions
+
+The same Acrobat configuration still read from the first list item directly into
+“down to Gainesville owing to our special...”. This disproved the assumption that a
+`/Span` child and its `/BBox` would make an independently ordered Acrobat reading
+region. The tag transcript, MCR order, and geometry were all correct, but the enclosing
+paragraph remained the region Acrobat used for layout traversal.
+
+[Adobe's Reading Order documentation](https://helpx.adobe.com/acrobat/using/touch-reading-order-tool-pdfs.html)
+states that text inside a contiguous region is ordered left-to-right and top-to-bottom,
+and that a region containing multiple columns or irregular flow must be divided into
+separate parts. This behavior matches the observed jump exactly.
+
+### Role-bearing block regions
+
+The compiler now represents every text element as a logical `/Div` container. Each
+model-reviewed rectangular block is an ordered child carrying the actual semantic role
+(`/P`, `/H1`, `/H2`, or `/H3`), its stable `/ID`, its `/BBox`, and its word MCRs. Thus a
+paragraph that crosses columns remains one logical plan element, while Acrobat sees two
+separate paragraph regions instead of one disjoint parent region. Figures remain direct
+`/Figure` elements.
+
+On page 1, the conference list is now one rectangular `/P` region with 71 word MCRs.
+The next cross-column paragraph is represented by two ordered `/P` regions with 11 and
+31 MCRs, and the following paragraph by two ordered `/P` regions with 75 and 16 MCRs.
+The ParentTree points every word directly to its role-bearing block region.
+
+The revised 2007 build again passed exact rendering, 1.000000 extraction agreement and
+token ratio, recursive block structure comparison, qpdf, and veraPDF PDF/UA-1. No model
+calls were made. Acrobat Read Out Loud remains the pending empirical acceptance test for
+this role-bearing-region revision.
+
+### Acrobat retest: complete list followed by a skipped paragraph
+
+The role-bearing-region build improved one symptom: Acrobat read the complete conference
+list. It then skipped all of `p0001-e0010`, beginning “The Annual Meeting of the
+Association of Symbolic Logic...”, and resumed at `p0001-e0011`, beginning “The year in
+logic...”. Preview did not reproduce two nearby word-pronunciation anomalies reported
+in Acrobat.
+
+Direct inspection found no missing or internally split source text:
+
+- `Computability` is one marked-content sequence, MCID 157, with the complete ASCII word
+  in both the encoded `Tj` operand and `/ActualText`.
+- `Singular` and `cardinal` are complete adjacent words, MCIDs 176 and 177; neither word
+  is split internally.
+- `p0001-e0010` owns the contiguous MCID range 208-249. Its first visual block contains
+  “The Annual Meeting ... was brought”; its second contains “down to Gainesville ...”.
+- The preceding list owns MCIDs 137-207 and the following paragraph owns MCIDs 250-340.
+- The ParentTree, structure-tree transcript, `/ToUnicode` mapping, and ordinary text
+  extraction all agree with that sequence.
+
+This makes the skipped paragraph an Acrobat traversal/interoperability failure rather
+than evidence that the approved plan omitted or reordered it. The unusual word breaks
+also appear to be Acrobat-specific because the marked content and Unicode mapping do
+not contain those breaks and Preview speaks the words normally.
+
+Adobe documents that tagged PDFs should use their logical structure order, but also
+provides an `Override The Reading Order In Tagged Documents` preference that can cause
+Acrobat to infer a different order. Adobe also describes Read Out Loud as a convenience
+feature rather than a screen reader. These facts make the Acrobat preference state an
+important manual test variable, but do not excuse a file that fails in the department's
+ordinary Acrobat configuration.
+
+### Comparison with official passing tagged PDFs
+
+The PDF Association's passing technique files exposed three material differences from
+our two wrapper experiments:
+
+- The correct-columns example `G4_03` places ordinary `/P` elements directly under
+  `/Document`; each `/P` directly owns its content MCIDs.
+- The one-container-per-word example `G2_02` uses same-page integer MCID children and
+  one `BT`/`ET` text object around multiple per-word marked-content sequences.
+- The semantically contiguous paragraph example `G5_03` uses one `/P` for the whole
+  paragraph. `/Div` is used selectively in examples such as a true sidebar, not as a
+  universal wrapper around every element.
+
+The PDF Association's general technique guidance also says that `/ActualText` attached
+to a marked-content sequence should use `/Span`. Our word containers already do this.
+The evidence therefore favored removing our extra structural regions while preserving
+word-level `/Span` marked content, exact `/ActualText`, and model-reviewed order.
+
+### Reference-aligned compiler experiment
+
+The compiler now follows that simpler reference shape:
+
+- Every logical `/P`, heading, and `/Figure` is a direct `/Document` child with its
+  stable plan ID.
+- A same-page text element owns an ordered array of integer MCIDs rather than `/MCR`
+  dictionaries or nested block structure elements.
+- Each page has one invisible `BT`/`ET` text object containing all per-word `/Span`
+  marked-content sequences.
+- Visual fragments and flows remain in schema v4 and continue to control block-local
+  word alignment, fallbacks, review overlays, and validation. They no longer force
+  extra tags into the semantic tree.
+- The structure serializer accepts both integer MCIDs and explicit MCR dictionaries,
+  verifies ParentTree ownership, and compares the direct element role, ID, and exact
+  text with the canonical plan.
+
+On page 1 the resulting structure is now unambiguous and minimal: the list is direct
+`/P p0001-e0009` with integer MCIDs 137-207, the formerly skipped paragraph is direct
+`/P p0001-e0010` with MCIDs 208-249, and the next paragraph is direct
+`/P p0001-e0011` with MCIDs 250-340. The page anchor stream contains one `BT`, one `ET`,
+and 792 marked-content sequences.
+
+The full 2007 rebuild reused the approved saved plans and made no model calls. It passed
+all 16 unit tests, exact rendering, qpdf, block-plan validation, exact structure-plan
+comparison, 1.000000 extraction agreement and token ratio, and veraPDF PDF/UA-1. The
+controlled Acrobat test file is
+`build/2007_newsletter/2007_newsletter.accessible.acrobat-reference.pdf`, SHA-256
+`15fb70b52f9ab6f810a1b29fd41033aa3f004b48225a4d84cb94fa19b34a00cd`.
+
+This experiment is mechanically valid and closer to official passing examples, but its
+Read Out Loud behavior remains pending manual Acrobat testing. The wrapper experiments
+remain recorded above as useful negative results.
+
+### Acrobat retest: the discontiguous paragraph had no clickable region
+
+Acrobat would not merely skip `p0001-e0010` during continuous reading. With Read Out
+Loud active, neither “The Annual Meeting...” nor its “down to Gainesville...”
+continuation could be clicked as a paragraph. Other nearby paragraphs remained
+clickable. This is stronger evidence that Acrobat failed to construct a usable reading
+region for the structure element.
+
+The reference-aligned tree still represented both visual fragments as one direct `/P`.
+Its derived union box was normalized `[88.235, 524.318, 574.118, 769.327]`: a diagonal
+combination of the bottom-left fragment and the top-middle fragment. That union overlaps
+the next cross-column paragraph's large union box through much of the middle column.
+The individual fragment boxes themselves are rectangular and nonoverlapping:
+
+- `p0001-e0010-b001`: `[86.601, 746.212, 306.699, 771.465]`;
+- `p0001-e0010-b002`: `[332.353, 522.601, 579.248, 592.803]`.
+
+The content MCIDs, word boxes, ParentTree, and text remained correct. The defect was the
+mapping of two disjoint hit-test areas to one semantic structure node.
+
+### Direct visual-region paragraphs
+
+The compiler now gives every rectangular fragment of a multi-block paragraph its own
+consecutive, top-level `/P`. It does not add an enclosing `/Div`. Single-block
+paragraphs, headings, and figures retain one direct structure element. The canonical
+schema-v4 plan still owns the whole logical paragraph, and validation groups the direct
+regions back together to require the original role, fragment IDs, order, and exact
+concatenated text.
+
+For the affected page, the resulting direct children are:
+
+- `/P p0001-e0009`, MCIDs 137-207: the complete conference list;
+- `/P p0001-e0010-b001`, MCIDs 208-218: “The Annual Meeting ... was brought”;
+- `/P p0001-e0010-b002`, MCIDs 219-249: “down to Gainesville ...”;
+- `/P p0001-e0011-b001`, MCIDs 250-324: the middle-column continuation;
+- `/P p0001-e0011-b002`, MCIDs 325-340: its right-column continuation.
+
+All five are direct `/Document` children. Each page still uses one invisible text object
+and word-level `/Span` marked content with exact `/ActualText`. A regression test now
+requires a two-block paragraph to compile as two direct `/P` regions with independent
+integer MCID arrays and no wrapper.
+
+The full 2007 rebuild reused the saved approved plan and made no model calls. It passed
+all 17 unit tests, exact rendering, qpdf, block-plan validation, exact grouped
+structure-plan comparison, 1.000000 extraction agreement and token ratio, and veraPDF
+PDF/UA-1. The controlled test file is
+`build/2007_newsletter/2007_newsletter.accessible.direct-regions.pdf`, SHA-256
+`6ebb8038fafed16e55f99d8087ba8a490af2b1bc1ee98e529b436f0b8c0d009f`.
+
+The expected improvement is independently clickable paragraph regions and uninterrupted
+Acrobat traversal. That behavior remains a manual acceptance test; automated validity
+does not establish Acrobat hit-testing behavior.
+
+### Acrobat retest: direct tags alone did not create hit targets
+
+The direct-region build still did not let Acrobat click either part of
+`p0001-e0010`. The top full-width paragraph on page 2 was another unclickable example.
+This falsified the hypothesis that direct `/P` tags and independent MCID arrays were
+sufficient.
+
+Page 2 supplied the missing diagnostic. `p0002-e0003` had two model-reviewed fragments:
+an overlapping drop-cap `T` and the remainder beginning `he Department...`. Those are
+not separate paragraph continuations and must not become two spoken paragraphs. The
+page-1 continuations and the page-2 drop-cap paragraph nevertheless shared one compiler
+property: their word sequences were embedded in a single page-wide `BT`/`ET` text
+object. Changing the tag tree had never changed that Acrobat-facing text-object
+boundary.
+
+### Connected visual regions and region-scoped text objects
+
+The compiler now groups nearby or overlapping fragments into connected visual regions.
+Overlapping drop caps and body text remain one `/P`; spatially disjoint column
+continuations become consecutive direct `/P` regions. The grouping uses connected
+components with a small normalized proximity tolerance, preserving semantic fragment
+order. This also prevents drop caps such as `T` + `he` from being spoken as separate
+paragraphs.
+
+Each connected visual region now receives its own invisible `BT`/`ET` text object.
+Word-level `/Span`, MCIDs, exact `/ActualText`, local geometry, and the ParentTree are
+unchanged. Thus the text-object boundaries, structure regions, and reviewed rectangular
+areas now agree.
+
+The affected structures are:
+
+- page 1 `p0001-e0010-b001`, MCIDs 208-218, in its own `/P` and text object;
+- page 1 `p0001-e0010-b002`, MCIDs 219-249, in the next `/P` and text object;
+- page 2 `p0002-e0003`, MCIDs 10-64, one `/P` and text object containing both the
+  overlapping drop cap and the rest of the full-width paragraph.
+
+Page 1 now has 21 balanced text objects for 21 connected visual regions; page 2 has 13.
+Two regression tests distinguish disjoint continuation regions from an overlapping
+drop-cap paragraph. The complete suite now has 18 passing tests.
+
+The rebuilt 2007 issue reused the saved approved plan and made no model calls. It passed
+exact rendering, qpdf, block-plan validation, exact grouped structure-plan comparison,
+1.000000 extraction agreement and token ratio, and veraPDF PDF/UA-1. The controlled
+Acrobat file is
+`build/2007_newsletter/2007_newsletter.accessible.region-text-objects.pdf`, SHA-256
+`272b794a2d1aea8b3d4fe8075b62f8228ebd57b7ffe9d0b07ecfecc36d00cae9`.
+
+Whether these region-scoped text objects restore Acrobat clicking remains a manual
+acceptance test.
+
+### Acrobat retest: page-local clicking improved, traversal remained broken
+
+Region-scoped text objects made the full-width opening paragraph on page 2 clickable.
+The two page-1 continuation regions still could not be clicked. A second failure was
+more diagnostic: clicking the page-2 byline “by Douglas Cenzer and Jean Larson” caused
+Acrobat to jump next to photographs on page 3 instead of reading the immediately
+following full-width paragraph.
+
+Low-level inspection found the expected page-2 sequence in every ordinary structure
+mechanism: heading, byline `/P` with MCIDs 4-9, full-width `/P` with MCIDs 10-64, then
+the page-2 figure and caption content. The `/Pg` references, ParentTree array, structure
+serializer, `pdfinfo -struct`, and extracted transcript all agreed. Official multi-page
+PDF Association examples also showed that direct document children are valid; a
+page-level `/Sect` wrapper was therefore not justified by the evidence.
+
+### Invalid structure identifiers
+
+Comparison with the
+[PDF Association's logical-structure reference](https://pdfa.org/download-area/cheat-sheets/LogicalStructureObjects.pdf)
+exposed a concrete defect: the compiler emitted `/ID` on every structure element but
+did not create the required `StructTreeRoot /IDTree` name tree. The identifiers were
+unique, and veraPDF's PDF/UA-1 profile did not report the missing map, but the PDF
+structure rules require an `/IDTree` whenever structure element IDs are present. This
+incomplete cross-reference is a plausible cause of Acrobat losing its place during
+object traversal.
+
+The IDs served only as compiler and validator bookkeeping. They now remain in the
+canonical plan JSON and are omitted from the PDF. The structure validator has a new
+invariant and regression assertion that rejects structure IDs without an `/IDTree` and
+also rejects duplicate IDs.
+
+### Direct layout boxes
+
+Each direct text region now also receives a `/Layout` attribute with a PDF-space
+`/BBox` calculated from the union of its actual placed word boxes. This gives Acrobat an
+explicit hit-test rectangle instead of requiring it to infer one from invisible glyphs.
+Unlike the earlier bbox experiments, these attributes are on direct semantic elements,
+with no `/Div` wrapper, one text object per connected region, and no incomplete
+identifier map.
+
+The critical regions are now:
+
+- page 1 first continuation: MCIDs 208-218, bbox
+  `[54.000, 182.693, 185.040, 200.700]`;
+- page 1 second continuation: MCIDs 219-249, bbox
+  `[203.580, 325.793, 351.360, 376.740]`;
+- page 2 byline: MCIDs 4-9, bbox `[36.720, 705.952, 180.000, 713.700]`;
+- page 2 full-width paragraph: MCIDs 10-64, bbox
+  `[36.360, 651.052, 575.460, 694.800]`.
+
+The rebuilt issue passes all 18 tests, exact rendering, qpdf, block-plan validation,
+exact grouped structure-plan comparison, 1.000000 extraction agreement and token ratio,
+and veraPDF PDF/UA-1. It contains 224 direct semantic regions, zero structure element
+IDs, and no `/IDTree`. The controlled Acrobat file is
+`build/2007_newsletter/2007_newsletter.accessible.acrobat-bbox.pdf`, SHA-256
+`64c5e1d59f5442fa1dccd2ad88f46891473ce6fff48bd2b6ec4573d631996051`.
+
+Acrobat clicking and byline-to-paragraph traversal remain manual acceptance tests.
+
+### Acrobat retest: explicit boxes and identifier repair were insufficient
+
+The direct `/Layout /BBox` build still left both fragments of `p0001-e0010` and the
+top-right continuation `p0001-e0011-b002` unclickable. Page 2 still advanced from the
+byline directly to photographs on page 3. Explicit rectangles and removal of the
+incomplete structure identifiers therefore did not fix Acrobat Read Out Loud.
+
+The local Acrobat installation is version `26.001.21662`. Its persisted
+`com.adobe.Acrobat.Pro` preferences contain `DC.Accessibility.CheckReadMode = 1` and
+`ReadingMode = 3`, but no `ReadOrderOverride` entry. The Accessibility plugin binary
+identifies `ReadOrderOverride` as the relevant preference key. Thus there is no evidence
+that the tested Acrobat configuration was explicitly overriding tagged-document order.
+The PDF structure remained the primary suspect.
+
+### Finding: tag regions still owned word-level MCIDs
+
+The direct `/P` elements appeared region-level in the tag tree, but each owned an array
+of word MCIDs. The physical marked-content sequence for every MCID was `/Span`, not
+`/P`. Page 1 therefore exposed 792 independent ParentTree content items and page 2
+exposed 742. The region's `/P` role and `/BBox` did not correspond to one physical
+marked-content object that Acrobat could select or advance through.
+
+This differs materially from the PDF Association's passing multi-column example, where
+each semantic paragraph is associated with a paragraph marked-content region. The
+passing one-container-per-word example uses the containing semantic role for each
+numbered container. Our combination of a direct `/P`, many `/Span` MCIDs, and invisible
+nongeometric word jumps matched neither reference pattern.
+
+### Region MCIDs with nested word corrections
+
+The compiler now emits one outer marked-content sequence per connected visual region:
+
+```text
+/P <</MCID 8>> BDC
+BT
+  /Span <</ActualText (...)>> BDC ...word glyph... EMC
+  /Span <</ActualText (...)>> BDC ...word glyph... EMC
+ET
+EMC
+```
+
+The outer tag matches the semantic structure element and supplies its only integer
+MCID. Each word retains its exact `/ActualText` and geometry in an unnumbered nested
+`/Span`. The ParentTree consequently has one entry per region rather than one entry per
+word. The structure serializer now accumulates nested `/ActualText` into its owning
+outer MCID and still compares the exact reconstructed region text with the canonical
+plan.
+
+The critical physical and logical sequence is now:
+
+- page 1: 21 connected regions, 21 MCIDs, and 792 nested word corrections;
+- page 1 first continuation: `/P`, MCID 8;
+- page 1 second continuation: `/P`, MCID 9;
+- page 1 middle continuation: `/P`, MCID 10;
+- page 1 top-right continuation: `/P`, MCID 11;
+- page 2: 13 connected regions, 13 MCIDs, and 742 nested word corrections;
+- page 2 byline: `/P`, MCID 1;
+- page 2 full-width paragraph: the immediately following `/P`, MCID 2.
+
+The rebuilt document passes all 18 tests, exact rendering, qpdf, block-plan validation,
+exact structure-plan comparison, 1.000000 extraction agreement and token ratio, and
+veraPDF PDF/UA-1. The controlled Acrobat file is
+`build/2007_newsletter/2007_newsletter.accessible.region-mcids.pdf`, SHA-256
+`a34a2d30a77dd129062ec7e807ba90a79b4baf64599be8fb7f8bfaba669497f1`.
+
+Clickability of the page-1 region MCIDs and continuous traversal from page-2 MCID 1 to
+MCID 2 remain the manual acceptance tests.
+
+## 2026-07-14: Direct Unicode Line Layer
+
+### Decision after the region-MCID Acrobat retest
+
+Acrobat still could not click the page-1 continuation regions in the region-MCID build,
+and page 2 still advanced from the byline to photographs on page 3. This falsified the
+remaining hypothesis that finer tag-tree variations alone would make the existing
+synthetic word layer interoperable. `/Sect`/`/Div` wrappers, structure IDs, direct
+`/Layout /BBox`, region-scoped `BT`/`ET`, direct `/P` regions, and region MCIDs had all
+been tried without fixing both failures.
+
+The selected next strategy was a conventional canonical Unicode text layer:
+
+- keep the visible facsimile byte stream inside `/Artifact` without repainting it;
+- keep the independently model-reviewed visual blocks and reading order;
+- emit one direct semantic MCID and one content stream per connected visual region;
+- encode the corrected Unicode itself in ordinary invisible `Tj` strings;
+- place one string per measured OCR/native line;
+- reserve `/ActualText` for exceptional characters that the embedded font cannot
+  represent.
+
+Semantic raster tiles, native visible-text reconstruction, an Acrobat-authored control,
+and dropping Read Out Loud as a goal were not selected. Native visible-text
+reconstruction remains conceptually possible but would be a different project because
+it would redraw the page. The workflow will not add a human-remediation or write-back
+stage. Ambiguities continue to be logged without blocking, and Read Out Loud remains an
+interoperability target alongside real screen-reader testing.
+
+### OCR geometry and line preservation
+
+OCRmyPDF's hidden Tesseract layer supplies word geometry. PyMuPDF exposes each word as
+`(x0, y0, x1, y1, text, block, line, word)`. The previous compiler discarded the last
+three identifiers and kept only word boxes. The compiler now retains `(block, line)`
+through block-local `SequenceMatcher(..., autojunk=False)` alignment. Corrected tokens
+inherit the line identity of the OCR/native word they replace; insertions inherit nearby
+evidence. Geometric vertical overlap remains a fallback for native sources or style
+changes that split a logical line into multiple source records.
+
+Each corrected line is encoded directly with the embedded Type 0/CIDFontType2 font,
+its `/ToUnicode` map, and an invisible rendering mode. Font size and horizontal scale
+are derived from the union of the aligned word boxes. Physical content-stream order is
+therefore identical to the approved structure order, while selection geometry follows
+the printed lines rather than hundreds of independently positioned word replacements.
+
+Regions with no usable source words initially exposed a separate problem. Photo alt
+text and the curved Cantor quotation were compressed into one long invisible line;
+Poppler then discarded physically tiny spaces, reducing extraction agreement to
+`0.975521` and token-count ratio to `0.962271`. The release gate correctly withheld that
+draft even though qpdf, exact rendering, structure comparison, and veraPDF passed.
+
+The fallback now wraps only no-geometry regions into bounded synthetic lines inside the
+reviewed region box. This raised extraction agreement to `0.991391` and token-count
+ratio to `0.988297`, above the existing release thresholds. Tab, LF, and CR are mapped
+as zero-width Unicode CIDs, so exact list-item joiners remain direct text. This removed
+the otherwise necessary region-wide `/ActualText` from the page-1 conference list,
+where Acrobat had pronounced `Computability` and `cardinal` as split words.
+
+### Controlled 2007 result
+
+The controlled candidate is
+`build/2007_newsletter/2007_newsletter.accessible.direct-unicode.pdf`, SHA-256
+`0f4cf03534e492aa89af97f10c5827500b98362f8622e279e48e6c2fd181bb52`.
+It is 11,431,193 bytes; the OCR facsimile remains the dominant file-size cost.
+The same strategy was then promoted through the ordinary release pipeline as
+`build/2007_newsletter/2007_newsletter.accessible.pdf`, SHA-256
+`e99ac2a1ea3b2cb0dcd792d6f69e168e002be1bf730b3061fdb54d8d87cb77c2`.
+
+Automated results:
+
+- 19 unit tests pass, including a two-line direct-Unicode geometry regression;
+- exact base-to-output rendering and sampled source fidelity pass;
+- qpdf reports no syntax or stream errors;
+- the direct-text-aware structure serializer exactly matches all 224 plan regions;
+- the block plan and transformation reconstruction pass;
+- Poppler extraction passes at `0.991391` agreement and `0.988297` token ratio;
+- veraPDF 1.30.2 passes PDF/UA-1 with 106 rules, 42,740 checks, and zero failures.
+
+Page 1 contains 21 semantic streams, 21 region MCIDs, 123 direct line strings, zero
+nested spans, and zero `/ActualText` regions. The previously unclickable regions are
+direct `/P` MCIDs 8–11 with 2, 5, 13, and 2 line strings. Page 2 contains 13 semantic
+streams; its heading, byline, and opening full-width paragraph are consecutive MCIDs
+0, 1, and 2 with 1, 1, and 5 line strings. Pages 1–11 require no `/ActualText`; six
+page-12 regions use the exceptional-character fallback.
+
+These automated results establish conventional Unicode content, geometry, order,
+tagging, and unchanged appearance. Acrobat click selection and the page-2 byline
+continuous-reading transition remain manual acceptance tests and must not be claimed as
+fixed until the controlled candidate is retested in Acrobat.

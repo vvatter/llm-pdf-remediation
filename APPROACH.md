@@ -48,7 +48,7 @@ source PDF
                             always chooses a canonical page
                                     |
                                     v
-                           canonical schema-v2 plan
+                           canonical schema-v4 plan
                                     |
                  selected visible base + geometry
                                     |
@@ -123,9 +123,11 @@ source/page hashes are retained in the build record.
 
 ## Canonical Schema
 
-Schema version 3 gives every element a stable `pNNNN-eNNNN` identifier and records:
+Schema version 4 gives every element a stable `pNNNN-eNNNN` identifier, gives every
+rectangular visual block a stable identifier, and records:
 
-- visible fragments and their evidence references;
+- visible fragments, their normalized boxes, and their evidence references;
+- page flows that own every visual block exactly once in reading order;
 - exact visible and accessible text;
 - declared transformations;
 - semantic role and normalized bounding box;
@@ -134,6 +136,12 @@ Schema version 3 gives every element a stable `pNNNN-eNNNN` identifier and recor
 - findings, alternatives, and chosen readings;
 - review status;
 - deterministic word offsets.
+
+Logical elements and visual blocks are deliberately separate. A paragraph that begins
+at the bottom of one column and continues at the top of another remains one `P`, but it
+has two ordered rectangular fragments. A fragment may not span disjoint columns. The
+page flow makes reading order explicit even when global top-to-bottom or left-to-right
+coordinates would interleave independent articles, sidebars, or contents boxes.
 
 Every page declares its coordinate space. Model output is constrained to
 `normalized_0_1000`, OCR/native evidence boxes are normalized before prompting, and
@@ -152,7 +160,8 @@ newlines, nonbreaking spaces, and other joiners. This replaces the earlier pract
 appending a generic space to every word.
 
 Schema-v1 plans migrate automatically and are marked `legacy_unreviewed`. Reviewed
-schema-v2 plans retain their approval while their point-space geometry is migrated.
+schema-v2 and schema-v3 plans retain their approval while their geometry and default
+page flows are migrated.
 Original JSON is backed up. The next ordinary run can use each schema-v1 page as a
 proposal and put it through the independent review stage.
 
@@ -165,23 +174,60 @@ It:
 - suppresses uncorrected OCR text form streams after extracting their geometry;
 - embeds an open TrueType font as a Type 0/CIDFontType2 resource;
 - creates explicit widths, a CID-to-GID map, and `/ToUnicode` mapping;
-- aligns canonical tokens to native or OCR word boxes;
-- emits invisible glyphs at those boxes;
-- emits one marked-content sequence and MCID per word;
-- places the exact word plus its original following joiner in `/ActualText`;
-- creates paragraph- or heading-level structure elements owning ordered MCRs;
+- partitions canonical tokens by their model-reviewed visual fragments;
+- aligns each fragment only to native or OCR words inside that fragment's box;
+- retains OCR/native block and line identifiers through corrected-token alignment;
+- groups corrected tokens into measured visual lines, with a bounded synthetic line
+  layout only when a region has no usable source words;
+- emits corrected Unicode text directly in invisible line-level `Tj` strings;
+- emits one semantic marked-content sequence and MCID per connected visual region;
+- emits each reviewed visual region as a separate page content stream containing one
+  invisible `BT`/`ET` text object;
+- maps tab and newline controls as zero-width Unicode codes so exact joiners remain
+  direct text rather than region-wide replacements;
+- uses region-wide `/ActualText` only when the embedded font cannot represent an
+  exceptional character;
+- creates headings, figures, and single-block paragraphs directly under `/Document`;
+- emits each spatially disjoint region of a multi-block paragraph as a consecutive
+  direct `/P` so Acrobat has an independent reading and hit-test target;
+- stores each region's single same-page MCID as the integer child of its semantic
+  element;
+- records each text region's actual word-union box as a `/Layout /BBox` attribute;
+- keeps plan and fragment IDs in canonical JSON rather than emitting PDF structure
+  element `/ID` entries that would require a complete `/IDTree`;
 - builds the ParentTree and page `StructParents` values;
 - adds `/Tabs /S`, document language, title, viewer preference, and bookmarks.
 - adds decimal PDF page labels matching the printed pagination.
 
-The word-level strategy is an Acrobat compatibility profile, not part of the semantic
-plan. It is recorded in the manifest so another compiler strategy can be compared later
-without replanning the document.
+The region-level MCID with direct line Unicode is an Acrobat compatibility profile, not
+part of the semantic plan. It is recorded in the manifest so another compiler strategy
+can be compared later without replanning the document.
 
-The existing alignment uses page-wide `SequenceMatcher` with `autojunk=False`. It is
-adequate for the current proof corpus, but region, line, and weighted token alignment is
-deferred. Inserted text still uses nearby geometry and is surfaced through evidence and
-review findings rather than silently being treated as exact geometry.
+The visual blocks remain authoritative plan, geometry, and text-object units. They do
+not introduce extra `/Div` or `/Span` structure wrappers. Nearby or overlapping blocks,
+such as a drop cap and its body text, form one connected region. Spatially disjoint
+continuations become consecutive direct `/P` regions because Acrobat cannot reliably
+hit-test a single paragraph whose disjoint union overlaps another paragraph. Validation
+groups those regions back into the canonical logical element and requires their
+concatenated exact text to match the plan. This is an explicit Acrobat compatibility
+tradeoff: the canonical plan retains paragraph continuity even though the PDF tag tree
+exposes disjoint continuation regions separately. Region-scoped streams and text
+objects also keep the physical content order identical to the tag-tree order and avoid
+page-wide nongeometric text jumps.
+
+Page-wide agreement is used only to choose the better native or OCR geometry source.
+Token alignment then uses `SequenceMatcher` with `autojunk=False` separately inside
+each reviewed visual block. Source word block/line identifiers survive alignment into
+the corrected tokens, including replacements that inherit nearby evidence. If a block
+has no usable source words, its corrected text is wrapped into short synthetic lines
+inside that block rather than borrowed from another column. A future weighted aligner
+may improve difficult formulas and insertions, but global page alignment no longer
+controls anchor placement.
+
+One constrained legacy-repair path remains: a zero-area migrated block may recover its
+box from page words only when at least half of its visible tokens match. The recovered
+word union becomes the new block box, after which ordinary block-local alignment and
+validation apply. Valid reviewed boxes never take this path.
 
 ## Validation and Release Gates
 
@@ -192,14 +238,17 @@ The draft deliberately omits the PDF/UA identification metadata. Validation then
 3. Parses marked-content operators on every page.
 4. Checks MCID uniqueness and balanced marked-content sequences.
 5. Walks the structure tree in order.
-6. Resolves every MCR, page, and `/ActualText` value.
+6. Resolves every integer MCID or MCR and decodes direct Type 0 Unicode text, falling
+   back to `/ActualText` where explicitly present.
 7. Verifies every ParentTree entry and detects missing, duplicate, or orphan MCIDs.
 8. Requires nonempty semantic elements and alternate text for figures.
 9. Compares role and exact element text with the canonical plan.
-10. Reconstructs accessible text from exact transformation source/target spans.
-11. Compares Poppler `pdftotext -raw` tokens with the canonical transcript and rejects
+10. Verifies visual-block identifiers, single flow ownership, exact flow order, bounded
+    block geometry, and completed block-local alignment evidence.
+11. Reconstructs accessible text from exact transformation source/target spans.
+12. Compares Poppler `pdftotext -raw` tokens with the canonical transcript and rejects
     duplicated or substantially missing ordinary extraction.
-12. Samples original-to-base renders at 72 and 150 DPI and requires every page's mean
+13. Samples original-to-base renders at 72 and 150 DPI and requires every page's mean
     normalized channel difference to be at most 0.05 and material-difference fraction
     to be at most 0.25.
 
@@ -230,8 +279,8 @@ all WCAG 2.1 AA requirements have been met.
 
 Institutional acceptance should still include NVDA with Acrobat Reader on Windows,
 optionally JAWS, heading and figure navigation, continuous reading, search, selection,
-copy/paste, 400% zoom, narrow-window reflow, page navigation, and human review of names,
-dates, formulas, alternative text, and high-severity findings.
+copy/paste, 400% zoom, narrow-window reflow, and page navigation. Findings remain logged
+for audit and future model improvements; they do not pause the unattended build.
 
 ## Current Boundaries
 
@@ -240,7 +289,8 @@ semantic layer should add a document-level article graph plus captions, lists, t
 contents entries, formulas, quotations, and references. Explicit artifacts and page
 labels are now implemented.
 
-Other deferred work includes region/line dynamic-programming alignment, a write-back
-human reviewer, PAC automation, formal NVDA/JAWS scripts, native image-object tagging,
-mathematics font fallback, and a larger golden regression corpus. These additions can
-extend the saved plan and compiler without changing the central reviewed-plan boundary.
+Other deferred work includes region/line dynamic-programming alignment, PAC automation,
+formal NVDA/JAWS scripts, native image-object tagging, mathematics font fallback, and a
+larger golden regression corpus. An interactive human-remediation stage is explicitly
+out of scope; these additions can extend the saved plan and compiler without changing
+the central independently model-reviewed plan boundary.

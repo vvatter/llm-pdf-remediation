@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import textwrap
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -12,7 +11,14 @@ import pymupdf
 from fontTools.ttLib import TTFont
 from pikepdf import Array, Dictionary, Name, OutlineItem, Stream, String
 
-from .models import DocumentPlan, ElementRole, PageElement, exact_text_tokens
+from .models import (
+    DocumentPlan,
+    ElementRole,
+    PageElement,
+    TextFragment,
+    exact_text_tokens,
+    fragment_region_groups,
+)
 
 
 ROLE_NAMES = {
@@ -45,6 +51,20 @@ class AnchorFont:
 class WordPlacement:
     text: str
     bbox: tuple[float, float, float, float]
+    line_key: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class LinePlacement:
+    text: str
+    bbox: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class StructureRegion:
+    element: PageElement
+    chunks: list[AnchorChunk]
+    mcid: int
 
 
 def _as_contents_array(contents: pikepdf.Object | None) -> list[pikepdf.Object]:
@@ -120,17 +140,20 @@ def _make_anchor_font(pdf: pikepdf.Pdf, plan: DocumentPlan) -> AnchorFont:
         if ord(character) <= 0xFFFF
     }
     fallback = ord("?")
-    supported = {codepoint for codepoint in requested | {fallback} if codepoint in cmap}
+    control_codepoints = requested & {9, 10, 13}
+    supported = {
+        codepoint for codepoint in requested | {fallback} if codepoint in cmap
+    } | control_codepoints
     units_per_em = font["head"].unitsPerEm
 
     max_codepoint = max(supported)
     cid_to_gid = bytearray((max_codepoint + 1) * 2)
     widths = Array()
     for codepoint in sorted(supported):
-        glyph_name = cmap[codepoint]
-        glyph_id = font.getGlyphID(glyph_name)
+        glyph_name = cmap.get(codepoint)
+        glyph_id = font.getGlyphID(glyph_name) if glyph_name else 0
         cid_to_gid[codepoint * 2 : codepoint * 2 + 2] = glyph_id.to_bytes(2, "big")
-        advance, _ = font["hmtx"].metrics[glyph_name]
+        advance = font["hmtx"].metrics[glyph_name][0] if glyph_name else 0
         widths.extend([codepoint, Array([_scale_metric(advance, units_per_em)])])
 
     head = font["head"]
@@ -185,7 +208,11 @@ def _make_anchor_font(pdf: pikepdf.Pdf, plan: DocumentPlan) -> AnchorFont:
         )
     )
     advances = {
-        codepoint: _scale_metric(font["hmtx"].metrics[cmap[codepoint]][0], units_per_em)
+        codepoint: (
+            _scale_metric(font["hmtx"].metrics[cmap[codepoint]][0], units_per_em)
+            if codepoint in cmap
+            else 0
+        )
         for codepoint in supported
     }
     font.close()
@@ -210,32 +237,15 @@ def _ensure_anchor_font(page: pikepdf.Page, anchor_font: AnchorFont) -> None:
     page.obj[Name.Resources] = resources
 
 
-def _pdf_xy(element: PageElement, width: float, height: float) -> tuple[float, float]:
-    left, top, right, bottom = element.bbox
-    x = min(max(left / 1000 * width, 0.0), width)
-    y = min(max(height - (top / 1000 * height), 0.0), height)
-    return x, y
-
-
-def _unicode_lines(
-    text: str, supported_codepoints: frozenset[int], width: int = 80
-) -> list[bytes]:
-    flattened = " ".join(text.split())
-    wrapped = textwrap.wrap(
-        flattened,
-        width=width,
-        break_long_words=True,
-        break_on_hyphens=False,
-    ) or [""]
-    return [
-        "".join(
-            character
-            if ord(character) <= 0xFFFF and ord(character) in supported_codepoints
-            else "?"
-            for character in line
-        ).encode("utf-16-be")
-        for line in wrapped
-    ]
+def _direct_unicode_text(text: str, supported_codepoints: frozenset[int]) -> str:
+    return "".join(
+        character
+        if ord(character) <= 0xFFFF and ord(character) in supported_codepoints
+        else " "
+        if character.isspace()
+        else "?"
+        for character in text
+    )
 
 
 def _token_key(token: str) -> str:
@@ -244,6 +254,20 @@ def _token_key(token: str) -> str:
         character for character in decomposed if character.isalnum()
     )
     return letters_and_numbers or token
+
+
+def _word_bbox(word: tuple) -> tuple[float, float, float, float]:
+    return tuple(float(value) for value in word[:4])
+
+
+def _word_text(word: tuple) -> str:
+    return str(word[4])
+
+
+def _word_line_key(word: tuple) -> tuple[int, int] | None:
+    if len(word) < 7:
+        return None
+    return int(word[5]), int(word[6])
 
 
 def _subdivide_bbox(
@@ -261,13 +285,13 @@ def _subdivide_bbox(
     )
 
 
-def _allocate_replacement_boxes(
-    source_boxes: list[tuple[float, float, float, float]], count: int
-) -> list[tuple[float, float, float, float]]:
-    if not source_boxes:
+def _allocate_replacement_placements(
+    source_words: list[tuple], count: int
+) -> list[tuple[tuple[float, float, float, float], tuple[int, int] | None]]:
+    if not source_words:
         return []
     assignments = [
-        min(index * len(source_boxes) // count, len(source_boxes) - 1)
+        min(index * len(source_words) // count, len(source_words) - 1)
         for index in range(count)
     ]
     totals = {
@@ -279,7 +303,14 @@ def _allocate_replacement_boxes(
     for source_index in assignments:
         offset = seen.get(source_index, 0)
         allocated.append(
-            _subdivide_bbox(source_boxes[source_index], offset, totals[source_index])
+            (
+                _subdivide_bbox(
+                    _word_bbox(source_words[source_index]),
+                    offset,
+                    totals[source_index],
+                ),
+                _word_line_key(source_words[source_index]),
+            )
         )
         seen[source_index] = offset + 1
     return allocated
@@ -287,45 +318,58 @@ def _allocate_replacement_boxes(
 
 def _align_corrected_words(
     chunks: list[AnchorChunk],
-    ocr_words: list[tuple[float, float, float, float, str]],
+    ocr_words: list[tuple],
+    fallback_bbox: tuple[float, float, float, float] | None = None,
 ) -> dict[int, list[WordPlacement]]:
     corrected = [
         (chunk.token_text, chunk.mcid)
         for chunk in chunks
         if chunk.token_text
     ]
-    ocr_keys = [_token_key(word[4]) for word in ocr_words]
+    ocr_keys = [_token_key(_word_text(word)) for word in ocr_words]
     corrected_keys = [_token_key(token) for token, _ in corrected]
     matcher = SequenceMatcher(None, ocr_keys, corrected_keys, autojunk=False)
-    placements: list[tuple[float, float, float, float] | None] = [None] * len(corrected)
+    placements: list[
+        tuple[tuple[float, float, float, float], tuple[int, int] | None] | None
+    ] = [None] * len(corrected)
 
     for tag, ocr_start, ocr_end, corrected_start, corrected_end in matcher.get_opcodes():
         if tag == "equal":
             for offset in range(corrected_end - corrected_start):
-                placements[corrected_start + offset] = ocr_words[ocr_start + offset][:4]
+                word = ocr_words[ocr_start + offset]
+                placements[corrected_start + offset] = (
+                    _word_bbox(word),
+                    _word_line_key(word),
+                )
             continue
         if tag == "delete":
             continue
 
         replacement_count = corrected_end - corrected_start
-        source_boxes = [word[:4] for word in ocr_words[ocr_start:ocr_end]]
-        if not source_boxes:
+        source_words = list(ocr_words[ocr_start:ocr_end])
+        if not source_words:
             neighbor = None
             if ocr_start:
-                neighbor = ocr_words[ocr_start - 1][:4]
+                neighbor = ocr_words[ocr_start - 1]
             elif ocr_start < len(ocr_words):
-                neighbor = ocr_words[ocr_start][:4]
+                neighbor = ocr_words[ocr_start]
             if neighbor:
-                source_boxes = [neighbor]
-        for offset, bbox in enumerate(
-            _allocate_replacement_boxes(source_boxes, replacement_count)
+                source_words = [neighbor]
+        for offset, placement in enumerate(
+            _allocate_replacement_placements(source_words, replacement_count)
         ):
-            placements[corrected_start + offset] = bbox
+            placements[corrected_start + offset] = placement
 
-    fallback = ocr_words[0][:4] if ocr_words else (36.0, 36.0, 72.0, 48.0)
+    fallback = (
+        _word_bbox(ocr_words[0])
+        if ocr_words
+        else fallback_bbox or (36.0, 36.0, 72.0, 48.0)
+    )
     by_mcid: dict[int, list[WordPlacement]] = {chunk.mcid: [] for chunk in chunks}
-    for index, ((token, mcid), bbox) in enumerate(zip(corrected, placements, strict=True)):
-        if bbox is None:
+    for index, ((token, mcid), placement) in enumerate(
+        zip(corrected, placements, strict=True)
+    ):
+        if placement is None:
             previous = next(
                 (placements[prior] for prior in range(index - 1, -1, -1) if placements[prior]),
                 None,
@@ -338,19 +382,231 @@ def _align_corrected_words(
                 ),
                 None,
             )
-            bbox = previous or following or fallback
-        by_mcid[mcid].append(WordPlacement(text=token, bbox=bbox))
+            placement = previous or following
+            if placement is None and fallback_bbox is not None:
+                placement = (
+                    _subdivide_bbox(fallback_bbox, index, len(corrected)),
+                    None,
+                )
+            placement = placement or (fallback, None)
+        bbox, line_key = placement
+        by_mcid[mcid].append(
+            WordPlacement(text=token, bbox=bbox, line_key=line_key)
+        )
     return by_mcid
 
 
-def _extract_ocr_words(source: Path) -> list[list[tuple[float, float, float, float, str]]]:
-    pages: list[list[tuple[float, float, float, float, str]]] = []
+def _fragment_bbox_points(
+    fragment: TextFragment,
+    element: PageElement,
+    width: float,
+    height: float,
+) -> tuple[float, float, float, float]:
+    left, top, right, bottom = fragment.bbox or element.bbox
+    return (
+        max(0.0, left / 1000 * width),
+        max(0.0, top / 1000 * height),
+        min(width, right / 1000 * width),
+        min(height, bottom / 1000 * height),
+    )
+
+
+def _words_in_fragment(
+    words: list[tuple],
+    bbox: tuple[float, float, float, float],
+    margin: float = 3.0,
+) -> list[tuple[float, float, float, float, str]]:
+    left, top, right, bottom = bbox
+    return [
+        word
+        for word in words
+        if left - margin <= (_word_bbox(word)[0] + _word_bbox(word)[2]) / 2 <= right + margin
+        and top - margin <= (_word_bbox(word)[1] + _word_bbox(word)[3]) / 2 <= bottom + margin
+    ]
+
+
+def _repair_invalid_fragment_bbox(
+    fragment: TextFragment,
+    element: PageElement,
+    words: list[tuple],
+    width: float,
+    height: float,
+) -> bool:
+    bbox = _fragment_bbox_points(fragment, element, width, height)
+    if bbox[0] < bbox[2] and bbox[1] < bbox[3]:
+        return False
+    target_keys = [
+        _token_key(token.text)
+        for token in exact_text_tokens(fragment.text)
+        if _token_key(token.text)
+    ]
+    if not target_keys:
+        return False
+    source_keys = [_token_key(_word_text(word)) for word in words]
+    matcher = SequenceMatcher(None, source_keys, target_keys, autojunk=False)
+    matched_boxes: list[tuple[float, float, float, float]] = []
+    matched_tokens = 0
+    for block in matcher.get_matching_blocks():
+        if not block.size:
+            continue
+        matched_boxes.extend(
+            _word_bbox(word) for word in words[block.a : block.a + block.size]
+        )
+        matched_tokens += block.size
+    if matched_tokens / len(target_keys) < 0.5 or not matched_boxes:
+        return False
+    repaired = (
+        min(box[0] for box in matched_boxes),
+        min(box[1] for box in matched_boxes),
+        max(box[2] for box in matched_boxes),
+        max(box[3] for box in matched_boxes),
+    )
+    if repaired[0] >= repaired[2] or repaired[1] >= repaired[3]:
+        return False
+    fragment.bbox = [
+        round(repaired[0] / width * 1000, 3),
+        round(repaired[1] / height * 1000, 3),
+        round(repaired[2] / width * 1000, 3),
+        round(repaired[3] / height * 1000, 3),
+    ]
+    return True
+
+
+def _chunks_by_fragment(
+    element: PageElement,
+    chunks: list[AnchorChunk],
+) -> list[tuple[TextFragment, list[AnchorChunk]]]:
+    fragments = element.visible_fragments
+    if not fragments:
+        return []
+    if len(fragments) == 1:
+        return [(fragments[0], chunks)]
+
+    source_tokens: list[tuple[str, int]] = []
+    for fragment_index, fragment in enumerate(fragments):
+        source_tokens.extend(
+            (token.text, fragment_index) for token in exact_text_tokens(fragment.text)
+        )
+    source_keys = [_token_key(token) for token, _ in source_tokens]
+    corrected_keys = [_token_key(chunk.token_text) for chunk in chunks]
+    assignments: list[int | None] = [None] * len(chunks)
+    matcher = SequenceMatcher(None, source_keys, corrected_keys, autojunk=False)
+
+    for tag, source_start, source_end, corrected_start, corrected_end in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(corrected_end - corrected_start):
+                assignments[corrected_start + offset] = source_tokens[source_start + offset][1]
+            continue
+        if tag == "delete" or corrected_start == corrected_end:
+            continue
+        source_fragments = [
+            fragment_index
+            for _, fragment_index in source_tokens[source_start:source_end]
+        ]
+        if not source_fragments:
+            if source_start:
+                source_fragments = [source_tokens[source_start - 1][1]]
+            elif source_start < len(source_tokens):
+                source_fragments = [source_tokens[source_start][1]]
+        if not source_fragments:
+            source_fragments = [0]
+        corrected_count = corrected_end - corrected_start
+        for offset in range(corrected_count):
+            source_offset = min(
+                offset * len(source_fragments) // corrected_count,
+                len(source_fragments) - 1,
+            )
+            assignments[corrected_start + offset] = source_fragments[source_offset]
+
+    for index, assignment in enumerate(assignments):
+        if assignment is not None:
+            continue
+        previous = next(
+            (assignments[item] for item in range(index - 1, -1, -1) if assignments[item] is not None),
+            None,
+        )
+        following = next(
+            (
+                assignments[item]
+                for item in range(index + 1, len(assignments))
+                if assignments[item] is not None
+            ),
+            None,
+        )
+        assignments[index] = previous if previous is not None else following or 0
+
+    grouped: list[list[AnchorChunk]] = [[] for _ in fragments]
+    for chunk, fragment_index in zip(chunks, assignments, strict=True):
+        grouped[int(fragment_index)].append(chunk)
+    return list(zip(fragments, grouped, strict=True))
+
+
+def _align_element_fragments(
+    element: PageElement,
+    chunks: list[AnchorChunk],
+    words: list[tuple],
+    width: float,
+    height: float,
+    geometry_source: str,
+) -> dict[int, list[WordPlacement]]:
+    placements: dict[int, list[WordPlacement]] = {}
+    weighted_quality = 0.0
+    weighted_chunks = 0
+    for fragment, fragment_chunks in _chunks_by_fragment(element, chunks):
+        _repair_invalid_fragment_bbox(
+            fragment,
+            element,
+            words,
+            width,
+            height,
+        )
+        bbox = _fragment_bbox_points(fragment, element, width, height)
+        local_words = _words_in_fragment(words, bbox)
+        fragment.geometry_word_count = len(local_words)
+        fragment.geometry_source = geometry_source
+        fragment.alignment_coverage = _alignment_quality(fragment_chunks, local_words)
+        chunk_count = max(len(fragment_chunks), 1)
+        weighted_quality += fragment.alignment_coverage * chunk_count
+        weighted_chunks += chunk_count
+        placements.update(
+            _align_corrected_words(
+                fragment_chunks,
+                local_words,
+                fallback_bbox=bbox,
+            )
+        )
+    element.evidence.alignment_coverage = (
+        weighted_quality / weighted_chunks if weighted_chunks else 0.0
+    )
+    return placements
+
+
+def _extract_ocr_words(source: Path) -> list[list[tuple]]:
+    pages: list[list[tuple]] = []
     with pymupdf.open(source) as document:
         for page in document:
             pages.append(
                 [
-                    (float(x0), float(y0), float(x1), float(y1), str(word))
-                    for x0, y0, x1, y1, word, *_ in page.get_text("words", sort=False)
+                    (
+                        float(x0),
+                        float(y0),
+                        float(x1),
+                        float(y1),
+                        str(word),
+                        int(block_number),
+                        int(line_number),
+                        int(word_number),
+                    )
+                    for (
+                        x0,
+                        y0,
+                        x1,
+                        y1,
+                        word,
+                        block_number,
+                        line_number,
+                        word_number,
+                    ) in page.get_text("words", sort=False)
                 ]
             )
     return pages
@@ -358,12 +614,12 @@ def _extract_ocr_words(source: Path) -> list[list[tuple[float, float, float, flo
 
 def _alignment_quality(
     chunks: list[AnchorChunk],
-    words: list[tuple[float, float, float, float, str]],
+    words: list[tuple],
 ) -> float:
     corrected_keys = [
         _token_key(chunk.token_text) for chunk in chunks if chunk.token_text
     ]
-    word_keys = [_token_key(word[4]) for word in words]
+    word_keys = [_token_key(_word_text(word)) for word in words]
     if not corrected_keys:
         return 1.0
     if not word_keys:
@@ -377,15 +633,15 @@ def _alignment_quality(
 
 def _select_geometry_words(
     plan: DocumentPlan,
-    base_words: list[list[tuple[float, float, float, float, str]]],
-    candidate_words: list[list[tuple[float, float, float, float, str]]] | None,
+    base_words: list[list[tuple]],
+    candidate_words: list[list[tuple]] | None,
     primary_label: str = "ocr",
     candidate_label: str = "native",
 ) -> tuple[
-    list[list[tuple[float, float, float, float, str]]],
+    list[list[tuple]],
     list[str],
 ]:
-    selected: list[list[tuple[float, float, float, float, str]]] = []
+    selected: list[list[tuple]] = []
     sources: list[str] = []
     plan_by_page = {page.page_number: page for page in plan.pages}
     for page_index, primary in enumerate(base_words):
@@ -446,82 +702,224 @@ def _page_anchor_chunks(elements: list[PageElement]) -> list[list[AnchorChunk]]:
     return by_element
 
 
-def _marked_content_start(chunk: AnchorChunk) -> str:
-    actual_text = b"\xfe\xff" + chunk.text.encode("utf-16-be")
+def _union_bbox(
+    boxes: list[tuple[float, float, float, float]],
+) -> tuple[float, float, float, float]:
     return (
-        f"/Span <</MCID {chunk.mcid} "
-        f"/ActualText <{actual_text.hex().upper()}>>> BDC"
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
     )
+
+
+def _same_visual_line(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> bool:
+    overlap = min(left[3], right[3]) - max(left[1], right[1])
+    minimum_height = max(min(left[3] - left[1], right[3] - right[1]), 0.01)
+    if overlap / minimum_height >= 0.35:
+        return True
+    left_center = (left[1] + left[3]) / 2
+    right_center = (right[1] + right[3]) / 2
+    maximum_height = max(left[3] - left[1], right[3] - right[1], 0.01)
+    return abs(left_center - right_center) <= maximum_height * 0.3
+
+
+def _region_lines(
+    region: StructureRegion,
+    placements: dict[int, list[WordPlacement]],
+    width: float,
+    height: float,
+) -> list[LinePlacement]:
+    fallback = _fragment_bbox_points(
+        region.element.visible_fragments[0],
+        region.element,
+        width,
+        height,
+    )
+    grouped: list[
+        tuple[list[AnchorChunk], list[tuple[float, float, float, float]], tuple[int, int] | None]
+    ] = []
+    for chunk in region.chunks:
+        word_placements = placements.get(chunk.mcid, [])
+        boxes = [placement.bbox for placement in word_placements] or [fallback]
+        bbox = _union_bbox(boxes)
+        line_key = next(
+            (
+                placement.line_key
+                for placement in word_placements
+                if placement.line_key is not None
+            ),
+            None,
+        )
+        if grouped:
+            prior_chunks, prior_boxes, prior_key = grouped[-1]
+            prior_bbox = _union_bbox(prior_boxes)
+            if _same_visual_line(prior_bbox, bbox) or (
+                prior_key is not None and prior_key == line_key
+            ):
+                prior_chunks.append(chunk)
+                prior_boxes.extend(boxes)
+                if prior_key is None and line_key is not None:
+                    grouped[-1] = (prior_chunks, prior_boxes, line_key)
+                continue
+        grouped.append(([chunk], list(boxes), line_key))
+
+    lines = [
+        LinePlacement(
+            text="".join(chunk.text for chunk in chunks),
+            bbox=_union_bbox(boxes),
+        )
+        for chunks, boxes, _ in grouped
+    ]
+    if len(lines) != 1 or any(
+        placement.line_key is not None
+        for chunk in region.chunks
+        for placement in placements.get(chunk.mcid, [])
+    ):
+        return lines
+
+    x0, y0, x1, y1 = lines[0].bbox
+    maximum_characters = max(12, int((x1 - x0) / 5.2))
+    if len(lines[0].text) <= maximum_characters:
+        return lines
+
+    wrapped_chunks: list[list[AnchorChunk]] = []
+    current: list[AnchorChunk] = []
+    current_length = 0
+    for chunk in region.chunks:
+        if current and current_length + len(chunk.text) > maximum_characters:
+            wrapped_chunks.append(current)
+            current = []
+            current_length = 0
+        current.append(chunk)
+        current_length += len(chunk.text)
+        if "\n" in chunk.text:
+            wrapped_chunks.append(current)
+            current = []
+            current_length = 0
+    if current:
+        wrapped_chunks.append(current)
+
+    line_height = max(5.0, min(12.0, (y1 - y0) / len(wrapped_chunks)))
+    return [
+        LinePlacement(
+            text="".join(chunk.text for chunk in chunks),
+            bbox=(x0, y0 + index * line_height, x1, y0 + (index + 1) * line_height),
+        )
+        for index, chunks in enumerate(wrapped_chunks)
+    ]
+
+
+def _text_advance(text: str, font: AnchorFont) -> int:
+    fallback = font.advances.get(ord("?"), 600)
+    return sum(font.advances.get(ord(character), fallback) for character in text)
+
+
 def _anchor_stream(
-    chunks: list[AnchorChunk],
+    region: StructureRegion,
     width: float,
     height: float,
     anchor_font: AnchorFont,
     placements: dict[int, list[WordPlacement]] | None = None,
 ) -> bytes:
-    commands: list[str] = []
-    for chunk in chunks:
-        placed_words = placements.get(chunk.mcid, []) if placements else []
-        if placed_words:
-            commands.append(_marked_content_start(chunk))
-            for word in placed_words:
-                x0, y0, x1, y1 = word.bbox
-                font_size = max(1.0, min(72.0, (y1 - y0) * 0.82))
-                encoded = _unicode_lines(
-                    word.text, anchor_font.supported_codepoints, width=10_000
-                )[0]
-                advance = sum(
-                    anchor_font.advances.get(
-                        ord(character), anchor_font.advances.get(ord("?"), 600)
-                    )
-                    for character in word.text
-                )
-                natural_width = max(advance * font_size / 1000, 0.01)
-                horizontal_scale = max(10.0, min(1000.0, (x1 - x0) / natural_width * 100))
-                baseline = height - y1 + font_size * 0.18
-                commands.append(
-                    f"BT /A11yAnchor {font_size:.3f} Tf 3 Tr {horizontal_scale:.3f} Tz "
-                    f"1 0 0 1 {x0:.3f} {baseline:.3f} Tm "
-                    f"<{encoded.hex().upper()}> Tj ET"
-                )
-            commands.append("EMC")
-            continue
-
-        x, y = _pdf_xy(chunk.element, width, height)
-        y = max(0.0, y - chunk.offset)
-        commands.append(_marked_content_start(chunk))
-        commands.append(f"BT /A11yAnchor 1 Tf 3 Tr 1 TL 1 0 0 1 {x:.3f} {y:.3f} Tm")
-        for line_index, line in enumerate(
-            _unicode_lines(chunk.text, anchor_font.supported_codepoints)
-        ):
-            if line_index:
-                commands.append("T*")
-            commands.append(f"<{line.hex().upper()}> Tj")
-        commands.extend(["ET", "EMC"])
+    placements = placements or {}
+    lines = _region_lines(region, placements, width, height)
+    exact_text = "".join(chunk.text for chunk in region.chunks)
+    direct_lines = [
+        _direct_unicode_text(line.text, anchor_font.supported_codepoints)
+        for line in lines
+    ]
+    properties = f"/MCID {region.mcid}"
+    if "".join(direct_lines) != exact_text:
+        actual_text = b"\xfe\xff" + exact_text.encode("utf-16-be")
+        properties += f" /ActualText <{actual_text.hex().upper()}>"
+    commands: list[str] = [
+        f"{ROLE_NAMES[region.element.role]} <<{properties}>> BDC",
+        "BT",
+    ]
+    for line, direct_text in zip(lines, direct_lines, strict=True):
+        x0, y0, x1, y1 = line.bbox
+        font_size = max(1.0, min(72.0, (y1 - y0) * 0.82))
+        natural_width = max(_text_advance(direct_text, anchor_font) * font_size / 1000, 0.01)
+        horizontal_scale = max(
+            10.0,
+            min(1000.0, (x1 - x0) / natural_width * 100),
+        )
+        baseline = height - y1 + font_size * 0.18
+        encoded = direct_text.encode("utf-16-be")
+        commands.append(
+            f"/A11yAnchor {font_size:.3f} Tf 3 Tr {horizontal_scale:.3f} Tz "
+            f"1 0 0 1 {x0:.3f} {baseline:.3f} Tm "
+            f"<{encoded.hex().upper()}> Tj"
+        )
+    commands.extend(["ET", "EMC"])
     return ("\n".join(commands) + "\n").encode("ascii")
+
+
+def _element_structure_regions(
+    element: PageElement,
+    chunks: list[AnchorChunk],
+) -> list[tuple[str, list[AnchorChunk]]]:
+    regions: list[tuple[str, list[AnchorChunk]]] = [(element.id, chunks)]
+    if element.role == ElementRole.P and len(element.visible_fragments) > 1:
+        fragment_chunks = _chunks_by_fragment(element, chunks)
+        groups = fragment_region_groups(element.visible_fragments)
+        if len(groups) > 1:
+            regions = []
+            for group in groups:
+                grouped_chunks = [
+                    chunk
+                    for fragment_index in group
+                    for chunk in fragment_chunks[fragment_index][1]
+                ]
+                if grouped_chunks:
+                    regions.append(
+                        (element.visible_fragments[group[0]].id, grouped_chunks)
+                    )
+    return regions
 
 
 def _make_role_element(
     pdf: pikepdf.Pdf,
-    element: PageElement,
+    region: StructureRegion,
     page_obj: pikepdf.Object,
     parent: pikepdf.Object,
-    chunks: list[AnchorChunk],
-) -> tuple[pikepdf.Object, list[pikepdf.Object]]:
-    role = ROLE_NAMES[element.role]
+    placements: dict[int, list[WordPlacement]],
+    height: float,
+) -> pikepdf.Object:
     role_element = pdf.make_indirect(
-        Dictionary(Type=Name.StructElem, S=role, P=parent, Pg=page_obj)
+        Dictionary(
+            Type=Name.StructElem,
+            S=ROLE_NAMES[region.element.role],
+            P=parent,
+            Pg=page_obj,
+            K=region.mcid,
+        )
     )
-    content_items = Array(
-        [
-            Dictionary(Type=Name("/MCR"), Pg=page_obj, MCID=chunk.mcid)
-            for chunk in chunks
+    if region.element.role == ElementRole.FIGURE:
+        role_element[Name.Alt] = String(region.element.alt_text or "")
+    else:
+        boxes = [
+            placement.bbox
+            for chunk in region.chunks
+            for placement in placements.get(chunk.mcid, [])
         ]
-    )
-    role_element[Name.K] = content_items
-    if element.role == ElementRole.FIGURE:
-        role_element[Name.Alt] = String(element.alt_text or "")
-    return role_element, [role_element] * len(chunks)
+        if boxes:
+            role_element[Name.A] = Dictionary(
+                O=Name.Layout,
+                BBox=Array(
+                    [
+                        round(min(box[0] for box in boxes), 3),
+                        round(height - max(box[3] for box in boxes), 3),
+                        round(max(box[2] for box in boxes), 3),
+                        round(height - min(box[1] for box in boxes), 3),
+                    ]
+                ),
+            )
+    return role_element
 
 
 def _placement_bbox(
@@ -569,18 +967,6 @@ def compile_tagged_pdf(
         ),
         candidate_label="native",
     )
-    for page_plan in plan.pages:
-        page_index = page_plan.page_number - 1
-        if page_index >= len(geometry_words_by_page):
-            continue
-        chunks = [
-            chunk
-            for element_chunks in _page_anchor_chunks(page_plan.elements)
-            for chunk in element_chunks
-        ]
-        coverage = _alignment_quality(chunks, geometry_words_by_page[page_index])
-        for element in page_plan.elements:
-            element.evidence.alignment_coverage = coverage
     with pikepdf.Pdf.open(source) as pdf:
         anchor_font = _make_anchor_font(pdf, plan)
         structure_root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
@@ -604,13 +990,21 @@ def compile_tagged_pdf(
             height = float(page.mediabox[3]) - float(page.mediabox[1])
             _ensure_anchor_font(page, anchor_font)
             chunks_by_element = _page_anchor_chunks(page_plan.elements)
-            all_chunks = [chunk for chunks in chunks_by_element for chunk in chunks]
             _suppress_ocr_text(page)
-            placements = (
-                _align_corrected_words(all_chunks, geometry_words_by_page[page_index])
-                if geometry_words_by_page[page_index]
-                else None
-            )
+            placements: dict[int, list[WordPlacement]] = {}
+            for element, chunks in zip(
+                page_plan.elements, chunks_by_element, strict=True
+            ):
+                placements.update(
+                    _align_element_fragments(
+                        element,
+                        chunks,
+                        geometry_words_by_page[page_index],
+                        width,
+                        height,
+                        geometry_sources[page_index],
+                    )
+                )
             if placements:
                 for element, chunks in zip(
                     page_plan.elements, chunks_by_element, strict=True
@@ -620,25 +1014,49 @@ def compile_tagged_pdf(
                     derived_bbox = _placement_bbox(chunks, placements, width, height)
                     if derived_bbox:
                         element.bbox = derived_bbox
-            anchors = Stream(
-                pdf,
-                _anchor_stream(all_chunks, width, height, anchor_font, placements),
-            )
+            regions = [
+                StructureRegion(element=element, chunks=region, mcid=region_mcid)
+                for region_mcid, (element, region) in enumerate(
+                    (element, region)
+                    for element, chunks in zip(
+                        page_plan.elements, chunks_by_element, strict=True
+                    )
+                    for _, region in _element_structure_regions(element, chunks)
+                )
+            ]
+            anchor_streams = [
+                Stream(
+                    pdf,
+                    _anchor_stream(
+                        region,
+                        width,
+                        height,
+                        anchor_font,
+                        placements,
+                    ),
+                )
+                for region in regions
+            ]
             page.obj[Name.Contents] = Array(
-                [artifact_start, *original_contents, artifact_end, anchors]
+                [artifact_start, *original_contents, artifact_end, *anchor_streams]
             )
             page.obj[Name.StructParents] = page_index
             page.obj[Name.Tabs] = Name.S
 
-            mcid_parents = Array()
-            for element, chunks in zip(page_plan.elements, chunks_by_element, strict=True):
-                role_element, span_parents = _make_role_element(
-                    pdf, element, page.obj, document, chunks
+            mcid_parents: list[pikepdf.Object] = []
+            for region in regions:
+                role_element = _make_role_element(
+                    pdf,
+                    region,
+                    page.obj,
+                    document,
+                    placements,
+                    height,
                 )
                 document[Name.K].append(role_element)
-                mcid_parents.extend(span_parents)
+                mcid_parents.append(role_element)
 
-            parent_tree_entries.extend([page_index, mcid_parents])
+            parent_tree_entries.extend([page_index, Array(mcid_parents)])
 
         parent_tree = pdf.make_indirect(Dictionary(Nums=parent_tree_entries))
         structure_root[Name.ParentTree] = parent_tree

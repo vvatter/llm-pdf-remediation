@@ -9,16 +9,23 @@ from pathlib import Path
 
 import pikepdf
 import pymupdf
+from pydantic import ValidationError
 
-from pdf_accessibility.compiler import compile_tagged_pdf
+from pdf_accessibility.compiler import (
+    _align_element_fragments,
+    _page_anchor_chunks,
+    compile_tagged_pdf,
+)
 from pdf_accessibility.models import (
     ArtifactReason,
     CoordinateSpace,
     DocumentPlan,
     ElementRole,
     PageElement,
+    PageFlow,
     PagePlan,
     ReviewStatus,
+    TextFragment,
     TransformationKind,
     exact_text_tokens,
 )
@@ -36,6 +43,7 @@ from pdf_accessibility.planner import (
 from pdf_accessibility.refine import refine_document_plan, transformation_errors
 from pdf_accessibility.validate import (
     add_pdfua_declaration,
+    compare_structure_to_plan,
     plan_is_approved,
     serialize_structure_tree,
     validate_output,
@@ -153,6 +161,7 @@ class CompileTests(unittest.TestCase):
             self.assertEqual(report["language"], "en-US")
             self.assertGreaterEqual(report["bookmark_count"], 1)
             self.assertTrue(report["structure_matches_plan"])
+            self.assertTrue(report["block_plan_valid"])
             self.assertFalse(report["declares_pdfua"])
             self.assertFalse(report["extraction_compatible"])
             self.assertTrue(report["transformations_valid"])
@@ -181,24 +190,260 @@ class CompileTests(unittest.TestCase):
                     anchor_font.DescendantFonts[0].FontDescriptor,
                 )
                 paragraph = pdf.Root.StructTreeRoot.K.K[1]
-                self.assertGreater(len(paragraph.K), 1)
+                self.assertEqual(str(paragraph.S), "/P")
+                self.assertNotIn("/ID", paragraph)
+                self.assertEqual(str(paragraph.A.O), "/Layout")
+                self.assertEqual(len(paragraph.A.BBox), 4)
+                self.assertEqual(int(paragraph.K), 1)
+                anchor_streams = [
+                    stream.read_bytes() for stream in pdf.pages[0].Contents[-3:]
+                ]
                 self.assertTrue(
-                    all(str(content_item.Type) == "/MCR" for content_item in paragraph.K)
+                    anchor_streams[0].startswith(b"/H1 <</MCID 0>> BDC\nBT\n")
                 )
-                anchor_stream = pdf.pages[0].Contents[-1].read_bytes()
-                self.assertIn(b"/ActualText <FEFF", anchor_stream)
+                self.assertTrue(
+                    all(stream.count(b"BT\n") == 1 for stream in anchor_streams)
+                )
+                self.assertTrue(
+                    all(stream.count(b"ET\n") == 1 for stream in anchor_streams)
+                )
+                self.assertNotIn(b"/ActualText", b"".join(anchor_streams))
                 self.assertEqual(
                     pdf.pages[0].Contents[0].read_bytes(), b"q\n/Artifact BMC\n"
                 )
                 self.assertEqual(
-                    pdf.pages[0].Contents[-2].read_bytes(), b"EMC\nQ\n"
+                    pdf.pages[0].Contents[-4].read_bytes(), b"EMC\nQ\n"
                 )
+
+    def test_fragment_alignment_is_local_when_page_words_are_interleaved(self) -> None:
+        planned = PageElement(
+            role=ElementRole.P,
+            visible_fragments=[
+                TextFragment(
+                    id="left",
+                    text="one two ",
+                    bbox=[0, 0, 450, 1000],
+                ),
+                TextFragment(
+                    id="right",
+                    text="three four",
+                    bbox=[550, 0, 1000, 1000],
+                ),
+            ],
+            visible_text="one two three four",
+            accessible_text="one two three four",
+            bbox=[0, 0, 1000, 1000],
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+        globally_interleaved_words = [
+            (5.0, 5.0, 20.0, 15.0, "one"),
+            (60.0, 5.0, 80.0, 15.0, "three"),
+            (5.0, 25.0, 20.0, 35.0, "two"),
+            (60.0, 25.0, 80.0, 35.0, "four"),
+        ]
+
+        placements = _align_element_fragments(
+            planned,
+            chunks,
+            globally_interleaved_words,
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertTrue(all(item.bbox[2] <= 45 for mcid in (0, 1) for item in placements[mcid]))
+        self.assertTrue(all(item.bbox[0] >= 55 for mcid in (2, 3) for item in placements[mcid]))
+        self.assertEqual(
+            [fragment.geometry_word_count for fragment in planned.visible_fragments],
+            [2, 2],
+        )
+        self.assertTrue(
+            all(fragment.alignment_coverage == 1 for fragment in planned.visible_fragments)
+        )
+
+    def test_multiblock_paragraph_compiles_as_direct_clickable_regions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=100, height=100)
+            document.save(source)
+            document.close()
+            paragraph = PageElement(
+                role=ElementRole.P,
+                visible_fragments=[
+                    TextFragment(
+                        text="First block ",
+                        bbox=[0, 500, 400, 900],
+                    ),
+                    TextFragment(
+                        text="second block",
+                        bbox=[500, 0, 900, 400],
+                    ),
+                ],
+                visible_text="First block second block",
+                accessible_text="First block second block",
+                bbox=[0, 0, 900, 900],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Regions",
+                pages=[PagePlan(page_number=1, elements=[paragraph])],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+
+            with pikepdf.Pdf.open(output) as pdf:
+                regions = list(pdf.Root.StructTreeRoot.K.K)
+                self.assertEqual([str(region.S) for region in regions], ["/P", "/P"])
+                self.assertTrue(all("/ID" not in region for region in regions))
+                self.assertEqual([int(region.K) for region in regions], [0, 1])
+                self.assertTrue(all(str(region.A.O) == "/Layout" for region in regions))
+                first_box = [float(value) for value in regions[0].A.BBox]
+                second_box = [float(value) for value in regions[1].A.BBox]
+                self.assertLessEqual(first_box[2], second_box[0])
+                anchor_streams = [
+                    stream.read_bytes() for stream in pdf.pages[0].Contents[-2:]
+                ]
+                self.assertTrue(
+                    all(stream.count(b"BT\n") == 1 for stream in anchor_streams)
+                )
+                self.assertTrue(
+                    all(stream.count(b"ET\n") == 1 for stream in anchor_streams)
+                )
+                self.assertTrue(
+                    all(b"/ActualText" not in stream for stream in anchor_streams)
+                )
+            serialized = serialize_structure_tree(output)
+            self.assertEqual(
+                [record["text"] for record in serialized["elements"]],
+                ["First block ", "second block"],
+            )
+            self.assertEqual(compare_structure_to_plan(serialized, plan), [])
+
+    def test_direct_unicode_stream_uses_ocr_line_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            geometry = Path(temp) / "geometry.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=300, height=200)
+            document.save(source)
+            document.close()
+            document = pymupdf.open()
+            page = document.new_page(width=300, height=200)
+            page.insert_text((30, 50), "First semantic line")
+            page.insert_text((30, 75), "Second semantic line")
+            document.save(geometry)
+            document.close()
+            paragraph = PageElement(
+                role=ElementRole.P,
+                visible_text="First semantic line Second semantic line",
+                accessible_text="First semantic line Second semantic line",
+                bbox=[50, 100, 950, 500],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Line geometry",
+                pages=[PagePlan(page_number=1, elements=[paragraph])],
+            )
+
+            compile_tagged_pdf(source, output, plan, geometry_source=geometry)
+
+            with pikepdf.Pdf.open(output) as pdf:
+                anchor_stream = pdf.pages[0].Contents[-1].read_bytes()
+                self.assertEqual(anchor_stream.count(b" Tj\n"), 2)
+                self.assertNotIn(b"/ActualText", anchor_stream)
+                self.assertEqual(anchor_stream.count(b" Tm "), 2)
+            with pymupdf.open(output) as document:
+                self.assertEqual(
+                    [word[4] for word in document[0].get_text("words", sort=False)],
+                    ["First", "semantic", "line", "Second", "semantic", "line"],
+                )
+            self.assertEqual(
+                compare_structure_to_plan(serialize_structure_tree(output), plan), []
+            )
+
+    def test_drop_cap_fragments_remain_one_paragraph_region(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=100, height=100)
+            document.save(source)
+            document.close()
+            paragraph = PageElement(
+                role=ElementRole.P,
+                visible_fragments=[
+                    TextFragment(text="T", bbox=[50, 100, 90, 300]),
+                    TextFragment(
+                        text="he paragraph continues.",
+                        bbox=[50, 120, 900, 320],
+                    ),
+                ],
+                visible_text="The paragraph continues.",
+                accessible_text="The paragraph continues.",
+                bbox=[50, 100, 900, 320],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Drop cap",
+                pages=[PagePlan(page_number=1, elements=[paragraph])],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+
+            with pikepdf.Pdf.open(output) as pdf:
+                regions = list(pdf.Root.StructTreeRoot.K.K)
+                self.assertEqual(len(regions), 1)
+                self.assertNotIn("/ID", regions[0])
+                self.assertEqual(int(regions[0].K), 0)
+                anchor_stream = pdf.pages[0].Contents[-1].read_bytes()
+                self.assertEqual(anchor_stream.count(b"BT\n"), 1)
+                self.assertEqual(anchor_stream.count(b"ET\n"), 1)
+            self.assertEqual(
+                compare_structure_to_plan(serialize_structure_tree(output), plan), []
+            )
+
+    def test_invalid_legacy_fragment_box_is_repaired_from_matching_words(self) -> None:
+        planned = PageElement(
+            role=ElementRole.P,
+            visible_fragments=[
+                TextFragment(
+                    text="Professor Smith",
+                    bbox=[700, 1000, 1000, 1000],
+                )
+            ],
+            visible_text="Professor Smith",
+            accessible_text="Professor Smith",
+            bbox=[700, 1000, 1000, 1000],
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+
+        placements = _align_element_fragments(
+            planned,
+            chunks,
+            [
+                (60.0, 80.0, 75.0, 90.0, "Professor"),
+                (77.0, 80.0, 90.0, 90.0, "Smith"),
+            ],
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertEqual(len(placements), 2)
+        left, top, right, bottom = planned.visible_fragments[0].bbox
+        self.assertTrue(0 <= left < right <= 1000)
+        self.assertTrue(0 <= top < bottom <= 1000)
+        self.assertEqual(planned.visible_fragments[0].alignment_coverage, 1)
 
     def test_structure_serializer_preserves_exact_text_and_detects_parent_tree_damage(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"
             output = Path(temp) / "output.pdf"
             damaged = Path(temp) / "damaged.pdf"
+            identified = Path(temp) / "identified-without-id-tree.pdf"
             document = pymupdf.open()
             page = document.new_page()
             page.insert_text((72, 72), "Visible")
@@ -214,13 +459,26 @@ class CompileTests(unittest.TestCase):
 
             serialized = serialize_structure_tree(output)
             self.assertEqual(serialized["elements"][0]["text"], exact)
+            self.assertEqual(serialized["elements"][0]["id"], "")
             self.assertEqual(serialized["errors"], [])
+            with pikepdf.Pdf.open(output) as pdf:
+                direct_stream = pdf.pages[0].Contents[-1].read_bytes()
+                self.assertNotIn(b"/ActualText", direct_stream)
+                self.assertIn(b"000A", direct_stream)
 
             with pikepdf.Pdf.open(output) as pdf:
                 del pdf.Root.StructTreeRoot.ParentTree
                 pdf.save(damaged)
             errors = serialize_structure_tree(damaged)["errors"]
             self.assertTrue(any("ParentTree" in error for error in errors))
+
+            with pikepdf.Pdf.open(output) as pdf:
+                pdf.Root.StructTreeRoot.K.K[0][pikepdf.Name.ID] = pikepdf.String(
+                    "element-1"
+                )
+                pdf.save(identified)
+            errors = serialize_structure_tree(identified)["errors"]
+            self.assertTrue(any("IDTree" in error for error in errors))
 
     def test_pdfua_declaration_is_added_only_to_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -271,7 +529,7 @@ class PlanMigrationTests(unittest.TestCase):
 
             plan = load_document_plan(path)
 
-            self.assertEqual(plan.schema_version, 3)
+            self.assertEqual(plan.schema_version, 4)
             self.assertEqual(plan.pages[0].elements[0].visible_text, "Authored sucess.")
             self.assertEqual(plan.pages[0].elements[0].accessible_text, "Authored sucess.")
             self.assertTrue(path.with_suffix(".legacy.json").exists())
@@ -310,9 +568,28 @@ class PlanMigrationTests(unittest.TestCase):
 
             plan = load_document_plan(path)
 
-            self.assertEqual(plan.schema_version, 3)
+            self.assertEqual(plan.schema_version, 4)
             self.assertEqual(plan.pages[0].coordinate_space, CoordinateSpace.PDF_POINTS)
             self.assertTrue(plan_is_approved(plan))
+
+    def test_visual_blocks_must_have_single_flow_ownership(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "more than once"):
+            PagePlan(
+                page_number=1,
+                elements=[
+                    PageElement(
+                        role=ElementRole.P,
+                        visible_fragments=[
+                            TextFragment(id="b001", text="First", bbox=[0, 0, 400, 400]),
+                            TextFragment(id="b002", text="Second", bbox=[500, 0, 900, 400]),
+                        ],
+                        visible_text="First Second",
+                        accessible_text="First Second",
+                        bbox=[0, 0, 900, 400],
+                    )
+                ],
+                flows=[PageFlow(id="flow1", block_ids=["b001", "b001"])],
+            )
 
 
 class DeterministicRefinementTests(unittest.TestCase):
@@ -369,6 +646,72 @@ class DeterministicRefinementTests(unittest.TestCase):
             self.assertIn(ArtifactReason.WRITING_LINE, reasons)
             self.assertTrue(
                 all(0 <= value <= 1000 for page in plan.pages for element in page.elements for value in element.bbox)
+            )
+
+    def test_moves_decoration_only_fragment_out_of_semantic_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page(width=612, height=792)
+            document.save(source)
+            document.close()
+            form = PageElement(
+                role=ElementRole.P,
+                visible_fragments=[
+                    TextFragment(text="Address:", bbox=[100, 100, 300, 150]),
+                    TextFragment(text="________________", bbox=[100, 160, 500, 180]),
+                ],
+                visible_text="Address:\n________________",
+                accessible_text="Address:",
+                bbox=[100, 100, 500, 180],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Sample",
+                pages=[PagePlan(page_number=1, elements=[form])],
+            )
+
+            refine_document_plan(source, plan)
+
+            self.assertEqual(
+                [fragment.text for fragment in form.visible_fragments], ["Address:"]
+            )
+            self.assertEqual(len(plan.pages[0].block_order), 1)
+            self.assertEqual(
+                plan.pages[0].artifacts[0].reason, ArtifactReason.WRITING_LINE
+            )
+
+    def test_moves_omitted_pointer_fragment_to_decoration_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page(width=612, height=792)
+            document.save(source)
+            document.close()
+            caption = PageElement(
+                role=ElementRole.P,
+                visible_fragments=[
+                    TextFragment(text="⟶", bbox=[100, 100, 200, 130]),
+                    TextFragment(text="Professor Smith", bbox=[100, 150, 400, 200]),
+                ],
+                visible_text="⟶\nProfessor Smith",
+                accessible_text="Professor Smith",
+                bbox=[100, 100, 400, 200],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Sample",
+                pages=[PagePlan(page_number=1, elements=[caption])],
+            )
+
+            refine_document_plan(source, plan)
+
+            self.assertEqual(
+                [fragment.text for fragment in caption.visible_fragments],
+                ["Professor Smith"],
+            )
+            self.assertEqual(
+                plan.pages[0].artifacts[0].reason, ArtifactReason.DECORATION
             )
 
     def test_transformations_have_exact_reconstructable_spans(self) -> None:
@@ -437,7 +780,7 @@ class ModelPipelineTests(unittest.TestCase):
                 "reading_order": 1,
             },
         )
-        model_page = ModelPagePlan(page_number=1, elements=[model_element])
+        model_page = ModelPagePlan(page_number=99, elements=[model_element])
 
         class FakeResponses:
             def __init__(self) -> None:
@@ -460,6 +803,10 @@ class ModelPipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(decision.canonical_page.elements[0].accessible_text, "Printed text.")
+        self.assertEqual(proposal.page_number, 1)
+        self.assertEqual(proposal.elements[0].id, "p0001-e0001")
+        self.assertEqual(decision.canonical_page.page_number, 1)
+        self.assertEqual(decision.canonical_page.elements[0].id, "p0001-e0001")
         review_content = responses.calls[1]["input"][1]["content"]
         self.assertEqual(review_content[0]["type"], "input_image")
         self.assertTrue(review_content[1]["text"].startswith("EVIDENCE FIRST:"))

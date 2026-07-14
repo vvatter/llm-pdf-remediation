@@ -9,10 +9,25 @@ vision model proposes a transcription and reading order, a second model reviews 
 page, and ordinary Python code owns PDF structure, fonts, MCIDs, metadata, validation,
 and serialization. The original visible page is not redesigned.
 
+Pages are planned as ordered rectangular visual blocks rather than inferred from a
+single global column layout. Logical paragraphs may own multiple blocks when they
+continue from one column to another. The compiler uses those blocks for local geometry
+and emits them in reviewed tag-tree order; disjoint paragraph continuations receive
+consecutive direct `/P` regions so Acrobat can target each visual area independently.
+Each region owns one PDF MCID and one ordered content stream. Corrected Unicode text is
+encoded directly in line-level strings positioned from OCR/native word geometry; the
+facsimile page remains visually unchanged underneath. `/ActualText` is reserved for
+the uncommon character that the embedded font cannot represent.
+
 The current corpus is departmental newsletters, but the pipeline is organized around
 fixed-layout PDFs rather than newsletter-specific file formats. See
 [APPROACH.md](APPROACH.md) for the architecture, trust model, validation gates, and known
 limitations.
+
+The production workflow is intentionally unattended. Ambiguities are logged without
+pausing the run, and the second model reviews the first model's plan. Interactive human
+remediation is not a planned pipeline stage; manual reader testing remains an external
+acceptance check while compatibility is being developed.
 
 ## Requirements
 
@@ -90,7 +105,7 @@ Each input receives a work directory under `build/` containing:
 - `pages/*.evidence.json`: native and OCR evidence
 - `pages/*.proposal.json`: immutable Terra proposal checkpoint
 - `pages/*.review.json`: immutable Sol decision checkpoint
-- `*.plan.json`: schema-v3 canonical plan used by the compiler
+- `*.plan.json`: schema-v4 canonical plan used by the compiler
 - `*.draft.pdf`: tagged draft without a PDF/UA declaration
 - `*.accessible.pdf`: published only after every machine gate passes
 - `*.validation.json`: render, qpdf, structure-tree, and veraPDF results
@@ -98,7 +113,7 @@ Each input receives a work directory under `build/` containing:
 - `*.wcag.json`: per-criterion WCAG 2.1 AA evidence matrix
 - `*.manifest.json`: hashes, models, prompts, tools, font, and compiler strategy
 
-Old schema-v1 and schema-v2 plans migrate automatically. The original is preserved as
+Old schema-v1 through schema-v3 plans migrate automatically. The original is preserved as
 `*.plan.legacy.json`. Existing reviewed or manually modified canonical plans are not
 overwritten unless a force option is supplied.
 
@@ -107,7 +122,8 @@ overwritten unless a force option is supplied.
 The compiler first creates an undeclared draft. It then verifies exact rendered-page
 equality, qpdf integrity, every MCID and ParentTree relationship, and an exact
 element-by-element structure-tree transcript. It also proves that exact transformation
-spans reconstruct the accessible text and requires `pdftotext -raw` to agree with the
+spans reconstruct the accessible text, checks that every visual block has one ordered
+flow owner and block-local geometry, and requires `pdftotext -raw` to agree with the
 semantic transcript without duplication. The selected base is compared with the
 original at 72 and 150 DPI, and the final PDF must match that base exactly. Only a
 temporary candidate receives
@@ -115,8 +131,9 @@ temporary candidate receives
 also passes.
 
 Model findings, including critical findings, are logged but do not interrupt a batch.
-They remain visible in the anomaly report. Human approval, NVDA or JAWS testing, Acrobat
-reflow, and manual WCAG checks are still needed for an institutional conformance claim.
+They remain visible in the anomaly report. NVDA or JAWS testing, Acrobat reflow, and
+manual WCAG checks are still needed as external evidence for an institutional
+conformance claim; they do not create an interactive remediation or approval stage.
 
 See [DEVELOG.md](DEVELOG.md) for the experiment log, measured results, decisions, and
 open questions that explain why the current implementation behaves this way.
