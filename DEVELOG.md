@@ -971,9 +971,9 @@ and nonpainting figure proxies with structural `/Alt`.
 
 | Issue | Size | Structure regions | Extraction agreement | Token ratio | SHA-256 |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 1996 | 1.07 MB | 134 | 0.999801 | 0.999868 | `3ec4c91e6bef5a4efa7aafcf04d0f250c4aabca1d4720211cf5d5c2b0c5b7909` |
-| 2004 | 10.69 MB | 273 | 0.998825 | 1.000000 | `cb8e3ebc1de05b92fc989eaa2d26b4d62e3861da4d60e95f577efdb16c191ebf` |
-| 2007 | 11.43 MB | 224 | 0.998898 | 1.000000 | `955ce0394431ed28ed30ee15ed182f623860cc556546a8f8376c5806f9e362d8` |
+| 1996 | 1.07 MB | 134 | 0.999801 | 0.999868 | `06aebbbbdbcdfd76137061716f057c2c7c93fdb97ba448411401d53b5622e7eb` |
+| 2004 | 10.69 MB | 273 | 0.998825 | 1.000000 | `270930f55a760d3f2cadb09d124913750e057493eeb7c15e33a3ff6e9fc23967` |
+| 2007 | 11.43 MB | 224 | 0.998898 | 1.000000 | `fed835902a066e2106b3625c9c89ef7d77d7bf6464fcc80d1f3e5cc6f555c210` |
 
 For every issue:
 
