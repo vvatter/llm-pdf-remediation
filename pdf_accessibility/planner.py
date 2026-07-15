@@ -9,7 +9,7 @@ from typing import Literal
 
 from openai import OpenAI
 import pymupdf
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .evidence import (
     PageEvidence,
@@ -24,10 +24,12 @@ from .models import (
     ArtifactReason,
     ArtifactRecord,
     ElementRole,
+    FindingCategory,
     PagePlan,
     PageFlow,
     PageReview,
     ReviewFinding,
+    ReviewSeverity,
     ReviewStatus,
     ConfidenceProfile,
     TextFragment,
@@ -118,6 +120,33 @@ class ReviewDecision(BaseModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
 
 
+def _validated_page_plan(page_data: dict, page_number: int) -> PagePlan:
+    page_data["page_number"] = page_number
+    try:
+        return PagePlan.model_validate(page_data)
+    except ValidationError as error:
+        if not error.errors() or any(
+            "flow" not in str(item.get("msg", "")).lower()
+            for item in error.errors()
+        ):
+            raise
+    normalized = dict(page_data)
+    normalized["flows"] = []
+    page = PagePlan.model_validate(normalized)
+    page.findings.append(
+        ReviewFinding(
+            severity=ReviewSeverity.INFO,
+            category=FindingCategory.READING_ORDER,
+            message=(
+                "Model flow grouping was inconsistent with semantic element order; "
+                "the deterministic parser rebuilt a single ordered page flow."
+            ),
+            chosen="Semantic element and fragment order.",
+        )
+    )
+    return page
+
+
 def _page_prompt(packet: PagePacket, evidence: PageEvidence) -> str:
     return f"""Analyze page {packet.page_number}, size {packet.width:.1f} by {packet.height:.1f} points.
 
@@ -154,8 +183,7 @@ def propose_page(
     if response.output_parsed is None:
         raise RuntimeError(f"{model} returned no parsed proposal for page {packet.page_number}")
     page_data = response.output_parsed.model_dump()
-    page_data["page_number"] = packet.page_number
-    page = PagePlan.model_validate(page_data)
+    page = _validated_page_plan(page_data, packet.page_number)
     page.review_status = ReviewStatus.PROPOSAL
     for element in page.elements:
         element.review_status = ReviewStatus.PROPOSAL
@@ -221,9 +249,8 @@ def review_page(
         raise RuntimeError(f"{model} returned no parsed review for page {packet.page_number}")
     parsed = response.output_parsed
     page_data = parsed.canonical_page.model_dump()
-    page_data["page_number"] = packet.page_number
     return ReviewDecision(
-        canonical_page=PagePlan.model_validate(page_data),
+        canonical_page=_validated_page_plan(page_data, packet.page_number),
         findings=parsed.findings,
     ), response.id
 

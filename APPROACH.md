@@ -142,6 +142,10 @@ at the bottom of one column and continues at the top of another remains one `P`,
 has two ordered rectangular fragments. A fragment may not span disjoint columns. The
 page flow makes reading order explicit even when global top-to-bottom or left-to-right
 coordinates would interleave independent articles, sidebars, or contents boxes.
+If a model returns flow ownership or order inconsistent with its own ordered elements,
+the parser discards only that invalid grouping, derives one flow from semantic element
+and fragment order, and records an informational reading-order finding. Transcription,
+roles, fragments, and element order remain unchanged.
 
 Every page declares its coordinate space. Model output is constrained to
 `normalized_0_1000`, OCR/native evidence boxes are normalized before prompting, and

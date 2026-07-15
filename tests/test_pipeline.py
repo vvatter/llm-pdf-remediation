@@ -34,6 +34,7 @@ from pdf_accessibility.plans import load_document_plan
 from pdf_accessibility.evidence import diagnostics_for, evidence_from_packet
 from pdf_accessibility.extract import PagePacket
 from pdf_accessibility.planner import (
+    _validated_page_plan,
     ModelPageElement,
     ModelPagePlan,
     ModelReviewDecision,
@@ -67,6 +68,35 @@ def element(
 
 
 class NormalizePlanTests(unittest.TestCase):
+    def test_invalid_model_flow_is_rebuilt_from_semantic_order(self) -> None:
+        page = PagePlan(
+            page_number=9,
+            elements=[
+                element(ElementRole.P, "First"),
+                element(ElementRole.P, "Second", top=200),
+            ],
+        )
+        page_data = page.model_dump(mode="json")
+        page_data["flows"][0]["block_ids"].reverse()
+
+        normalized = _validated_page_plan(page_data, 9)
+
+        self.assertEqual(
+            normalized.block_order,
+            [
+                fragment.id
+                for item in normalized.elements
+                for fragment in item.visible_fragments
+            ],
+        )
+        self.assertTrue(
+            any(
+                finding.category == FindingCategory.READING_ORDER
+                and "deterministic parser" in finding.message
+                for finding in normalized.findings
+            )
+        )
+
     def test_keeps_one_title_and_removes_decorative_content(self) -> None:
         pages = [
             PagePlan(
