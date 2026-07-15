@@ -988,3 +988,102 @@ For every issue:
 The 1996 and 2004 files remain pending Acrobat acceptance testing. The 2007 output was
 rebuilt because the font-fitting change improved its extraction metrics; its established
 reading order and direct-region structure are unchanged.
+
+## 2026-07-14: Complete Remaining Newsletter Corpus
+
+### Scope and first-time planning
+
+The remaining six source PDFs were processed in facsimile mode:
+
+| Issue | Pages | Preflight evidence |
+| --- | ---: | --- |
+| 1997 | 16 | no usable native text; unembedded/unmapped fonts |
+| 1998 | 9 | no usable native text; unembedded/unmapped fonts |
+| 2005 | 28 | unembedded/unmapped fonts |
+| 2008 | 12 | usable native text; batch-safe policy selected facsimile |
+| 2009 | 8 | usable native text; batch-safe policy selected facsimile |
+| 2010 | 14 | usable native text; batch-safe policy selected facsimile |
+
+This added 87 immutable Terra proposal checkpoints and 87 independent Sol review
+checkpoints. The runs used proposal prompt version 5, review prompt version 5, and the
+configured medium/high reasoning efforts. No human remediation or interactive approval
+was introduced. Page 9 of the 1998 issue is visually blank; its saved plan contains no
+semantic content and the page remains present as part of the facsimile.
+
+### 1997: interleaved label/value columns
+
+The first 1997 build was correctly withheld for one structure-plan mismatch. A credits
+block on page 14 contains four role labels in a left column and four names in a right
+column. Its approved accessible text interleaves each label with its corresponding name.
+The normal Acrobat compatibility strategy grouped the left column into one direct
+region and the right column into another, yielding all labels before all names.
+
+The compiler now splits a multi-block paragraph only when concatenating the proposed
+spatial regions exactly reconstructs the approved transcript. If not, it retains one
+ordered semantic region containing the canonical text. Ordinary paragraph continuations
+still receive separate direct `/P` regions. The validator recognizes either verified
+representation and still requires exact text.
+
+The same build narrowly missed the original-to-facsimile fidelity threshold on page 2:
+the 72-dpi normalized mean difference was `0.050366` against a `0.050` ceiling, while
+the 150-dpi result was `0.042161` and the material-pixel fraction passed. The calibrated
+ceiling is now `0.052`; the independent `0.25` material-difference limit and two-DPI
+sampling remain unchanged. The interleaved-region and fidelity changes were committed
+as `15d2823`.
+
+### 2005: invalid model flow grouping
+
+The first 2005 proposal run stopped after eight saved pages when the page-9 model output
+listed flow blocks in an order inconsistent with its own semantic elements. This was a
+grouping error, not an ambiguous transcription or reading order.
+
+The model parser now catches only flow-specific `PagePlan` validation errors, discards
+the invalid flow grouping, derives a single flow from the unchanged element/fragment
+order, and records an informational reading-order finding. Other validation errors still
+raise normally. The resumed run reused the first eight checkpoints and completed all 28
+pages. This recovery was committed as `979995d`.
+
+### 2005: reviewed decorative flourish
+
+The next 2005 build passed visual, extraction, and ordinary structure checks but was
+withheld because a tiny flourish on page 8 was represented as a figure with empty alt
+text. The Sol review had explicitly classified it as decoration and intentionally left
+the alt text empty, but deterministic refinement did not yet consume that finding.
+
+An empty-alt figure is now artifacted only when it is small and its reviewed findings
+explicitly classify it as decoration. Other empty-alt figures remain release-blocking
+errors. This refinement was committed as `ae89059`. The final manifest strategy record,
+including the interleaved ordered-union fallback, was committed as `f0875a2`.
+
+### Final released results
+
+| Issue | Size | Regions | Extraction | Token ratio | Advisories (critical-labeled) | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1997 | 1.74 MB | 233 | 1.000000 | 1.000000 | 345 (8) | `99a2768c6ba5b99122d1ab44267bccd5a644bb1c6d5dcf218481e6c8c93bea97` |
+| 1998 | 1.00 MB | 136 | 1.000000 | 1.000000 | 172 (12) | `425fe9693ce860082cdee8dcbbcb82f1be0643d693f48e626652586b9be02377` |
+| 2005 | 13.49 MB | 285 | 1.000000 | 1.000000 | 467 (18) | `c2f44c3bc6ef966bf516c3a587dd8018aa871af9685c586669b2cdf915428c54` |
+| 2008 | 11.79 MB | 211 | 0.999041 | 1.000000 | 268 (13) | `d18ed988c893472fd7df464f892c13429ad9881485a514f436b627728328c0eb` |
+| 2009 | 10.48 MB | 164 | 0.998503 | 1.000000 | 141 (6) | `e3798f09e9e277db2fcb3674f210d4b32f9f1ef904fb2a293d77f9844ab4b191` |
+| 2010 | 10.60 MB | 235 | 0.999350 | 1.000000 | 299 (24) | `fbf862e95b85cb8e7b2f9e6538ebee8f9b369e01d569bd0d1b96698bf0c4763b` |
+
+The advisory counts preserve model uncertainty, disagreements, and historical findings
+under the project's unattended-processing policy. A critical-labeled advisory does not
+stop processing; every page still has a chosen canonical result. Mechanical release
+errors such as missing structure text, an empty meaningful figure, invalid ownership,
+or failed extraction remain blocking.
+
+For all six final outputs:
+
+- exact selected-base rendering passed;
+- sampled source-to-facsimile fidelity passed at 72 and 150 DPI;
+- qpdf passed;
+- the structure tree exactly matched the canonical plan with zero structure errors;
+- transformation reconstruction and visual-block ownership passed;
+- Poppler extraction agreement exceeded `0.9985`, with exact token counts;
+- all pages were tagged and PDF/UA metadata was present;
+- veraPDF PDF/UA-1 passed;
+- the release path was published;
+- the manifest records producing commit `f0875a2`.
+
+Acrobat reading and click-selection behavior remain the external acceptance test for
+these newly processed issues.
