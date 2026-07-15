@@ -259,7 +259,15 @@ def _artifact_reason(
             term in alt for term in ("decorative", "flourish", "ornament")
         )
         generic_and_small = alt in _GENERIC_ALT_TEXT and (width <= 80 or height <= 25)
-        if explicitly_decorative or generic_and_small:
+        reviewed_small_decoration = (
+            not alt
+            and (width <= 80 or height <= 25)
+            and any(
+                finding.category == FindingCategory.DECORATION
+                for finding in element.findings
+            )
+        )
+        if explicitly_decorative or generic_and_small or reviewed_small_decoration:
             return ArtifactReason.DECORATION
     fingerprint = _furniture_fingerprint(element)
     if fingerprint and fingerprint in repeated_furniture:

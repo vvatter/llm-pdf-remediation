@@ -155,7 +155,9 @@ non-figure element boxes with the union of aligned word evidence when available.
 Artifacts are explicit records with a bounding box and reason. The deterministic
 post-review pass currently identifies printed page numbers, repeated top/bottom
 furniture, writing lines, and small decorative figures. These items remain visible in
-the page facsimile but do not enter the semantic reading stream.
+the page facsimile but do not enter the semantic reading stream. A small empty-alt
+figure is treated as decoration only when the reviewed findings explicitly classify it
+that way; other empty-alt figures remain release-blocking errors.
 
 On the first page, an attributed epigraph is placed after publication and
 volume/issue/date metadata and before the first article heading. Proposal/review prompt

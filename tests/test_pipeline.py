@@ -25,6 +25,8 @@ from pdf_accessibility.models import (
     PageElement,
     PageFlow,
     PagePlan,
+    ReviewFinding,
+    ReviewSeverity,
     ReviewStatus,
     TextFragment,
     TransformationKind,
@@ -890,6 +892,39 @@ class DeterministicRefinementTests(unittest.TestCase):
             self.assertEqual(len(plan.pages[0].block_order), 1)
             self.assertEqual(
                 plan.pages[0].artifacts[0].reason, ArtifactReason.WRITING_LINE
+            )
+
+    def test_moves_reviewed_empty_alt_flourish_to_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page(width=612, height=792)
+            document.save(source)
+            document.close()
+            flourish = PageElement(
+                role=ElementRole.FIGURE,
+                alt_text=None,
+                bbox=[900, 900, 940, 920],
+                findings=[
+                    ReviewFinding(
+                        severity=ReviewSeverity.INFO,
+                        category=FindingCategory.DECORATION,
+                        message="The small flourish is decorative.",
+                        chosen="Retain as an unlabelled decorative figure.",
+                    )
+                ],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Sample",
+                pages=[PagePlan(page_number=1, elements=[flourish])],
+            )
+
+            refine_document_plan(source, plan)
+
+            self.assertEqual(plan.pages[0].elements, [])
+            self.assertEqual(
+                plan.pages[0].artifacts[0].reason, ArtifactReason.DECORATION
             )
 
     def test_moves_omitted_pointer_fragment_to_decoration_artifacts(self) -> None:
