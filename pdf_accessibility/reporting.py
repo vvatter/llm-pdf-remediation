@@ -285,6 +285,7 @@ def build_manifest(
             "geometry_alignment": "block_local_with_ocr_line_identity",
             "structure_regions": "direct_visual_regions_integer_mcids",
             "fragmented_paragraph_strategy": "separate_direct_paragraph_regions",
+            "interleaved_region_fallback": "ordered_union_when_spatial_concatenation_changes_transcript",
             "text_object_scope": "visual_region",
             "content_stream_scope": "visual_region",
             "figure_proxy": "nonpainting_geometry_with_structural_alt",
