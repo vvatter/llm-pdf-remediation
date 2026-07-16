@@ -141,14 +141,6 @@ Old schema-v1 through schema-v3 plans migrate automatically. The original is pre
 `*.plan.legacy.json`. Existing reviewed or manually modified canonical plans are not
 overwritten unless a force option is supplied.
 
-## Current Status
-
-All nine documents in the original project corpus have released accessible outputs.
-Every output passed the project's machine checks and veraPDF's PDF/UA-1 checks. Three
-representative documents also received successful Acrobat Read Out Loud, clicking,
-selection, and reading-order spot checks. The remaining six still need document-level
-testing in a real PDF reader.
-
 ## Release Semantics
 
 The compiler first creates an undeclared draft. It then verifies exact rendered-page
