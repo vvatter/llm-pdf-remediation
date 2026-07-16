@@ -47,6 +47,11 @@ space.
 **Decision:** retain word-level MCIDs as an Acrobat compatibility profile, isolated from
 the semantic plan so another compiler strategy can be tested later.
 
+**Superseded on 2026-07-14:** direct Unicode line strings inside region-level MCIDs
+replaced the synthetic word-level layer. The later entries retain the word-level work as
+the experiment that exposed Acrobat's geometry requirements, not as the current
+compiler strategy.
+
 ## 2026-07-12: Three-Document Golden Run
 
 ### Configuration
@@ -1087,3 +1092,26 @@ For all six final outputs:
 
 Acrobat reading and click-selection behavior remain the external acceptance test for
 these newly processed issues.
+
+## 2026-07-16: Newsletter Corpus Wrap-Up
+
+The newsletter phase concluded with nine released accessible PDFs: 1996, 1997, 1998,
+2004, 2005, 2007, 2008, 2009, and 2010. Every release passed exact selected-base
+rendering, sampled source fidelity, qpdf, structure-plan comparison, transformation and
+visual-block checks, text-extraction compatibility, complete tagging, and veraPDF
+PDF/UA-1.
+
+The 1996, 2004, and 2007 outputs were manually spot-checked in Acrobat after the final
+compiler changes. Read Out Loud, click targets, selection, and the difficult reading
+orders were judged successful. In particular, the 2007 nested-column page now reads its
+list and split paragraph in the intended order, keeps the paragraph fragments
+clickable, preserves spoken date ranges, and announces each figure description once.
+
+The other six issues have the full machine evidence described above but have not yet
+received issue-by-issue Acrobat or screen-reader acceptance testing. That distinction is
+now stated in both the README and the architecture document so a PDF/UA validator pass
+is not mistaken for complete WCAG 2.1 AA evidence.
+
+**Decision:** the newsletter corpus is complete enough to close this project phase. The
+same codebase remains available for other visually fixed historical PDFs; newsletter-
+specific generalization is not the next required task.

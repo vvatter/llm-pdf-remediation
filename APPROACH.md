@@ -297,6 +297,21 @@ optionally JAWS, heading and figure navigation, continuous reading, search, sele
 copy/paste, 400% zoom, narrow-window reflow, and page navigation. Findings remain logged
 for audit and future model improvements; they do not pause the unattended build.
 
+## Proven Corpus
+
+The initial University of Florida mathematics newsletter corpus contains nine issues:
+1996, 1997, 1998, 2004, 2005, 2007, 2008, 2009, and 2010. All nine completed the
+facsimile workflow and passed the project's release gates, including veraPDF PDF/UA-1.
+The 1996, 2004, and 2007 outputs also received successful manual Acrobat Read Out Loud,
+clicking, selection, and reading-order spot checks. The remaining six have machine
+evidence but still need issue-by-issue assistive-technology testing.
+
+This corpus exercises scan-like pages, damaged or missing character mappings,
+multi-column articles, nested columns, paragraph continuations, contents boxes,
+photographs, captions, decorative objects, a blank page, and interleaved label/value
+layouts. Exact results and the changes prompted by failures are recorded in
+[DEVELOG.md](DEVELOG.md).
+
 ## Current Boundaries
 
 The present roles are `DocumentTitle`, `H1`, `H2`, `H3`, `P`, and `Figure`. The next
@@ -306,6 +321,6 @@ labels are now implemented.
 
 Other deferred work includes region/line dynamic-programming alignment, PAC automation,
 formal NVDA/JAWS scripts, native image-object tagging, mathematics font fallback, and a
-larger golden regression corpus. An interactive human-remediation stage is explicitly
-out of scope; these additions can extend the saved plan and compiler without changing
-the central independently model-reviewed plan boundary.
+repeatable full-corpus rebuild harness. An interactive human-remediation stage is
+explicitly out of scope; these additions can extend the saved plan and compiler without
+changing the central independently model-reviewed plan boundary.

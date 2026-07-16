@@ -4,34 +4,55 @@
 > (xhigh)**. Its architecture, implementation, tests, experiments, and documentation
 > are being developed through human-directed collaboration with that model.
 
-This project adds a deterministic semantic layer to visually fixed archival PDFs. A
-vision model proposes a transcription and reading order, a second model reviews every
-page, and ordinary Python code owns PDF structure, fonts, MCIDs, metadata, validation,
-and serialization. The original visible page is not redesigned.
+## What This Does
 
-Pages are planned as ordered rectangular visual blocks rather than inferred from a
-single global column layout. Logical paragraphs may own multiple blocks when they
-continue from one column to another. The compiler uses those blocks for local geometry
-and emits them in reviewed tag-tree order; disjoint paragraph continuations receive
-consecutive direct `/P` regions because Acrobat reverses or loses independently placed
-MCIDs when they share one paragraph parent. This preserves clicking and order at the
-cost of a longer pause between fragments. When visual columns must be interleaved to
-preserve the approved transcript, the compiler instead retains one ordered region.
-Each region owns one PDF MCID and one ordered content stream. Corrected Unicode text is
-encoded directly in line-level strings positioned from OCR/native word geometry; the
-facsimile page remains visually unchanged underneath. `/ActualText` is reserved for
-the uncommon character that the embedded font cannot represent. Figures use structural
-`/Alt` alone plus a nonpainting geometric proxy, avoiding duplicate descriptions.
+The goal is to make old PDFs much more accessible without changing how their pages
+look. The tool uses AI models to read each page, correct mistakes left by automatic text
+recognition, identify headings, paragraphs, and meaningful images, and decide the order
+in which everything should be read. It then adds the improved text and organization
+behind the original page.
 
-The current corpus is departmental newsletters, but the pipeline is organized around
-fixed-layout PDFs rather than newsletter-specific file formats. See
-[APPROACH.md](APPROACH.md) for the architecture, trust model, validation gates, and known
-limitations.
+The resulting PDF should be easier to read aloud, search, select, copy, and navigate
+with accessibility software. The finished file is checked automatically before it is
+released. Automated checks are useful, but they do not replace testing with the PDF
+reader and assistive technology used by the intended audience.
 
-The production workflow is intentionally unattended. Ambiguities are logged without
-pausing the run, and the second model reviews the first model's plan. Interactive human
-remediation is not a planned pipeline stage; manual reader testing remains an external
-acceptance check while compatibility is being developed.
+The first completed collection is a set of University of Florida mathematics
+newsletters. The project is not limited to newsletters; it is intended for old PDFs
+whose original publishing files are no longer available.
+
+## Before You Start
+
+You need an **OpenAI API key** to run the remediation process. The tool sends page
+images and supporting text to OpenAI models. Set the key in the `OPENAI_API_KEY`
+environment variable, and do not save it in this repository.
+
+The recommended way to use the project is to clone it into a local directory, open that
+directory in **Codex** or **Claude Code**, and ask the coding assistant to install the
+requirements and run the tool on your PDFs:
+
+```sh
+git clone https://github.com/vvatter/llm-pdf-remediation.git
+cd llm-pdf-remediation
+```
+
+In Git terminology, **clone** is the right operation for making the local copy. A fork
+is only needed if you want a separate GitHub repository under your own account. Pulling
+updates happens after the repository has been cloned.
+
+## How It Works
+
+The first AI model proposes the page text, organization, image descriptions, and
+reading order. A second AI model checks that work while looking at the original page.
+The approved result is saved, and ordinary Python code builds the PDF from it. The
+models never write PDF instructions directly.
+
+The production workflow is unattended. Uncertain readings are recorded without
+pausing the run, and the second model must still choose a result. Human editing is not a
+pipeline stage, although real-reader testing remains an important final check.
+
+See [APPROACH.md](APPROACH.md) for the detailed architecture, trust model, PDF
+construction strategy, validation gates, and known limitations.
 
 ## Requirements
 
@@ -48,6 +69,10 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 source ~/.zshrc  # or otherwise export OPENAI_API_KEY
 ```
+
+`.venv` is a conventional name for a project-local Python environment. It is created
+from the Python installation on the current machine, is not committed to Git, and can
+be deleted and recreated at any time.
 
 The default model pair is deliberately fixed:
 
@@ -120,6 +145,14 @@ Each input receives a work directory under `build/` containing:
 Old schema-v1 through schema-v3 plans migrate automatically. The original is preserved as
 `*.plan.legacy.json`. Existing reviewed or manually modified canonical plans are not
 overwritten unless a force option is supplied.
+
+## Current Status
+
+All nine newsletters in the original project corpus have released accessible outputs:
+1996, 1997, 1998, 2004, 2005, 2007, 2008, 2009, and 2010. Every output passed the
+project's machine checks and veraPDF's PDF/UA-1 checks. The 1996, 2004, and 2007 issues
+also received successful Acrobat Read Out Loud, clicking, selection, and reading-order
+spot checks. The remaining six still need issue-by-issue testing in a real PDF reader.
 
 ## Release Semantics
 
