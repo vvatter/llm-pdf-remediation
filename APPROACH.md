@@ -299,12 +299,11 @@ for audit and future model improvements; they do not pause the unattended build.
 
 ## Proven Corpus
 
-The initial University of Florida mathematics newsletter corpus contains nine issues:
-1996, 1997, 1998, 2004, 2005, 2007, 2008, 2009, and 2010. All nine completed the
+The initial regression corpus contains nine historical PDFs. All nine completed the
 facsimile workflow and passed the project's release gates, including veraPDF PDF/UA-1.
-The 1996, 2004, and 2007 outputs also received successful manual Acrobat Read Out Loud,
+Three representative outputs also received successful manual Acrobat Read Out Loud,
 clicking, selection, and reading-order spot checks. The remaining six have machine
-evidence but still need issue-by-issue assistive-technology testing.
+evidence but still need document-level assistive-technology testing.
 
 This corpus exercises scan-like pages, damaged or missing character mappings,
 multi-column articles, nested columns, paragraph continuations, contents boxes,

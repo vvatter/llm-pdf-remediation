@@ -17,9 +17,8 @@ with accessibility software. The finished file is checked automatically before i
 released. Automated checks are useful, but they do not replace testing with the PDF
 reader and assistive technology used by the intended audience.
 
-The first completed collection is a set of University of Florida mathematics
-newsletters. The project is not limited to newsletters; it is intended for old PDFs
-whose original publishing files are no longer available.
+The first completed collection contains nine complex historical PDFs. The project is
+intended for old documents whose original publishing files are no longer available.
 
 ## Before You Start
 
@@ -35,10 +34,6 @@ requirements and run the tool on your PDFs:
 git clone https://github.com/vvatter/llm-pdf-remediation.git
 cd llm-pdf-remediation
 ```
-
-In Git terminology, **clone** is the right operation for making the local copy. A fork
-is only needed if you want a separate GitHub repository under your own account. Pulling
-updates happens after the repository has been cloned.
 
 ## How It Works
 
@@ -148,11 +143,11 @@ overwritten unless a force option is supplied.
 
 ## Current Status
 
-All nine newsletters in the original project corpus have released accessible outputs:
-1996, 1997, 1998, 2004, 2005, 2007, 2008, 2009, and 2010. Every output passed the
-project's machine checks and veraPDF's PDF/UA-1 checks. The 1996, 2004, and 2007 issues
-also received successful Acrobat Read Out Loud, clicking, selection, and reading-order
-spot checks. The remaining six still need issue-by-issue testing in a real PDF reader.
+All nine documents in the original project corpus have released accessible outputs.
+Every output passed the project's machine checks and veraPDF's PDF/UA-1 checks. Three
+representative documents also received successful Acrobat Read Out Loud, clicking,
+selection, and reading-order spot checks. The remaining six still need document-level
+testing in a real PDF reader.
 
 ## Release Semantics
 

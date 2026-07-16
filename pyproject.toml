@@ -19,7 +19,6 @@ dependencies = [
 
 [project.scripts]
 remediate-pdf = "pdf_accessibility.cli:main"
-remediate-newsletter = "pdf_accessibility.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pdf_accessibility*"]

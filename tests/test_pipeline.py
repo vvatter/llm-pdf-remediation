@@ -115,7 +115,7 @@ class NormalizePlanTests(unittest.TestCase):
             ),
         ]
 
-        normalized = normalize_document_pages(Path("newsletter.pdf"), pages)
+        normalized = normalize_document_pages(Path("document.pdf"), pages)
 
         self.assertEqual(
             [item.role for page in normalized for item in page.elements],
@@ -135,7 +135,7 @@ class NormalizePlanTests(unittest.TestCase):
             )
         ]
 
-        normalized = normalize_document_pages(Path("newsletter.pdf"), pages)
+        normalized = normalize_document_pages(Path("document.pdf"), pages)
 
         self.assertEqual(
             normalized[0].elements[0].text,
@@ -158,21 +158,21 @@ class CompileTests(unittest.TestCase):
             output = Path(temp) / "output.pdf"
             document = pymupdf.open()
             page = document.new_page()
-            page.insert_text((72, 72), "Visible newsletter text")
+            page.insert_text((72, 72), "Visible archival text")
             document.save(source)
             document.close()
 
             plan = DocumentPlan(
                 source_file=source.name,
-                title="Test Newsletter",
+                title="Test Document",
                 pages=[
                     PagePlan(
                         page_number=1,
                         elements=[
-                            element(ElementRole.DOCUMENT_TITLE, "Test Newsletter"),
+                            element(ElementRole.DOCUMENT_TITLE, "Test Document"),
                             element(
                                 ElementRole.P,
-                                " ".join(["Visible newsletter text"] * 20),
+                                " ".join(["Visible archival text"] * 20),
                                 top=200,
                             ),
                             element(
@@ -205,7 +205,7 @@ class CompileTests(unittest.TestCase):
                 text=True,
                 check=True,
             ).stdout
-            self.assertIn("Visible newsletter text", extracted)
+            self.assertIn("Visible archival text", extracted)
             self.assertNotIn("Historical diagram", extracted)
             with pikepdf.Pdf.open(output) as pdf:
                 self.assertTrue(pdf.Root.MarkInfo.Marked)
@@ -771,7 +771,7 @@ class DeterministicRefinementTests(unittest.TestCase):
                                 "The essence of mathematics resides in its freedom. – Georg Cantor",
                                 top=60,
                             ),
-                            element(ElementRole.P, "THE NEWSLETTER OF THE DEPARTMENT", top=80),
+                            element(ElementRole.P, "A DEPARTMENTAL PUBLICATION", top=80),
                             element(ElementRole.P, "VOLUME 20, ISSUE 1, SPRING 2007", top=90),
                             element(ElementRole.H1, "REPORT FROM THE CHAIR", top=120),
                         ],
@@ -785,7 +785,7 @@ class DeterministicRefinementTests(unittest.TestCase):
                 [item.semantic_text for item in plan.pages[0].elements],
                 [
                     "LITTLE by little",
-                    "THE NEWSLETTER OF THE DEPARTMENT",
+                    "A DEPARTMENTAL PUBLICATION",
                     "VOLUME 20, ISSUE 1, SPRING 2007",
                     "The essence of mathematics resides in its freedom. – Georg Cantor",
                     "REPORT FROM THE CHAIR",

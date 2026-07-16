@@ -56,7 +56,7 @@ compiler strategy.
 
 ### Configuration
 
-- Inputs: `1996_newsletter.pdf`, `2004_newsletter.pdf`, `2007_newsletter.pdf`
+- Inputs: three historical PDFs from 1996, 2004, and 2007
 - Proposal: `gpt-5.6-terra`, medium reasoning
 - Review: `gpt-5.6-sol`, high reasoning
 - Workers: 2 per document; documents ran in parallel
@@ -215,7 +215,7 @@ optimization was mixed into this release.
    DPI, image codecs, font subsetting, and mixed raster strategies while requiring every
    current fidelity, extraction, structure, Acrobat, and veraPDF result to remain equal
    or better.
-4. Add the document/article graph and the newsletter-relevant roles `Caption`, lists,
+4. Add the document/article graph and the document roles `Caption`, lists,
    `TOC`, and `Formula`; then extend block-local alignment with line-level weighted
    matching where formulas or insertions need it.
 5. Treat native preservation as a longer-term compiler project: tag or replace existing
@@ -433,7 +433,7 @@ The full 2007 rebuild reused the approved saved plans and made no model calls. I
 all 16 unit tests, exact rendering, qpdf, block-plan validation, exact structure-plan
 comparison, 1.000000 extraction agreement and token ratio, and veraPDF PDF/UA-1. The
 controlled Acrobat test file is
-`build/2007_newsletter/2007_newsletter.accessible.acrobat-reference.pdf`, SHA-256
+`build/<source-stem>/<source-stem>.accessible.acrobat-reference.pdf`, SHA-256
 `15fb70b52f9ab6f810a1b29fd41033aa3f004b48225a4d84cb94fa19b34a00cd`.
 
 This experiment is mechanically valid and closer to official passing examples, but its
@@ -486,7 +486,7 @@ The full 2007 rebuild reused the saved approved plan and made no model calls. It
 all 17 unit tests, exact rendering, qpdf, block-plan validation, exact grouped
 structure-plan comparison, 1.000000 extraction agreement and token ratio, and veraPDF
 PDF/UA-1. The controlled test file is
-`build/2007_newsletter/2007_newsletter.accessible.direct-regions.pdf`, SHA-256
+`build/<source-stem>/<source-stem>.accessible.direct-regions.pdf`, SHA-256
 `6ebb8038fafed16e55f99d8087ba8a490af2b1bc1ee98e529b436f0b8c0d009f`.
 
 The expected improvement is independently clickable paragraph regions and uninterrupted
@@ -537,7 +537,7 @@ The rebuilt 2007 issue reused the saved approved plan and made no model calls. I
 exact rendering, qpdf, block-plan validation, exact grouped structure-plan comparison,
 1.000000 extraction agreement and token ratio, and veraPDF PDF/UA-1. The controlled
 Acrobat file is
-`build/2007_newsletter/2007_newsletter.accessible.region-text-objects.pdf`, SHA-256
+`build/<source-stem>/<source-stem>.accessible.region-text-objects.pdf`, SHA-256
 `272b794a2d1aea8b3d4fe8075b62f8228ebd57b7ffe9d0b07ecfecc36d00cae9`.
 
 Whether these region-scoped text objects restore Acrobat clicking remains a manual
@@ -597,7 +597,7 @@ The rebuilt issue passes all 18 tests, exact rendering, qpdf, block-plan validat
 exact grouped structure-plan comparison, 1.000000 extraction agreement and token ratio,
 and veraPDF PDF/UA-1. It contains 224 direct semantic regions, zero structure element
 IDs, and no `/IDTree`. The controlled Acrobat file is
-`build/2007_newsletter/2007_newsletter.accessible.acrobat-bbox.pdf`, SHA-256
+`build/<source-stem>/<source-stem>.accessible.acrobat-bbox.pdf`, SHA-256
 `64c5e1d59f5442fa1dccd2ad88f46891473ce6fff48bd2b6ec4573d631996051`.
 
 Acrobat clicking and byline-to-paragraph traversal remain manual acceptance tests.
@@ -664,7 +664,7 @@ The critical physical and logical sequence is now:
 The rebuilt document passes all 18 tests, exact rendering, qpdf, block-plan validation,
 exact structure-plan comparison, 1.000000 extraction agreement and token ratio, and
 veraPDF PDF/UA-1. The controlled Acrobat file is
-`build/2007_newsletter/2007_newsletter.accessible.region-mcids.pdf`, SHA-256
+`build/<source-stem>/<source-stem>.accessible.region-mcids.pdf`, SHA-256
 `a34a2d30a77dd129062ec7e807ba90a79b4baf64599be8fb7f8bfaba669497f1`.
 
 Clickability of the page-1 region MCIDs and continuous traversal from page-2 MCID 1 to
@@ -730,11 +730,11 @@ where Acrobat had pronounced `Computability` and `cardinal` as split words.
 ### Controlled 2007 result
 
 The controlled candidate is
-`build/2007_newsletter/2007_newsletter.accessible.direct-unicode.pdf`, SHA-256
+`build/<source-stem>/<source-stem>.accessible.direct-unicode.pdf`, SHA-256
 `0f4cf03534e492aa89af97f10c5827500b98362f8622e279e48e6c2fd181bb52`.
 It is 11,431,193 bytes; the OCR facsimile remains the dominant file-size cost.
 The same strategy was then promoted through the ordinary release pipeline as
-`build/2007_newsletter/2007_newsletter.accessible.pdf`, SHA-256
+`build/<source-stem>/<source-stem>.accessible.pdf`, SHA-256
 `e99ac2a1ea3b2cb0dcd792d6f69e168e002be1bf730b3061fdb54d8d87cb77c2`.
 
 Automated results:
@@ -839,7 +839,7 @@ References used for this decision:
 ### Released result
 
 The ordinary output is
-`build/2007_newsletter/2007_newsletter.accessible.pdf`, SHA-256
+`build/<source-stem>/<source-stem>.accessible.pdf`, SHA-256
 `a6c4fb63e6077cb2242b5e636f0ad5317b274e657b8638cb7cd13a07a3fd9e5d`.
 
 Automated results:
@@ -863,8 +863,8 @@ either visual fragment.
 
 The Acrobat retest found four regressions in the polish build:
 
-1. The masthead began `Little the newsletter` instead of `Little by little. The
-   newsletter...`.
+1. The masthead title was truncated and joined to the following publication
+   descriptor instead of being read in full.
 2. Date ranges such as `September 15–17` lost the range relationship in speech.
 3. The first `The Annual Meeting...` fragment was no longer clickable.
 4. Acrobat read the second `down to Gainesville...` fragment before the first.
@@ -896,7 +896,7 @@ Both are direct `/P` children in that order.
 The title regression had a different cause. `LITTLE by little` had zero useful OCR
 agreement. The word `LITTLE` was positioned near the visible title, while `by little`
 inherited coordinates from an unrelated OCR line much lower on the page. The old
-masthead order happened to conceal that defect; moving the newsletter descriptor next
+masthead order happened to conceal that defect; moving the publication descriptor next
 to the title exposed it.
 
 The compiler now treats geometry evidence as usable only when the region has source
@@ -920,7 +920,7 @@ The single-source figure-description fix remains in place: figures have structur
 `/Alt` plus a nonpainting geometric proxy, with no duplicate hidden text.
 
 The ordinary output is
-`build/2007_newsletter/2007_newsletter.accessible.pdf`, SHA-256
+`build/<source-stem>/<source-stem>.accessible.pdf`, SHA-256
 `d51eb9205c07f4ffef3d2c50bfddfd2a28e119a4a5493a3f515243577f33f26d`.
 
 Automated results:
@@ -934,7 +934,7 @@ Automated results:
 - the release pipeline published the declared accessible output.
 
 The remaining acceptance tests are Acrobat-specific: the full masthead phrase should
-read before the newsletter descriptor, the date range should contain the spoken word
+read before the publication descriptor, the date range should contain the spoken word
 `to`, MCID 8 should be clickable and read before MCID 9, and each figure description
 should be announced once.
 
@@ -944,7 +944,7 @@ should be announced once.
 
 The Acrobat-proven 2007 implementation was committed as `47a6e6d` and tagged
 `v0.4.0`. The golden rebuild then reused the saved reviewed plans for the 1996, 2004,
-and 2007 newsletters. No model replanning or review calls were made. This isolated
+and 2007 documents. No model replanning or review calls were made. This isolated
 compiler and validation behavior from model variability.
 
 ### 2004 extraction gate failure
@@ -994,7 +994,7 @@ The 1996 and 2004 files remain pending Acrobat acceptance testing. The 2007 outp
 rebuilt because the font-fitting change improved its extraction metrics; its established
 reading order and direct-region structure are unchanged.
 
-## 2026-07-14: Complete Remaining Newsletter Corpus
+## 2026-07-14: Complete Remaining Initial Corpus
 
 ### Scope and first-time planning
 
@@ -1093,13 +1093,12 @@ For all six final outputs:
 Acrobat reading and click-selection behavior remain the external acceptance test for
 these newly processed issues.
 
-## 2026-07-16: Newsletter Corpus Wrap-Up
+## 2026-07-16: Initial Corpus Wrap-Up
 
-The newsletter phase concluded with nine released accessible PDFs: 1996, 1997, 1998,
-2004, 2005, 2007, 2008, 2009, and 2010. Every release passed exact selected-base
-rendering, sampled source fidelity, qpdf, structure-plan comparison, transformation and
-visual-block checks, text-extraction compatibility, complete tagging, and veraPDF
-PDF/UA-1.
+The initial corpus phase concluded with nine released accessible PDFs. Every release
+passed exact selected-base rendering, sampled source fidelity, qpdf, structure-plan
+comparison, transformation and visual-block checks, text-extraction compatibility,
+complete tagging, and veraPDF PDF/UA-1.
 
 The 1996, 2004, and 2007 outputs were manually spot-checked in Acrobat after the final
 compiler changes. Read Out Loud, click targets, selection, and the difficult reading
@@ -1112,6 +1111,5 @@ received issue-by-issue Acrobat or screen-reader acceptance testing. That distin
 now stated in both the README and the architecture document so a PDF/UA validator pass
 is not mistaken for complete WCAG 2.1 AA evidence.
 
-**Decision:** the newsletter corpus is complete enough to close this project phase. The
-same codebase remains available for other visually fixed historical PDFs; newsletter-
-specific generalization is not the next required task.
+**Decision:** the initial corpus is complete enough to close this project phase. The
+same codebase remains available for other visually fixed historical PDFs.

@@ -288,10 +288,9 @@ def normalize_document_pages(source: Path, pages: list[PagePlan]) -> list[PagePl
                     )
             text = " ".join(element.accessible_text.lower().split())
             is_running_header = (
-                (normalized_title and normalized_title in text and "spring" in text)
-                or "univ of florida mathematics newsletter" in text
-                or "department of mathematics newsletter" in text and page.page_number > 1
-                or text.startswith("vol 18. no 1.")
+                page.page_number > 1
+                and bool(normalized_title)
+                and normalized_title in text
             )
             if element.role == ElementRole.DOCUMENT_TITLE:
                 if page.page_number == 1 and not kept_document_title:
