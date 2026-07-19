@@ -155,6 +155,16 @@ temporary candidate receives
 `pdfuaid:part=1`. The final accessible filename is published only if veraPDF PDF/UA-1
 also passes.
 
+Released files identify `llm-pdf-remediation` as their PDF producer. Preflight snapshots
+the source authors, Subject, Keywords, XMP description, creation date, and encoding
+applications before derivative tools run, and release restores that content metadata.
+Misleading intermediate `Creator` values from OCR or PDF libraries are removed. A
+dedicated `llmpr` XMP namespace records the tool and version, UTC remediation date,
+schema version, source and canonical-plan hashes, original encoding software, and a
+brief remediation summary crediting ChatGPT 5.6 Sol. The release gate verifies this
+metadata. The remediation summary and original encoding software are mirrored into PDF
+custom properties so Acrobat exposes them in its Custom document-properties tab.
+
 Model findings, including critical findings, are logged but do not interrupt a batch.
 They remain visible in the anomaly report. NVDA or JAWS testing, Acrobat reflow, and
 manual WCAG checks are still needed as external evidence for an institutional

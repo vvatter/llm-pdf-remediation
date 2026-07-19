@@ -267,10 +267,21 @@ The draft deliberately omits the PDF/UA identification metadata. Validation then
     normalized channel difference to be at most 0.052 and material-difference fraction
     to be at most 0.25.
 
-Only after these checks does a temporary candidate receive `pdfuaid:part=1`. veraPDF
-then runs its PDF/UA-1 profile. The accessible output path is published only if all
-machine checks pass. On failure, the temporary candidate is discarded and the
-undeclared draft plus validation report remain.
+Only after these checks does a temporary candidate receive `pdfuaid:part=1` and its
+release provenance. The project is recorded as the PDF producer, while misleading
+intermediate OCR/PDF-library Creator values are removed. Preflight snapshots source
+authors, Subject, Keywords, XMP description, creation date, and encoding applications
+before derivative tools run; release restores the content metadata and original creation
+date. The `llmpr` XMP namespace records the tool and version, UTC remediation date,
+schema version, source SHA-256, canonical-plan SHA-256, original encoding software, and
+a brief remediation summary crediting ChatGPT 5.6 Sol. This keeps production history out
+of content-description fields while allowing an inventory crawler to recognize outputs
+deterministically. The two human-facing provenance values are mirrored into custom PDF
+Info properties so Acrobat displays them in its Custom document-properties tab. The
+release gate requires the Info and XMP copies to agree before veraPDF runs its PDF/UA-1
+profile. The accessible output path is published only if all machine checks pass. On
+failure, the temporary candidate is discarded and the undeclared draft plus validation
+report remain.
 
 The structure serializer is the deterministic reading-order test. `pdftotext` is also a
 release compatibility gate because it exposed native-layer duplication. Acrobat Read

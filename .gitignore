@@ -1,5 +1,6 @@
 .venv/
 build/
+upload/
 *.egg-info/
 *.pyc
 __pycache__/

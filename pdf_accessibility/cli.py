@@ -177,6 +177,7 @@ def run_command(args: argparse.Namespace) -> int:
             paths["output"],
             plan,
             reference_source=source,
+            source_metadata=preflight.source_metadata,
         )
     validation["draft_validation"] = draft_report
     paths["validation"].write_text(json.dumps(validation, indent=2) + "\n", encoding="utf-8")

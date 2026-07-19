@@ -1113,3 +1113,42 @@ is not mistaken for complete WCAG 2.1 AA evidence.
 
 **Decision:** the initial corpus is complete enough to close this project phase. The
 same codebase remains available for other visually fixed historical PDFs.
+
+## 2026-07-19: Release Provenance Metadata
+
+The released corpus previously inherited `Creator` and `Producer` values from
+OCRmyPDF and pikepdf. Those fields identified intermediate implementation tools but did
+not identify the accessibility remediation workflow, so a later PDF inventory could not
+reliably distinguish project outputs from unrelated OCR or PDF-library products.
+
+The final release step now removes application `Creator` and XMP `CreatorTool` values
+and records `llm-pdf-remediation` plus its version as the PDF producer. Preflight saves
+source authors, Subject, Keywords, XMP description, creation date, and encoding
+applications before derivative tools run. Release restores those content fields and the
+original creation date. A dedicated `llmpr` XMP namespace records the tool, version, UTC
+remediation timestamp, schema version, source SHA-256, canonical-plan SHA-256, original
+encoding software, and a short remediation summary crediting ChatGPT 5.6 Sol. This
+provides a stable crawler test without overloading authorship or content-description
+fields.
+
+Acrobat's ordinary Custom document-properties tab does not expose arbitrary custom XMP
+properties. The human-facing remediation summary and original encoding software are
+therefore mirrored into custom PDF Info properties named `Remediation` and `Original
+encoding software`. XMP remains authoritative for machine inventory, and the release
+gate requires both representations to agree exactly.
+
+Metadata validation is a blocking release gate. It checks the standard and XMP producer
+values, absence of application Creator values, exact preservation of source content and
+creation metadata, the project marker and version, remediation summary, original
+encoding software, schema version, timestamp, and exact source and plan hashes. The
+internal package version was updated from a stale `0.2.0` declaration to the current
+`0.4.0` before it was embedded.
+
+All nine existing newsletter releases were restamped through the release path. Each
+metadata-bearing file preserved exact rendering, source fidelity, structure-plan
+identity, complete tagging, transformation and visual-block validity, and Poppler
+extraction compatibility; qpdf and veraPDF PDF/UA-1 also passed for all nine.
+
+**Decision:** `llm-pdf-remediation` is the producer of the remediated derivative, not
+the creator or author of its source content. Only a candidate that passes the complete
+release pipeline retains the project provenance marker.

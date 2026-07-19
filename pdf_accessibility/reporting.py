@@ -261,6 +261,7 @@ def build_manifest(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": str(source),
         "source_sha256": sha256_file(source),
+        "source_metadata": preflight.source_metadata.model_dump(),
         "page_image_sha256": page_hashes,
         "plan_sha256": plan_sha256(plan),
         "plan_schema_version": plan.schema_version,
@@ -310,6 +311,7 @@ def build_manifest(
             "extraction_compatible": validation.get("extraction_compatible"),
             "transformations_valid": validation.get("transformations_valid"),
             "block_plan_valid": validation.get("block_plan_valid"),
+            "remediation_metadata_valid": validation.get("remediation_metadata_valid"),
             "verapdf_pdfua_ok": validation.get("verapdf_pdfua_ok"),
         },
     }

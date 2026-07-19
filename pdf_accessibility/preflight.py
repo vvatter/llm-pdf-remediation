@@ -8,6 +8,7 @@ import subprocess
 
 import pikepdf
 import pymupdf
+from pikepdf.models.metadata import decode_pdf_date
 from pydantic import BaseModel, Field
 
 from .models import RemediationMode
@@ -30,6 +31,18 @@ class PagePreflight(BaseModel):
     usable_native_text: bool
 
 
+class SourceMetadata(BaseModel):
+    author: str | None = None
+    subject: str | None = None
+    keywords: str | None = None
+    xmp_authors: list[str] = Field(default_factory=list)
+    description: str | None = None
+    xmp_keywords: str | None = None
+    creation_date: str | None = None
+    xmp_creation_date: str | None = None
+    encoding_software: list[str] = Field(default_factory=list)
+
+
 class PreflightReport(BaseModel):
     source: str
     source_sha256: str
@@ -45,9 +58,73 @@ class PreflightReport(BaseModel):
     native_text_page_ratio: float
     fonts_embedded: bool
     fonts_unicode_mapped: bool
+    source_metadata: SourceMetadata = Field(default_factory=SourceMetadata)
     pages: list[PagePreflight] = Field(default_factory=list)
     fonts: list[FontFinding] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
+
+
+def _text_value(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _text_values(value: object) -> list[str]:
+    if isinstance(value, (list, set, tuple)):
+        items = value
+    else:
+        items = [value]
+    values: list[str] = []
+    for item in items:
+        text = _text_value(item)
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def read_source_metadata(source: Path) -> SourceMetadata:
+    """Snapshot content and production metadata before derivative tools run."""
+    with pikepdf.Pdf.open(source) as pdf:
+        author = _text_value(pdf.docinfo.get("/Author"))
+        subject = _text_value(pdf.docinfo.get("/Subject"))
+        keywords = _text_value(pdf.docinfo.get("/Keywords"))
+        creation_date = _text_value(pdf.docinfo.get("/CreationDate"))
+        encoding_software = _text_values(pdf.docinfo.get("/Creator"))
+        for value in _text_values(pdf.docinfo.get("/Producer")):
+            if value not in encoding_software:
+                encoding_software.append(value)
+
+        with pdf.open_metadata(
+            set_pikepdf_as_editor=False, update_docinfo=False
+        ) as metadata:
+            xmp_authors = _text_values(metadata.get("dc:creator"))
+            description = _text_value(metadata.get("dc:description"))
+            xmp_keywords = _text_value(metadata.get("pdf:Keywords"))
+            xmp_creation_date = _text_value(metadata.get("xmp:CreateDate"))
+            for key in ("xmp:CreatorTool", "pdf:Producer"):
+                for value in _text_values(metadata.get(key)):
+                    if value not in encoding_software:
+                        encoding_software.append(value)
+
+        if not xmp_creation_date and creation_date:
+            try:
+                xmp_creation_date = decode_pdf_date(creation_date).isoformat()
+            except (TypeError, ValueError):
+                pass
+
+    return SourceMetadata(
+        author=author,
+        subject=subject,
+        keywords=keywords,
+        xmp_authors=xmp_authors,
+        description=description,
+        xmp_keywords=xmp_keywords,
+        creation_date=creation_date,
+        xmp_creation_date=xmp_creation_date,
+        encoding_software=encoding_software,
+    )
 
 
 def run_verapdf(pdf_path: Path) -> tuple[bool | None, dict[str, object] | None]:
@@ -108,8 +185,10 @@ def inspect_pdf(
     render_ok = True
     encrypted = False
     already_tagged = False
+    source_metadata = SourceMetadata()
 
     try:
+        source_metadata = read_source_metadata(source)
         with pikepdf.Pdf.open(source) as pdf:
             encrypted = bool(pdf.is_encrypted)
             already_tagged = bool(
@@ -227,6 +306,7 @@ def inspect_pdf(
         native_text_page_ratio=native_ratio,
         fonts_embedded=fonts_embedded,
         fonts_unicode_mapped=fonts_unicode,
+        source_metadata=source_metadata,
         pages=pages,
         fonts=fonts,
         reasons=reasons,

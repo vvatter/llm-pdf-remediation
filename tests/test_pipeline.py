@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import subprocess
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from pdf_accessibility.models import (
     exact_text_tokens,
 )
 from pdf_accessibility.plans import load_document_plan
+from pdf_accessibility.preflight import SourceMetadata, read_source_metadata
 from pdf_accessibility.evidence import diagnostics_for, evidence_from_packet
 from pdf_accessibility.extract import PagePacket
 from pdf_accessibility.planner import (
@@ -46,6 +48,9 @@ from pdf_accessibility.planner import (
 )
 from pdf_accessibility.refine import refine_document_plan, transformation_errors
 from pdf_accessibility.validate import (
+    REMEDIATION_PRODUCER,
+    REMEDIATION_SUMMARY,
+    REMEDIATION_TOOL,
     add_pdfua_declaration,
     compare_structure_to_plan,
     plan_is_approved,
@@ -144,6 +149,48 @@ class NormalizePlanTests(unittest.TestCase):
 
 
 class CompileTests(unittest.TestCase):
+    def test_preflight_snapshots_source_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            raw = Path(temp) / "raw.pdf"
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page()
+            document.save(raw)
+            document.close()
+            with pikepdf.Pdf.open(raw) as pdf:
+                pdf.docinfo[pikepdf.Name.Author] = "Ada Lovelace"
+                pdf.docinfo[pikepdf.Name.Subject] = "Analytical Engine"
+                pdf.docinfo[pikepdf.Name.Keywords] = "mathematics; history"
+                pdf.docinfo[pikepdf.Name.Creator] = "TeX"
+                pdf.docinfo[pikepdf.Name.Producer] = "Ghostscript 5.50"
+                pdf.docinfo[pikepdf.Name.CreationDate] = "D:20000102030405"
+                with pdf.open_metadata(
+                    set_pikepdf_as_editor=False, update_docinfo=False
+                ) as metadata:
+                    metadata["dc:creator"] = ["Ada Lovelace"]
+                    metadata["dc:description"] = "A history of the Analytical Engine."
+                    metadata["pdf:Keywords"] = "mathematics; history"
+                    metadata["xmp:CreatorTool"] = "TeX"
+                    metadata["pdf:Producer"] = "Ghostscript 5.50"
+                    metadata["xmp:CreateDate"] = "2000-01-02T03:04:05"
+                pdf.save(source)
+
+            snapshot = read_source_metadata(source)
+
+            self.assertEqual(snapshot.author, "Ada Lovelace")
+            self.assertEqual(snapshot.subject, "Analytical Engine")
+            self.assertEqual(snapshot.keywords, "mathematics; history")
+            self.assertEqual(snapshot.xmp_authors, ["Ada Lovelace"])
+            self.assertEqual(
+                snapshot.description, "A history of the Analytical Engine."
+            )
+            self.assertEqual(snapshot.xmp_keywords, "mathematics; history")
+            self.assertEqual(snapshot.creation_date, "D:20000102030405")
+            self.assertEqual(snapshot.xmp_creation_date, "2000-01-02T03:04:05")
+            self.assertEqual(
+                snapshot.encoding_software, ["TeX", "Ghostscript 5.50"]
+            )
+
     def test_exact_tokens_preserve_joiners(self) -> None:
         text = "Dr. Smith—yes,\u00a0indeed.\nNext"
         tokens = exact_text_tokens(text)
@@ -647,14 +694,76 @@ class CompileTests(unittest.TestCase):
             document.save(draft)
             document.close()
 
-            add_pdfua_declaration(draft, candidate)
+            plan = DocumentPlan(
+                source_file="source.pdf",
+                source_sha256="a" * 64,
+                title="Test",
+                pages=[],
+            )
+            source_metadata = SourceMetadata(
+                author="Ada Lovelace",
+                subject="Analytical Engine",
+                keywords="mathematics; history",
+                xmp_authors=["Ada Lovelace"],
+                description="A history of the Analytical Engine.",
+                xmp_keywords="mathematics; history",
+                creation_date="D:20000102030405",
+                xmp_creation_date="2000-01-02T03:04:05",
+                encoding_software=["TeX", "Ghostscript 5.50"],
+            )
+            add_pdfua_declaration(
+                draft,
+                candidate,
+                plan,
+                datetime(2026, 7, 19, 12, 30, tzinfo=timezone.utc),
+                source_metadata,
+            )
 
             with pikepdf.Pdf.open(draft) as pdf:
                 with pdf.open_metadata() as metadata:
                     self.assertNotIn("pdfuaid:part", metadata)
             with pikepdf.Pdf.open(candidate) as pdf:
-                with pdf.open_metadata() as metadata:
+                self.assertNotIn(pikepdf.Name.Creator, pdf.docinfo)
+                self.assertEqual(str(pdf.docinfo.Producer), REMEDIATION_PRODUCER)
+                self.assertEqual(str(pdf.docinfo.Remediation), REMEDIATION_SUMMARY)
+                self.assertEqual(
+                    str(pdf.docinfo[pikepdf.Name("/Original encoding software")]),
+                    "TeX; Ghostscript 5.50",
+                )
+                self.assertEqual(str(pdf.docinfo.Author), "Ada Lovelace")
+                self.assertEqual(str(pdf.docinfo.Subject), "Analytical Engine")
+                self.assertEqual(str(pdf.docinfo.Keywords), "mathematics; history")
+                self.assertEqual(str(pdf.docinfo.CreationDate), "D:20000102030405")
+                with pdf.open_metadata(set_pikepdf_as_editor=False) as metadata:
                     self.assertEqual(metadata["pdfuaid:part"], "1")
+                    self.assertEqual(metadata["llmpr:tool"], REMEDIATION_TOOL)
+                    self.assertEqual(metadata["llmpr:version"], "0.4.0")
+                    self.assertEqual(
+                        metadata["llmpr:remediationDate"], "2026-07-19T12:30:00Z"
+                    )
+                    self.assertEqual(metadata["llmpr:schemaVersion"], "4")
+                    self.assertEqual(metadata["llmpr:sourceSha256"], "a" * 64)
+                    self.assertIn("llmpr:canonicalPlanSha256", metadata)
+                    self.assertEqual(metadata["llmpr:remediation"], REMEDIATION_SUMMARY)
+                    self.assertEqual(
+                        metadata["llmpr:originalEncodingSoftware"],
+                        "TeX; Ghostscript 5.50",
+                    )
+                    self.assertNotIn("xmp:CreatorTool", metadata)
+                    self.assertEqual(metadata["dc:creator"], ["Ada Lovelace"])
+                    self.assertEqual(
+                        metadata["dc:description"],
+                        "A history of the Analytical Engine.",
+                    )
+                    self.assertEqual(metadata["pdf:Keywords"], "mathematics; history")
+                    self.assertEqual(metadata["xmp:CreateDate"], "2000-01-02T03:04:05")
+            report = validate_output(
+                draft,
+                candidate,
+                plan,
+                source_metadata=source_metadata,
+            )
+            self.assertTrue(report["remediation_metadata_valid"])
 
 
 class PlanMigrationTests(unittest.TestCase):

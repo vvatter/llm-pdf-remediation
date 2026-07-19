@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 import re
@@ -11,10 +12,33 @@ import subprocess
 import pikepdf
 import pymupdf
 from pikepdf import Name
+from pikepdf.models.metadata import PdfMetadata
 
-from .models import DocumentPlan, ElementRole, ReviewStatus, fragment_region_groups
-from .preflight import run_verapdf
+from . import __version__
+from .models import (
+    SCHEMA_VERSION,
+    DocumentPlan,
+    ElementRole,
+    ReviewStatus,
+    fragment_region_groups,
+)
+from .plans import plan_sha256
+from .preflight import SourceMetadata, read_source_metadata, run_verapdf
 from .refine import transformation_errors
+
+
+REMEDIATION_NAMESPACE = "https://github.com/vvatter/llm-pdf-remediation/ns/1.0/"
+REMEDIATION_PREFIX = "llmpr"
+REMEDIATION_TOOL = "llm-pdf-remediation"
+REMEDIATION_PRODUCER = f"{REMEDIATION_TOOL} {__version__}"
+REMEDIATION_INFO_KEY = Name("/Remediation")
+ORIGINAL_ENCODING_INFO_KEY = Name("/Original encoding software")
+REMEDIATION_SUMMARY = (
+    "Remediated with llm-pdf-remediation and ChatGPT 5.6 Sol: added reviewed accessible "
+    "text, semantic tags, reading order, bookmarks, and image descriptions while preserving "
+    "page appearance."
+)
+PdfMetadata.register_xml_namespace(REMEDIATION_NAMESPACE, REMEDIATION_PREFIX)
 
 
 EXPECTED_PDF_ROLES = {
@@ -34,6 +58,174 @@ def plan_is_approved(plan: DocumentPlan) -> bool:
         and all(element.review_status in approved for element in page.elements)
         for page in plan.pages
     )
+
+
+def _apply_remediation_metadata(
+    pdf: pikepdf.Pdf,
+    plan: DocumentPlan | None,
+    remediated_at: datetime | None = None,
+    source_metadata: SourceMetadata | None = None,
+) -> None:
+    source_metadata = source_metadata or SourceMetadata()
+    timestamp = (remediated_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    iso_timestamp = timestamp.isoformat().replace("+00:00", "Z")
+    original_encoding = "; ".join(source_metadata.encoding_software)
+
+    with pdf.open_metadata(
+        set_pikepdf_as_editor=False, update_docinfo=False
+    ) as metadata:
+        metadata["pdfuaid:part"] = "1"
+        metadata["pdf:Producer"] = REMEDIATION_PRODUCER
+        metadata["xmp:ModifyDate"] = iso_timestamp
+        metadata["xmp:MetadataDate"] = iso_timestamp
+        metadata[f"{REMEDIATION_PREFIX}:tool"] = REMEDIATION_TOOL
+        metadata[f"{REMEDIATION_PREFIX}:version"] = __version__
+        metadata[f"{REMEDIATION_PREFIX}:remediationDate"] = iso_timestamp
+        metadata[f"{REMEDIATION_PREFIX}:schemaVersion"] = str(SCHEMA_VERSION)
+        metadata[f"{REMEDIATION_PREFIX}:remediation"] = REMEDIATION_SUMMARY
+        if original_encoding:
+            metadata[f"{REMEDIATION_PREFIX}:originalEncodingSoftware"] = original_encoding
+        elif f"{REMEDIATION_PREFIX}:originalEncodingSoftware" in metadata:
+            del metadata[f"{REMEDIATION_PREFIX}:originalEncodingSoftware"]
+        if plan is not None:
+            metadata[f"{REMEDIATION_PREFIX}:canonicalPlanSha256"] = plan_sha256(plan)
+            if plan.source_sha256:
+                metadata[f"{REMEDIATION_PREFIX}:sourceSha256"] = plan.source_sha256
+        if "xmp:CreatorTool" in metadata:
+            del metadata["xmp:CreatorTool"]
+        if "dc:creator" in metadata:
+            del metadata["dc:creator"]
+        if source_metadata.xmp_authors:
+            metadata["dc:creator"] = source_metadata.xmp_authors
+        if "dc:description" in metadata:
+            del metadata["dc:description"]
+        if source_metadata.description:
+            metadata["dc:description"] = source_metadata.description
+        if "pdf:Keywords" in metadata:
+            del metadata["pdf:Keywords"]
+        if source_metadata.xmp_keywords:
+            metadata["pdf:Keywords"] = source_metadata.xmp_keywords
+        if "xmp:CreateDate" in metadata:
+            del metadata["xmp:CreateDate"]
+        if source_metadata.xmp_creation_date:
+            metadata["xmp:CreateDate"] = source_metadata.xmp_creation_date
+
+    pdf.docinfo[Name.Producer] = REMEDIATION_PRODUCER
+    pdf.docinfo[REMEDIATION_INFO_KEY] = REMEDIATION_SUMMARY
+    if original_encoding:
+        pdf.docinfo[ORIGINAL_ENCODING_INFO_KEY] = original_encoding
+    elif ORIGINAL_ENCODING_INFO_KEY in pdf.docinfo:
+        del pdf.docinfo[ORIGINAL_ENCODING_INFO_KEY]
+    pdf.docinfo[Name.ModDate] = timestamp.strftime("D:%Y%m%d%H%M%S+00'00'")
+    for key, value in (
+        (Name.Author, source_metadata.author),
+        (Name.Subject, source_metadata.subject),
+        (Name.Keywords, source_metadata.keywords),
+        (Name.CreationDate, source_metadata.creation_date),
+    ):
+        if value:
+            pdf.docinfo[key] = value
+        elif key in pdf.docinfo:
+            del pdf.docinfo[key]
+    if Name.Creator in pdf.docinfo:
+        del pdf.docinfo[Name.Creator]
+
+
+def _remediation_metadata_status(
+    pdf: pikepdf.Pdf,
+    plan: DocumentPlan | None,
+    source_metadata: SourceMetadata | None = None,
+) -> dict[str, object]:
+    source_metadata = source_metadata or SourceMetadata()
+    with pdf.open_metadata(
+        set_pikepdf_as_editor=False, update_docinfo=False
+    ) as metadata:
+        values = {
+            "tool": str(metadata.get(f"{REMEDIATION_PREFIX}:tool", "")),
+            "version": str(metadata.get(f"{REMEDIATION_PREFIX}:version", "")),
+            "remediation_date": str(
+                metadata.get(f"{REMEDIATION_PREFIX}:remediationDate", "")
+            ),
+            "schema_version": str(
+                metadata.get(f"{REMEDIATION_PREFIX}:schemaVersion", "")
+            ),
+            "source_sha256": str(
+                metadata.get(f"{REMEDIATION_PREFIX}:sourceSha256", "")
+            ),
+            "canonical_plan_sha256": str(
+                metadata.get(f"{REMEDIATION_PREFIX}:canonicalPlanSha256", "")
+            ),
+            "xmp_creator_tool": str(metadata.get("xmp:CreatorTool", "")),
+            "remediation": str(
+                metadata.get(f"{REMEDIATION_PREFIX}:remediation", "")
+            ),
+            "original_encoding_software": str(
+                metadata.get(
+                    f"{REMEDIATION_PREFIX}:originalEncodingSoftware", ""
+                )
+            ),
+            "xmp_authors": metadata.get("dc:creator", []) or [],
+            "description": str(metadata.get("dc:description", "")),
+            "xmp_keywords": str(metadata.get("pdf:Keywords", "")),
+            "xmp_creation_date": str(metadata.get("xmp:CreateDate", "")),
+        }
+    producer = str(pdf.docinfo.get(Name.Producer, ""))
+    creator = str(pdf.docinfo.get(Name.Creator, ""))
+    info_remediation = str(pdf.docinfo.get(REMEDIATION_INFO_KEY, ""))
+    info_original_encoding = str(
+        pdf.docinfo.get(ORIGINAL_ENCODING_INFO_KEY, "")
+    )
+    author = str(pdf.docinfo.get(Name.Author, ""))
+    subject = str(pdf.docinfo.get(Name.Subject, ""))
+    keywords = str(pdf.docinfo.get(Name.Keywords, ""))
+    creation_date = str(pdf.docinfo.get(Name.CreationDate, ""))
+    expected_source_hash = plan.source_sha256 if plan else ""
+    expected_plan_hash = plan_sha256(plan) if plan else ""
+    expected_original_encoding = "; ".join(source_metadata.encoding_software)
+    raw_xmp_authors = values["xmp_authors"]
+    if not isinstance(raw_xmp_authors, (list, set, tuple)):
+        raw_xmp_authors = [raw_xmp_authors]
+    values["xmp_authors"] = [
+        str(author) for author in raw_xmp_authors if author is not None
+    ]
+    valid = all(
+        [
+            values["tool"] == REMEDIATION_TOOL,
+            values["version"] == __version__,
+            bool(values["remediation_date"]),
+            values["schema_version"] == str(SCHEMA_VERSION),
+            producer == REMEDIATION_PRODUCER,
+            not creator,
+            not values["xmp_creator_tool"],
+            values["remediation"] == REMEDIATION_SUMMARY,
+            values["original_encoding_software"] == expected_original_encoding,
+            info_remediation == REMEDIATION_SUMMARY,
+            info_original_encoding == expected_original_encoding,
+            author == (source_metadata.author or ""),
+            subject == (source_metadata.subject or ""),
+            keywords == (source_metadata.keywords or ""),
+            values["xmp_authors"] == source_metadata.xmp_authors,
+            values["description"] == (source_metadata.description or ""),
+            values["xmp_keywords"] == (source_metadata.xmp_keywords or ""),
+            creation_date == (source_metadata.creation_date or ""),
+            values["xmp_creation_date"]
+            == (source_metadata.xmp_creation_date or ""),
+            not plan or values["source_sha256"] == expected_source_hash,
+            not plan or values["canonical_plan_sha256"] == expected_plan_hash,
+        ]
+    )
+    return {
+        **values,
+        "producer": producer,
+        "creator": creator,
+        "info_remediation": info_remediation,
+        "info_original_encoding_software": info_original_encoding,
+        "author": author,
+        "subject": subject,
+        "keywords": keywords,
+        "creation_date": creation_date,
+        "valid": valid,
+    }
 
 
 def _render_hashes(path: Path, dpi: int = 120) -> list[str]:
@@ -566,6 +758,7 @@ def validate_output(
     output: Path,
     plan: DocumentPlan | None = None,
     reference_source: Path | None = None,
+    source_metadata: SourceMetadata | None = None,
 ) -> dict[str, object]:
     before = _render_hashes(source)
     after = _render_hashes(output)
@@ -585,10 +778,15 @@ def validate_output(
         title = str(pdf.docinfo.get("/Title", ""))
         with pdf.open_outline() as outline:
             bookmark_count = len(outline.root)
-        with pdf.open_metadata() as metadata:
+        with pdf.open_metadata(
+            set_pikepdf_as_editor=False, update_docinfo=False
+        ) as metadata:
             declares_pdfua = metadata.get("pdfuaid:part") == "1"
         page_count = len(pdf.pages)
         page_labels_present = "/PageLabels" in pdf.Root
+        remediation_metadata = _remediation_metadata_status(
+            pdf, plan, source_metadata
+        )
     source_fidelity = (
         _source_visual_fidelity(reference_source, source)
         if reference_source
@@ -614,6 +812,8 @@ def validate_output(
         "bookmark_count": bookmark_count,
         "declares_pdfua": declares_pdfua,
         "page_labels_present": page_labels_present,
+        "remediation_metadata": remediation_metadata,
+        "remediation_metadata_valid": remediation_metadata["valid"],
         "transformation_errors": plan_transformation_errors,
         "transformations_valid": not plan_transformation_errors,
         "block_plan_errors": plan_block_errors,
@@ -626,12 +826,17 @@ def validate_output(
     }
 
 
-def add_pdfua_declaration(draft: Path, candidate: Path) -> None:
+def add_pdfua_declaration(
+    draft: Path,
+    candidate: Path,
+    plan: DocumentPlan | None = None,
+    remediated_at: datetime | None = None,
+    source_metadata: SourceMetadata | None = None,
+) -> None:
     if candidate.exists():
         candidate.unlink()
     with pikepdf.Pdf.open(draft) as pdf:
-        with pdf.open_metadata(set_pikepdf_as_editor=False) as metadata:
-            metadata["pdfuaid:part"] = "1"
+        _apply_remediation_metadata(pdf, plan, remediated_at, source_metadata)
         pdf.save(candidate, min_version="1.4", linearize=True)
 
 
@@ -641,11 +846,20 @@ def release_pdfua(
     output: Path,
     plan: DocumentPlan,
     reference_source: Path | None = None,
+    source_metadata: SourceMetadata | None = None,
 ) -> dict[str, object]:
+    if source_metadata is None and reference_source is not None:
+        source_metadata = read_source_metadata(reference_source)
     candidate = output.with_suffix(".candidate.pdf")
-    add_pdfua_declaration(draft, candidate)
+    add_pdfua_declaration(
+        draft, candidate, plan, source_metadata=source_metadata
+    )
     report = validate_output(
-        source, candidate, plan, reference_source=reference_source
+        source,
+        candidate,
+        plan,
+        reference_source=reference_source,
+        source_metadata=source_metadata,
     )
     vera_ok, vera_report = run_verapdf(candidate)
     report["verapdf_pdfua_ok"] = vera_ok
@@ -665,6 +879,7 @@ def release_pdfua(
             report["block_plan_valid"],
             report["extraction_compatible"],
             report["declares_pdfua"],
+            report["remediation_metadata_valid"],
             vera_ok is True,
             plan_approved,
         ]
