@@ -2,7 +2,8 @@
 
 > **Development disclosure:** This project is vibe-coded using **ChatGPT-5.6 Sol
 > (xhigh)**. Its architecture, implementation, tests, experiments, and documentation
-> are being developed through human-directed collaboration with that model.
+> are being developed through human-directed collaboration with that model. The model
+> also wrote this disclosure.
 
 ## What This Does
 
