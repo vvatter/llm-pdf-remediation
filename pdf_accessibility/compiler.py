@@ -27,6 +27,7 @@ ROLE_NAMES = {
     ElementRole.H2: Name.H2,
     ElementRole.H3: Name.H3,
     ElementRole.P: Name.P,
+    ElementRole.LI: Name.LBody,
     ElementRole.FIGURE: Name.Figure,
 }
 
@@ -944,12 +945,13 @@ def _make_role_element(
     placements: dict[int, list[WordPlacement]],
     width: float,
     height: float,
+    role_name: pikepdf.Name | None = None,
 ) -> pikepdf.Object:
     element = region.element
     role_element = pdf.make_indirect(
         Dictionary(
             Type=Name.StructElem,
-            S=ROLE_NAMES[element.role],
+            S=role_name or ROLE_NAMES[element.role],
             P=parent,
             Pg=page_obj,
             K=region.mcid,
@@ -1120,18 +1122,63 @@ def compile_tagged_pdf(
             page.obj[Name.Tabs] = Name.S
 
             mcid_parents: list[pikepdf.Object] = []
-            for region in regions:
-                role_element = _make_role_element(
-                    pdf,
-                    region,
-                    page.obj,
-                    document,
-                    placements,
-                    width,
-                    height,
-                )
-                document[Name.K].append(role_element)
-                mcid_parents.append(role_element)
+            active_list: pikepdf.Object | None = None
+            for element, element_regions in zip(
+                page_plan.elements, regions_by_element, strict=True
+            ):
+                if element.role == ElementRole.LI:
+                    if active_list is None:
+                        active_list = pdf.make_indirect(
+                            Dictionary(
+                                Type=Name.StructElem,
+                                S=Name.L,
+                                P=document,
+                                K=Array(),
+                                A=Dictionary(
+                                    O=Name.List,
+                                    ListNumbering=Name("/None"),
+                                ),
+                            )
+                        )
+                        document[Name.K].append(active_list)
+                    list_item = pdf.make_indirect(
+                        Dictionary(
+                            Type=Name.StructElem,
+                            S=Name.LI,
+                            P=active_list,
+                            Pg=page.obj,
+                            K=Array(),
+                        )
+                    )
+                    active_list[Name.K].append(list_item)
+                    for region in element_regions:
+                        list_body = _make_role_element(
+                            pdf,
+                            region,
+                            page.obj,
+                            list_item,
+                            placements,
+                            width,
+                            height,
+                            role_name=Name.LBody,
+                        )
+                        list_item[Name.K].append(list_body)
+                        mcid_parents.append(list_body)
+                    continue
+
+                active_list = None
+                for region in element_regions:
+                    role_element = _make_role_element(
+                        pdf,
+                        region,
+                        page.obj,
+                        document,
+                        placements,
+                        width,
+                        height,
+                    )
+                    document[Name.K].append(role_element)
+                    mcid_parents.append(role_element)
 
             parent_tree_entries.extend([page_index, Array(mcid_parents)])
 

@@ -47,6 +47,7 @@ EXPECTED_PDF_ROLES = {
     ElementRole.H2: "/H2",
     ElementRole.H3: "/H3",
     ElementRole.P: "/P",
+    ElementRole.LI: "/LI",
     ElementRole.FIGURE: "/Figure",
 }
 
@@ -582,8 +583,12 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
                     mcrs.append(mcr)
             return chunks, mcrs, blocks
 
-        for element_index, element in enumerate(children):
-            role = str(element.get("/S", ""))
+        def append_record(
+            element: pikepdf.Object,
+            role: str,
+            container_role: str | None = None,
+        ) -> None:
+            element_index = len(records)
             chunks, mcrs, blocks = resolve_children(element, element_index)
             alt = str(element.get("/Alt", ""))
             text = "".join(chunks)
@@ -605,7 +610,7 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
             records.append(
                 {
                     "role": semantic_role,
-                    "container_role": role,
+                    "container_role": container_role or role,
                     "id": str(element.get("/ID", "")),
                     "text": text,
                     "alt_text": alt,
@@ -616,6 +621,48 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
             element_id = str(element.get("/ID", ""))
             if element_id:
                 element_ids.append(element_id)
+
+        for element in children:
+            role = str(element.get("/S", ""))
+            if role != "/L":
+                append_record(element, role)
+                continue
+
+            attributes = element.get("/A", {})
+            if (
+                not isinstance(attributes, pikepdf.Dictionary)
+                or str(attributes.get("/O", "")) != "/List"
+            ):
+                errors.append("list structure element has no /List attributes")
+            list_items = element.get("/K", [])
+            if isinstance(list_items, pikepdf.Dictionary):
+                list_items = [list_items]
+            if not list_items:
+                errors.append("list structure element has no list items")
+            for list_item in list_items:
+                item_index = len(records)
+                if (
+                    not isinstance(list_item, pikepdf.Dictionary)
+                    or str(list_item.get("/S", "")) != "/LI"
+                ):
+                    errors.append(f"list child {item_index} is not an /LI structure element")
+                    continue
+                parent = list_item.get("/P")
+                if parent is None or parent.objgen != element.objgen:
+                    errors.append(f"list item {item_index} has the wrong parent")
+                item_children = list_item.get("/K", [])
+                if isinstance(item_children, pikepdf.Dictionary):
+                    item_children = [item_children]
+                item_roles = [
+                    str(child.get("/S", ""))
+                    for child in item_children
+                    if isinstance(child, pikepdf.Dictionary)
+                ]
+                if "/LBody" not in item_roles:
+                    errors.append(f"list item {item_index} has no /LBody")
+                if any(item_role not in {"/Lbl", "/LBody"} for item_role in item_roles):
+                    errors.append(f"list item {item_index} has an invalid structural child")
+                append_record(list_item, "/LI", container_role="/L")
 
         if element_ids and "/IDTree" not in root:
             errors.append("structure elements have IDs but StructTreeRoot has no IDTree")

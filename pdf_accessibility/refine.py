@@ -125,7 +125,8 @@ def _transformation_rationale(kind: TransformationKind) -> str:
         TransformationKind.SOFT_HYPHEN_REMOVAL: "Removes a discretionary soft hyphen.",
         TransformationKind.FORMULA_SPOKEN_EQUIVALENT: "Supplies a spoken equivalent for mathematical notation.",
         TransformationKind.DECORATIVE_LEADER_OMISSION: "Omits visual leader characters from speech.",
-        TransformationKind.DECORATIVE_MARKER_OMISSION: "Omits a visual direction marker that is not needed in linear speech.",
+        TransformationKind.DECORATIVE_MARKER_OMISSION: "Omits a reviewed visual marker that is not meaningful in linear speech.",
+        TransformationKind.INLINE_LIST_SEPARATOR_OMISSION: "Omits punctuation or a conjunction used only to separate items in a compact visual list.",
         TransformationKind.STRUCTURAL_SEPARATOR_NORMALIZATION: "Supplies spoken punctuation between adjacent labeled entries.",
         TransformationKind.DATE_RANGE_EXPANSION: "Expands an en dash in a month-and-day range to the spoken word 'to'.",
         TransformationKind.WHITESPACE_NORMALIZATION: "Normalizes layout whitespace for continuous reading.",
@@ -152,6 +153,14 @@ def canonicalize_transformations(element: PageElement) -> None:
         return
     visible, accessible = element.visible_text, element.accessible_text
     transformations: list[TextTransformation] = []
+    reviewed_decorative_omission = any(
+        finding.category == FindingCategory.DECORATION
+        and any(
+            term in f"{finding.message} {finding.chosen or ''}".lower()
+            for term in ("omit", "decorative-marker", "ornamental")
+        )
+        for finding in element.findings
+    )
     matcher = SequenceMatcher(None, visible, accessible, autojunk=False)
     for tag, source_start, source_end, target_start, target_end in matcher.get_opcodes():
         if tag == "equal":
@@ -159,6 +168,31 @@ def canonicalize_transformations(element: PageElement) -> None:
         source_text = visible[source_start:source_end]
         replacement_text = accessible[target_start:target_end]
         kind = _transformation_kind(source_text, replacement_text)
+        if (
+            kind == TransformationKind.UNVERIFIED
+            and reviewed_decorative_omission
+            and source_text
+            and not replacement_text
+        ):
+            kind = TransformationKind.DECORATIVE_MARKER_OMISSION
+        if (
+            kind == TransformationKind.UNVERIFIED
+            and element.role == ElementRole.LI
+            and not replacement_text
+            and (
+                source_text.strip() in {",", ";"}
+                or source_text.strip().lower() in {"and", "or", "&"}
+            )
+        ):
+            kind = TransformationKind.INLINE_LIST_SEPARATOR_OMISSION
+        if (
+            kind == TransformationKind.UNVERIFIED
+            and source_text in {"-", "–"}
+            and replacement_text == " to "
+            and re.search(r"\d\s*$", visible[:source_start])
+            and re.match(r"\s*\d", visible[source_end:])
+        ):
+            kind = TransformationKind.DATE_RANGE_EXPANSION
         transformations.append(
             TextTransformation(
                 kind=kind,
@@ -349,6 +383,34 @@ def _order_first_page_epigraph(page: PagePlan) -> None:
     )
 
 
+def _normalize_isolated_list_items(page: PagePlan) -> None:
+    marker = re.compile(r"^(?:[•◦▪‣*]|[-–—]|\(?\d+[.)]|[A-Za-z][.)])\s+")
+    for index, element in enumerate(page.elements):
+        if element.role != ElementRole.LI:
+            continue
+        previous_is_item = index > 0 and page.elements[index - 1].role == ElementRole.LI
+        next_is_item = (
+            index + 1 < len(page.elements)
+            and page.elements[index + 1].role == ElementRole.LI
+        )
+        if previous_is_item or next_is_item or marker.match(element.semantic_text.strip()):
+            continue
+        element.role = ElementRole.P
+        message = (
+            "An isolated unmarked entry was normalized from LI to P to avoid a "
+            "one-item list announcement."
+        )
+        if not any(finding.message == message for finding in element.findings):
+            element.findings.append(
+                ReviewFinding(
+                    severity=ReviewSeverity.INFO,
+                    category=FindingCategory.SEMANTIC_ROLE,
+                    message=message,
+                    chosen="P",
+                )
+            )
+
+
 def _mark_resolved_findings(findings: list[ReviewFinding]) -> None:
     for finding in findings:
         message = finding.message.lower()
@@ -370,6 +432,34 @@ def _mark_resolved_findings(findings: list[ReviewFinding]) -> None:
             and "running header" in message
             and "page number" in message
         )
+        resolved_model_role = (
+            finding.severity == ReviewSeverity.CRITICAL
+            and finding.category == FindingCategory.SEMANTIC_ROLE
+            and any(term in message for term in ("first-model", "first proposal", "proposal"))
+            and (
+                any(term in message for term in ("canonical plan", "canonical review"))
+                or (
+                    "image" in message
+                    and any(term in message for term in ("align", "places", "supports"))
+                )
+                or any(term in message for term in ("segmentation", "not separate printed"))
+            )
+            and bool(finding.chosen)
+        )
+        resolved_evidence_disagreement = (
+            finding.severity == ReviewSeverity.CRITICAL
+            and finding.category
+            in {
+                FindingCategory.NAME,
+                FindingCategory.TRANSCRIPTION,
+                FindingCategory.DATE_NUMBER,
+            }
+            and any(term in message for term in ("first-model", "first model", "proposal"))
+            and "image" in message
+            and any(term in message for term in ("authoritative", "evidence", "read", "supports"))
+            and not any(term in message for term in ("uncertain", "ambiguous", "obscured"))
+            and bool(finding.chosen)
+        )
         if resolved_geometry:
             finding.severity = ReviewSeverity.INFO
             finding.chosen = "Resolved: canonical geometry is normalized and evidence-derived."
@@ -377,6 +467,14 @@ def _mark_resolved_findings(findings: list[ReviewFinding]) -> None:
             finding.severity = ReviewSeverity.INFO
             finding.category = FindingCategory.ARTIFACT
             finding.chosen = "Resolved: running furniture remains visible and is explicitly artifacted."
+        elif resolved_model_role:
+            finding.severity = ReviewSeverity.INFO
+            finding.category = FindingCategory.MODEL_DISAGREEMENT
+            finding.chosen = f"Resolved in canonical plan: {finding.chosen}"
+        elif resolved_evidence_disagreement:
+            finding.severity = ReviewSeverity.INFO
+            finding.category = FindingCategory.MODEL_DISAGREEMENT
+            finding.chosen = f"Resolved from authoritative page evidence: {finding.chosen}"
 
 
 def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
@@ -391,6 +489,7 @@ def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
     repeated_furniture = {text for text, count in fingerprints.items() if count >= 2}
 
     for page in plan.pages:
+        _normalize_isolated_list_items(page)
         kept: list[PageElement] = []
         existing_artifact_keys = {
             (artifact.reason.value, tuple(artifact.bbox), artifact.text) for artifact in page.artifacts
@@ -447,5 +546,5 @@ def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
         page.findings = _dedupe_findings(page.findings)
         for index, artifact in enumerate(page.artifacts, start=1):
             artifact.id = f"p{page.page_number:04d}-a{index:04d}"
-    plan.plan_revision = max(plan.plan_revision, 4)
+    plan.plan_revision = max(plan.plan_revision, 5)
     return plan

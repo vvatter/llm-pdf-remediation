@@ -20,6 +20,7 @@ from .evidence import (
 )
 from .extract import PagePacket
 from .models import (
+    SCHEMA_VERSION,
     DocumentPlan,
     ArtifactReason,
     ArtifactRecord,
@@ -40,8 +41,8 @@ from .models import (
 from .plans import load_document_plan, sha256_file, write_document_plan
 
 
-PLANNER_PROMPT_VERSION = "proposal-v5"
-REVIEW_PROMPT_VERSION = "review-v5"
+PLANNER_PROMPT_VERSION = "proposal-v6"
+REVIEW_PROMPT_VERSION = "review-v6"
 
 PROPOSAL_SYSTEM_PROMPT = """You propose an accessibility transcription and semantic plan for a
 historical fixed-layout PDF page. The printed page is the historical source of record. Preserve
@@ -51,15 +52,22 @@ Never silently regularize or correct it.
 For every meaningful item, record visible_text exactly as printed and accessible_text as spoken.
 They should be identical except for a declared mechanical transformation: line-break
 dehyphenation, ligature expansion, soft-hyphen removal, formula spoken equivalent, decorative
-leader/marker omission, structural separator normalization, date-range spoken expansion, or
-whitespace normalization. Record every such transformation. Native and OCR
+leader/marker omission, inline-list separator omission, structural separator normalization,
+date-range spoken expansion, or whitespace normalization. Record every such transformation. Native and OCR
 text are evidence only and can be corrupt. Always choose a result, preserve visual page order,
 and record uncertainty in findings rather than stopping.
 
 Use DocumentTitle once on the first page; H1 for article titles; H2/H3 for genuine nested
 headings; P for body copy, bylines, quotations, contents entries, captions, and other meaningful
-text; Figure for meaningful graphics with concise alt text. Omit repeated headers, footers,
-page numbers that add no meaning, and decoration. Join line-broken body copy into paragraphs.
+text; LI for each item in a genuine list; and Figure for meaningful graphics with concise alt
+text. A recipient, participant, officer, or similar explicit roster should use one consecutive LI
+element per logical item, whether its items are line-separated or compactly comma-separated. Give
+each item only its own printed text and visual fragment. Do not split ordinary prose merely because
+it contains a comma-separated series, and do not create a one-item list solely because a lone name
+or value appears on its own line. The compiler groups consecutive LI elements into one list, so
+interrupt them with the appropriate heading or paragraph at a real list boundary. Omit
+repeated headers, footers, page numbers that add no meaning, and decoration. Join line-broken body
+copy into paragraphs.
 Every bbox must use normalized_0_1000 coordinates: left and right are percentages of page width
 times 1000; top and bottom are percentages of page height times 1000. Never return PDF points or
 image pixels. Give separate transcription, semantic-role, geometry, and reading-order confidence
@@ -72,7 +80,15 @@ fragments. Return flows whose block_ids contain every meaningful fragment exactl
 reading order. Finish an article flow before an independent sidebar or contents flow even when
 strict global top-to-bottom coordinates would interleave them. On a first-page masthead, order the
 publication title, descriptive publication line, volume/issue/date metadata, and then any epigraph
-or attributed quotation before the first article heading."""
+or attributed quotation before the first article heading.
+
+On page 1 only, supply document_title_candidate as PDF metadata, without changing the printed
+DocumentTitle element. Choose a concise title with an eye toward how informative and distinctive
+it would be in a browser tab or search result. Use only context supported by the page. A date,
+organization, document type, issue, or subject may help, but do not mechanically include every
+available field, keyword-stuff, or make the title long. Recent titles in the user prompt are style
+and consistency context only; follow relevant examples and ignore unrelated ones. On other pages,
+leave document_title_candidate null."""
 
 REVIEW_SYSTEM_PROMPT = """You are the independent final semantic reviewer for a historical PDF
 accessibility plan. The page image and printed content are authoritative. Evidence text may be
@@ -84,9 +100,13 @@ including critical findings, are advisories: always choose a canonical result an
 Use separate confidence dimensions and log alternatives for names, dates, numbers, URLs,
 formulas, uncertain transcription, roles, geometry, and reading order. Return atomic rectangular
 visible fragments with unique block IDs plus flows that own every block exactly once. Preserve a
-single logical paragraph across multiple ordered fragments when it continues between columns. On
-a first-page masthead, keep any epigraph or attributed quotation after publication and issue
-metadata and before the first article heading."""
+single logical paragraph across multiple ordered fragments when it continues between columns.
+Require one LI per item for genuine explicit lists, including compact rosters, but do not
+manufacture a list from comma-separated prose or an isolated unmarked entry. On a first-page
+masthead, keep any epigraph or attributed quotation after
+publication and issue metadata and before the first article heading. Independently review the
+page-1 document_title_candidate for concise search-result usefulness and consistency with relevant
+recent titles; it is metadata, not a transcription, and must not be copied into visible text."""
 
 
 class ModelPageElement(BaseModel):
@@ -103,6 +123,7 @@ class ModelPageElement(BaseModel):
 
 class ModelPagePlan(BaseModel):
     page_number: int = Field(ge=1)
+    document_title_candidate: str | None = Field(default=None, max_length=240)
     coordinate_space: Literal["normalized_0_1000"] = "normalized_0_1000"
     elements: list[ModelPageElement]
     flows: list[PageFlow] = Field(default_factory=list)
@@ -147,7 +168,23 @@ def _validated_page_plan(page_data: dict, page_number: int) -> PagePlan:
     return page
 
 
-def _page_prompt(packet: PagePacket, evidence: PageEvidence) -> str:
+def _recent_title_context(page_number: int, recent_titles: list[str] | None) -> str:
+    if page_number != 1:
+        return ""
+    examples = recent_titles or []
+    rendered = "\n".join(f"- {title}" for title in examples) or "(none yet)"
+    return (
+        "\nRECENT USER TITLES (oldest to newest; use only relevant examples):\n"
+        f"{rendered}\n"
+    )
+
+
+def _page_prompt(
+    packet: PagePacket,
+    evidence: PageEvidence,
+    recent_titles: list[str] | None = None,
+) -> str:
+    title_context = _recent_title_context(packet.page_number, recent_titles)
     return f"""Analyze page {packet.page_number}, size {packet.width:.1f} by {packet.height:.1f} points.
 
 NATIVE EVIDENCE (advisory):
@@ -155,6 +192,7 @@ NATIVE EVIDENCE (advisory):
 
 OCR EVIDENCE (advisory):
 {evidence.ocr_text or '(none)'}
+{title_context}
 """
 
 
@@ -164,6 +202,7 @@ def propose_page(
     reasoning_effort: str,
     packet: PagePacket,
     evidence: PageEvidence,
+    recent_titles: list[str] | None = None,
 ) -> tuple[PagePlan, str | None]:
     response = client.responses.parse(
         model=model,
@@ -174,7 +213,10 @@ def propose_page(
                 "role": "user",
                 "content": [
                     {"type": "input_image", "image_url": packet.image_data_url, "detail": "high"},
-                    {"type": "input_text", "text": _page_prompt(packet, evidence)},
+                    {
+                        "type": "input_text",
+                        "text": _page_prompt(packet, evidence, recent_titles),
+                    },
                 ],
             },
         ],
@@ -198,6 +240,7 @@ def review_page(
     evidence: PageEvidence,
     diagnostics: PlanningDiagnostics,
     proposal: PagePlan,
+    recent_titles: list[str] | None = None,
 ) -> tuple[ReviewDecision, str | None]:
     response = client.responses.parse(
         model=model,
@@ -218,6 +261,7 @@ def review_page(
                             f"OCR word count: {len(evidence.ocr_words)}\n"
                             f"NATIVE TEXT:\n{evidence.native_text or '(none)'}\n\n"
                             f"OCR TEXT:\n{evidence.ocr_text or '(none)'}"
+                            f"{_recent_title_context(packet.page_number, recent_titles)}"
                         ),
                     },
                     {
@@ -255,7 +299,7 @@ def review_page(
     ), response.id
 
 
-def infer_title(source: Path, pages: list[PagePlan]) -> str:
+def _visible_document_title(source: Path, pages: list[PagePlan]) -> str:
     for page in pages:
         for element in page.elements:
             if element.role == ElementRole.DOCUMENT_TITLE:
@@ -263,8 +307,17 @@ def infer_title(source: Path, pages: list[PagePlan]) -> str:
     return source.stem.replace("_", " ").strip().title()
 
 
+def infer_title(source: Path, pages: list[PagePlan]) -> str:
+    first_page = next((page for page in pages if page.page_number == 1), None)
+    if first_page and first_page.document_title_candidate:
+        candidate = " ".join(first_page.document_title_candidate.split())
+        if candidate:
+            return candidate
+    return _visible_document_title(source, pages)
+
+
 def normalize_document_pages(source: Path, pages: list[PagePlan]) -> list[PagePlan]:
-    canonical_title = infer_title(source, pages)
+    canonical_title = _visible_document_title(source, pages)
     kept_document_title = False
     normalized_title = " ".join(canonical_title.lower().split())
 
@@ -371,6 +424,7 @@ def build_document_plan(
     workers: int = 2,
     force_replan: bool = False,
     force_review: bool = False,
+    recent_titles: list[str] | None = None,
 ) -> DocumentPlan:
     source_hash = sha256_file(source)
     with pymupdf.open(source) as source_document:
@@ -411,7 +465,7 @@ def build_document_plan(
         _write_once(
             evidence_path,
             {
-                "schema_version": 4,
+                "schema_version": SCHEMA_VERSION,
                 "source_sha256": source_hash,
                 "evidence": evidence.model_dump(mode="json"),
             },
@@ -419,6 +473,13 @@ def build_document_plan(
         proposal_path = page_dir / f"{number:04d}.proposal.json"
         if force_replan:
             _archive(proposal_path)
+        elif proposal_path.exists():
+            saved_proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+            if (
+                saved_proposal.get("schema_version") != SCHEMA_VERSION
+                or saved_proposal.get("prompt_version") != PLANNER_PROMPT_VERSION
+            ):
+                _archive(proposal_path)
         if proposal_path.exists():
             proposals[number] = _read_page_artifact(
                 proposal_path, "proposal", source_hash
@@ -428,7 +489,7 @@ def build_document_plan(
             _write_once(
                 proposal_path,
                 {
-                    "schema_version": 4,
+                    "schema_version": SCHEMA_VERSION,
                     "source_sha256": source_hash,
                     "model": "legacy-plan-migration",
                     "response_id": None,
@@ -447,6 +508,7 @@ def build_document_plan(
                 planner_reasoning,
                 packet_by_page[number],
                 evidence_by_page[number],
+                recent_titles,
             ): number
             for number in pending
         }
@@ -457,7 +519,7 @@ def build_document_plan(
             _write_once(
                 page_dir / f"{number:04d}.proposal.json",
                 {
-                    "schema_version": 4,
+                    "schema_version": SCHEMA_VERSION,
                     "source_sha256": source_hash,
                     "model": planner_model,
                     "reasoning_effort": planner_reasoning,
@@ -473,6 +535,13 @@ def build_document_plan(
         review_path = page_dir / f"{number:04d}.review.json"
         if force_review or force_replan:
             _archive(review_path)
+        elif review_path.exists():
+            saved_review = json.loads(review_path.read_text(encoding="utf-8"))
+            if (
+                saved_review.get("schema_version") != SCHEMA_VERSION
+                or saved_review.get("prompt_version") != REVIEW_PROMPT_VERSION
+            ):
+                _archive(review_path)
         if review_path.exists():
             data = json.loads(review_path.read_text(encoding="utf-8"))
             if data.get("source_sha256") not in {None, source_hash}:
@@ -495,6 +564,7 @@ def build_document_plan(
                     evidence_by_page[number],
                     diagnostics,
                     proposal,
+                    recent_titles,
                 )
             ] = (number, diagnostics)
         for future in as_completed(futures):
@@ -526,7 +596,7 @@ def build_document_plan(
             _write_once(
                 page_dir / f"{number:04d}.review.json",
                 {
-                    "schema_version": 4,
+                    "schema_version": SCHEMA_VERSION,
                     "source_sha256": source_hash,
                     "model": reviewer_model,
                     "reasoning_effort": reviewer_reasoning,
@@ -548,7 +618,7 @@ def build_document_plan(
         language="en-US",
         pages=pages,
         review_status=ReviewStatus.MODEL_REVIEWED,
-        plan_revision=2,
+        plan_revision=5,
     )
     write_document_plan(plan, checkpoint_path)
     return plan

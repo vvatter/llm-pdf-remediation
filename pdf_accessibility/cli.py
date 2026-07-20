@@ -16,6 +16,7 @@ from .plans import load_document_plan, write_document_plan
 from .preflight import inspect_pdf, write_preflight
 from .refine import refine_document_plan
 from .reporting import build_manifest, wcag_evidence, write_anomaly_reports
+from .title_history import load_recent_titles, remember_title
 from .validate import release_pdfua, validate_output, write_validation_report
 
 
@@ -104,6 +105,8 @@ def run_command(args: argparse.Namespace) -> int:
     source = args.input.resolve()
     paths = _paths(source, args.output_dir)
     paths["workdir"].mkdir(parents=True, exist_ok=True)
+    recent_titles_path = args.recent_titles_file.resolve()
+    recent_titles = load_recent_titles(recent_titles_path)
     requested_mode = RemediationMode.FACSIMILE if args.ocr else RemediationMode(args.mode)
     preflight = inspect_pdf(source, requested_mode)
     _apply_native_policy(preflight, args.native_experimental)
@@ -146,6 +149,7 @@ def run_command(args: argparse.Namespace) -> int:
         workers=args.workers,
         force_replan=args.force_replan,
         force_review=args.force_review,
+        recent_titles=recent_titles,
     )
     refine_document_plan(source, plan)
     geometry_sources = compile_tagged_pdf(
@@ -212,6 +216,8 @@ def run_command(args: argparse.Namespace) -> int:
     print(f"anomalies: {len(anomalies)} ({paths['anomaly_html']})")
     print(f"validation: {paths['validation']}")
     if validation["released"]:
+        remember_title(recent_titles_path, plan.title)
+        print(f"title: {plan.title}")
         print(f"output: {paths['output']}")
         return 0
     print("release withheld: machine gates did not all pass; inspect the draft and validation report")
@@ -296,6 +302,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--ambiguity-threshold", type=float, default=0.8)
     run_parser.add_argument("--force-replan", action="store_true")
     run_parser.add_argument("--force-review", action="store_true")
+    run_parser.add_argument(
+        "--recent-titles-file",
+        type=Path,
+        default=Path(".recent-titles.json"),
+        help="local rolling title context (created automatically)",
+    )
     run_parser.set_defaults(handler=run_command)
 
     validate_parser = subparsers.add_parser("validate", help="compare a tagged PDF with a canonical plan")

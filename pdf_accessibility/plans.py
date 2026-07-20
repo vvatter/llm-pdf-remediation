@@ -33,7 +33,7 @@ def load_document_plan(path: Path, source: Path | None = None) -> DocumentPlan:
     raw["schema_version"] = SCHEMA_VERSION
     raw.setdefault("source_sha256", sha256_file(source) if source and source.exists() else "")
     raw.setdefault("source_page_count", len(raw.get("pages", [])))
-    raw["plan_revision"] = max(int(raw.get("plan_revision", 1)), 4)
+    raw["plan_revision"] = max(int(raw.get("plan_revision", 1)), 5)
     for page in raw.get("pages", []):
         page.setdefault(
             "coordinate_space",

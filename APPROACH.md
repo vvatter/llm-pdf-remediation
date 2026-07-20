@@ -15,7 +15,7 @@ The data model distinguishes:
 2. **Accessible text:** the spoken form, normally identical to the visible text.
 3. **Declared transformations:** narrow mechanical changes such as line-break
    dehyphenation, ligature expansion, soft-hyphen removal, formula speech, decorative
-   leader/marker omission, structural separator normalization, or whitespace
+   leader/marker omission, inline-list separator omission, structural separator normalization, or whitespace
    normalization.
 4. **Canonical reviewed plan:** the exact input accepted by the deterministic compiler.
 
@@ -48,7 +48,7 @@ source PDF
                             always chooses a canonical page
                                     |
                                     v
-                           canonical schema-v4 plan
+                           canonical schema-v5 plan
                                     |
                  selected visible base + geometry
                                     |
@@ -123,7 +123,7 @@ source/page hashes are retained in the build record.
 
 ## Canonical Schema
 
-Schema version 4 gives every element a stable `pNNNN-eNNNN` identifier, gives every
+Schema version 5 gives every element a stable `pNNNN-eNNNN` identifier, gives every
 rectangular visual block a stable identifier, and records:
 
 - visible fragments, their normalized boxes, and their evidence references;
@@ -136,6 +136,17 @@ rectangular visual block a stable identifier, and records:
 - findings, alternatives, and chosen readings;
 - review status;
 - deterministic word offsets.
+
+Page 1 may also carry a reviewed `document_title_candidate`. It is PDF metadata rather
+than printed transcription. The reviewer chooses it for concise usefulness in browser
+tabs and search results, using only page-supported context and relevant examples from
+the user's ignored rolling recent-title file. No particular metadata field is required.
+
+The `LI` role represents one item in an explicit list or roster. Consecutive `LI`
+elements form a list; headings and paragraphs create explicit list boundaries. A compact
+comma-separated roster may still be a list, but ordinary prose with a series remains a
+paragraph. Deterministic refinement changes isolated unmarked `LI` entries to `P` so a
+screen reader is not asked to announce a one-item list.
 
 Logical elements and visual blocks are deliberately separate. A paragraph that begins
 at the bottom of one column and continues at the top of another remains one `P`, but it
@@ -161,7 +172,7 @@ that way; other empty-alt figures remain release-blocking errors.
 
 On the first page, an attributed epigraph is placed after publication and
 volume/issue/date metadata and before the first article heading. Proposal/review prompt
-version 5 states this policy, and the deterministic refinement applies the same narrow
+version 6 states this policy and the title/list policies, and the deterministic refinement applies the same narrow
 rule to existing reviewed plans while recording an informational reading-order finding.
 
 Word offsets are computed from the exact accessible string. For each non-whitespace
@@ -170,8 +181,8 @@ the next token. Concatenating `text[start:actual_end]` exactly reconstructs punc
 newlines, nonbreaking spaces, and other joiners. This replaces the earlier practice of
 appending a generic space to every word.
 
-Schema-v1 plans migrate automatically and are marked `legacy_unreviewed`. Reviewed
-schema-v2 and schema-v3 plans retain their approval while their geometry and default
+Schema-v1 and schema-v4 plans migrate automatically and are marked `legacy_unreviewed`.
+Reviewed schema-v2 and schema-v3 plans retain their approval while their geometry and default
 page flows are migrated.
 Original JSON is backed up. The next ordinary run can use each schema-v1 page as a
 proposal and put it through the independent review stage.
@@ -199,6 +210,7 @@ It:
 - uses region-wide `/ActualText` only when the embedded font cannot represent an
   exceptional character;
 - creates headings, figures, and single-block paragraphs directly under `/Document`;
+- groups consecutive list items as `/L` containers with `/LI` and `/LBody` descendants;
 - emits each spatially disjoint region of a multi-block paragraph as a consecutive
   direct `/P` because Acrobat otherwise reverses or loses fragment click targets;
 - stores each region's single same-page MCID as the integer child of its structure
@@ -324,8 +336,8 @@ layouts. Exact results and the changes prompted by failures are recorded in
 
 ## Current Boundaries
 
-The present roles are `DocumentTitle`, `H1`, `H2`, `H3`, `P`, and `Figure`. The next
-semantic layer should add a document-level article graph plus captions, lists, table of
+The present roles are `DocumentTitle`, `H1`, `H2`, `H3`, `P`, `LI`, and `Figure`. The next
+semantic layer should add a document-level article graph plus captions, table of
 contents entries, formulas, quotations, and references. Explicit artifacts and page
 labels are now implemented.
 

@@ -9,7 +9,7 @@
 
 The goal is to make old PDFs much more accessible without changing how their pages
 look. The tool uses AI models to read each page, correct mistakes left by automatic text
-recognition, identify headings, paragraphs, and meaningful images, and decide the order
+recognition, identify headings, paragraphs, lists, and meaningful images, and decide the order
 in which everything should be read. It then adds the improved text and organization
 behind the original page.
 
@@ -43,6 +43,11 @@ reading order. A second AI model checks that work while looking at the original 
 The approved result is saved, and ordinary Python code builds the PDF from it. The
 models never write PDF instructions directly.
 
+The page-1 review also chooses a concise PDF title with search results and browser tabs
+in mind. A local ignored `.recent-titles.json` file is created automatically and supplies
+a few of that user's recent titles as optional consistency examples; a title is added
+only after its PDF is successfully released.
+
 The production workflow is unattended. Uncertain readings are recorded without
 pausing the run, and the second model must still choose a result. Human editing is not a
 pipeline stage, although real-reader testing remains an important final check.
@@ -61,14 +66,9 @@ construction strategy, validation gates, and known limitations.
 - An open TrueType font such as Noto Sans or DejaVu Sans
 
 ```sh
-python3 -m venv .venv
-.venv/bin/pip install -e .
+python -m pip install -e .
 source ~/.zshrc  # or otherwise export OPENAI_API_KEY
 ```
-
-`.venv` is a conventional name for a project-local Python environment. It is created
-from the Python installation on the current machine, is not committed to Git, and can
-be deleted and recreated at any time.
 
 The default model pair is deliberately fixed:
 
@@ -86,37 +86,37 @@ and saves its evidence. Automatic native candidates use facsimile mode by defaul
 native content can be tagged without duplicating ordinary text extraction:
 
 ```sh
-.venv/bin/remediate-pdf preflight src/document.pdf
+remediate-pdf preflight src/document.pdf
 ```
 
 Run the complete pipeline:
 
 ```sh
-.venv/bin/remediate-pdf run src/document.pdf
+remediate-pdf run src/document.pdf
 ```
 
 Force facsimile mode when the preflight result has been reviewed. Native mode is an
 explicit experimental path:
 
 ```sh
-.venv/bin/remediate-pdf run src/document.pdf --mode facsimile
-.venv/bin/remediate-pdf run src/document.pdf --mode native --native-experimental
+remediate-pdf run src/document.pdf --mode facsimile
+remediate-pdf run src/document.pdf --mode native --native-experimental
 ```
 
 Re-run model stages explicitly:
 
 ```sh
-.venv/bin/remediate-pdf run src/document.pdf --force-review
-.venv/bin/remediate-pdf run src/document.pdf --force-replan
+remediate-pdf run src/document.pdf --force-review
+remediate-pdf run src/document.pdf --force-replan
 ```
 
 Validate an existing candidate against its canonical plan or regenerate the read-only
 anomaly report:
 
 ```sh
-.venv/bin/remediate-pdf validate build/document/document.draft.pdf \
+remediate-pdf validate build/document/document.draft.pdf \
   --plan build/document/document.plan.json --source src/document.pdf
-.venv/bin/remediate-pdf report build/document
+remediate-pdf report build/document
 ```
 
 The old direct invocation remains available with a deprecation warning. `--ocr` is a
@@ -130,7 +130,7 @@ Each input receives a work directory under `build/` containing:
 - `pages/*.evidence.json`: native and OCR evidence
 - `pages/*.proposal.json`: immutable Terra proposal checkpoint
 - `pages/*.review.json`: immutable Sol decision checkpoint
-- `*.plan.json`: schema-v4 canonical plan used by the compiler
+- `*.plan.json`: schema-v5 canonical plan used by the compiler
 - `*.draft.pdf`: tagged draft without a PDF/UA declaration
 - `*.accessible.pdf`: published only after every machine gate passes
 - `*.validation.json`: render, qpdf, structure-tree, and veraPDF results
@@ -138,7 +138,7 @@ Each input receives a work directory under `build/` containing:
 - `*.wcag.json`: per-criterion WCAG 2.1 AA evidence matrix
 - `*.manifest.json`: hashes, models, prompts, tools, font, and compiler strategy
 
-Old schema-v1 through schema-v3 plans migrate automatically. The original is preserved as
+Old schema-v1 through schema-v4 plans migrate automatically. The original is preserved as
 `*.plan.legacy.json`. Existing reviewed or manually modified canonical plans are not
 overwritten unless a force option is supplied.
 

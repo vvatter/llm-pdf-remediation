@@ -42,11 +42,17 @@ from pdf_accessibility.planner import (
     ModelPageElement,
     ModelPagePlan,
     ModelReviewDecision,
+    infer_title,
     normalize_document_pages,
     propose_page,
     review_page,
 )
-from pdf_accessibility.refine import refine_document_plan, transformation_errors
+from pdf_accessibility.title_history import load_recent_titles, remember_title
+from pdf_accessibility.refine import (
+    canonicalize_transformations,
+    refine_document_plan,
+    transformation_errors,
+)
 from pdf_accessibility.validate import (
     REMEDIATION_PRODUCER,
     REMEDIATION_SUMMARY,
@@ -75,6 +81,19 @@ def element(
 
 
 class NormalizePlanTests(unittest.TestCase):
+    def test_search_title_candidate_is_separate_from_printed_title(self) -> None:
+        page = PagePlan(
+            page_number=1,
+            document_title_candidate="Spring Celebration, UF Mathematics, 2024",
+            elements=[element(ElementRole.DOCUMENT_TITLE, "Spring Celebration")],
+        )
+
+        self.assertEqual(
+            infer_title(Path("spring-celebration-2024.pdf"), [page]),
+            "Spring Celebration, UF Mathematics, 2024",
+        )
+        self.assertEqual(page.elements[0].accessible_text, "Spring Celebration")
+
     def test_invalid_model_flow_is_rebuilt_from_semantic_order(self) -> None:
         page = PagePlan(
             page_number=9,
@@ -149,6 +168,57 @@ class NormalizePlanTests(unittest.TestCase):
 
 
 class CompileTests(unittest.TestCase):
+    def test_consecutive_list_items_compile_as_a_real_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "Recipients")
+            page.insert_text((72, 100), "Ada Lovelace")
+            page.insert_text((72, 120), "Emmy Noether")
+            page.insert_text((72, 150), "Presented by the department")
+            document.save(source)
+            document.close()
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Recipients",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[
+                            element(ElementRole.H1, "Recipients", top=80),
+                            element(ElementRole.LI, "Ada Lovelace", top=140),
+                            element(ElementRole.LI, "Emmy Noether", top=200),
+                            element(ElementRole.P, "Presented by the department", top=260),
+                        ],
+                    )
+                ],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+
+            with pikepdf.Pdf.open(output) as pdf:
+                children = list(pdf.Root.StructTreeRoot.K.K)
+                self.assertEqual(
+                    [str(child.S) for child in children], ["/H1", "/L", "/P"]
+                )
+                self.assertEqual(str(children[1].A.O), "/List")
+                self.assertEqual(str(children[1].A.ListNumbering), "/None")
+                list_items = list(children[1].K)
+                self.assertEqual([str(item.S) for item in list_items], ["/LI", "/LI"])
+                self.assertTrue(
+                    all(str(item.K[0].S) == "/LBody" for item in list_items)
+                )
+
+            serialized = serialize_structure_tree(output)
+            self.assertEqual(
+                [record["role"] for record in serialized["elements"]],
+                ["/H1", "/LI", "/LI", "/P"],
+            )
+            self.assertEqual(serialized["errors"], [])
+            self.assertEqual(compare_structure_to_plan(serialized, plan), [])
+
     def test_preflight_snapshots_source_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             raw = Path(temp) / "raw.pdf"
@@ -741,7 +811,7 @@ class CompileTests(unittest.TestCase):
                     self.assertEqual(
                         metadata["llmpr:remediationDate"], "2026-07-19T12:30:00Z"
                     )
-                    self.assertEqual(metadata["llmpr:schemaVersion"], "4")
+                    self.assertEqual(metadata["llmpr:schemaVersion"], "5")
                     self.assertEqual(metadata["llmpr:sourceSha256"], "a" * 64)
                     self.assertIn("llmpr:canonicalPlanSha256", metadata)
                     self.assertEqual(metadata["llmpr:remediation"], REMEDIATION_SUMMARY)
@@ -796,7 +866,7 @@ class PlanMigrationTests(unittest.TestCase):
 
             plan = load_document_plan(path)
 
-            self.assertEqual(plan.schema_version, 4)
+            self.assertEqual(plan.schema_version, 5)
             self.assertEqual(plan.pages[0].elements[0].visible_text, "Authored sucess.")
             self.assertEqual(plan.pages[0].elements[0].accessible_text, "Authored sucess.")
             self.assertTrue(path.with_suffix(".legacy.json").exists())
@@ -835,7 +905,7 @@ class PlanMigrationTests(unittest.TestCase):
 
             plan = load_document_plan(path)
 
-            self.assertEqual(plan.schema_version, 4)
+            self.assertEqual(plan.schema_version, 5)
             self.assertEqual(plan.pages[0].coordinate_space, CoordinateSpace.PDF_POINTS)
             self.assertTrue(plan_is_approved(plan))
 
@@ -859,7 +929,239 @@ class PlanMigrationTests(unittest.TestCase):
             )
 
 
+class RecentTitleTests(unittest.TestCase):
+    def test_local_history_is_created_and_keeps_recent_unique_titles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / ".recent-titles.json"
+
+            self.assertEqual(load_recent_titles(path), [])
+            self.assertTrue(path.exists())
+            remember_title(path, "First Document", limit=2)
+            remember_title(path, "Second Document", limit=2)
+            remember_title(path, "First Document", limit=2)
+
+            self.assertEqual(
+                load_recent_titles(path, limit=2),
+                ["Second Document", "First Document"],
+            )
+
+
 class DeterministicRefinementTests(unittest.TestCase):
+    def test_numeric_hyphen_to_spoken_range_is_approved(self) -> None:
+        heading = element(
+            ElementRole.H3,
+            "Honors Teacher of the Year 2011-2012",
+        )
+        heading.accessible_text = "Honors Teacher of the Year 2011 to 2012"
+
+        canonicalize_transformations(heading)
+
+        self.assertEqual(
+            heading.transformations[0].kind,
+            TransformationKind.DATE_RANGE_EXPANSION,
+        )
+        self.assertFalse(
+            any(
+                finding.severity == ReviewSeverity.CRITICAL
+                for finding in heading.findings
+            )
+        )
+
+    def test_compact_roster_separators_are_declared_omissions(self) -> None:
+        item = element(ElementRole.LI, "and Brianna Henry")
+        item.accessible_text = "Brianna Henry"
+
+        canonicalize_transformations(item)
+
+        self.assertEqual(
+            item.transformations[0].kind,
+            TransformationKind.INLINE_LIST_SEPARATOR_OMISSION,
+        )
+        self.assertFalse(
+            any(
+                finding.severity == ReviewSeverity.CRITICAL
+                for finding in item.findings
+            )
+        )
+
+        trailing = element(ElementRole.LI, "Robert Monahan and")
+        trailing.accessible_text = "Robert Monahan"
+        canonicalize_transformations(trailing)
+        self.assertEqual(
+            trailing.transformations[0].kind,
+            TransformationKind.INLINE_LIST_SEPARATOR_OMISSION,
+        )
+
+    def test_reviewer_confirmed_ornament_is_a_declared_omission(self) -> None:
+        quotation = element(ElementRole.P, "Quotation ##")
+        quotation.accessible_text = "Quotation"
+        quotation.findings.append(
+            ReviewFinding(
+                severity=ReviewSeverity.WARNING,
+                category=FindingCategory.DECORATION,
+                message="The ornamental terminal marks are omitted from accessible text.",
+                chosen="Omit using a decorative-marker transformation",
+            )
+        )
+
+        canonicalize_transformations(quotation)
+
+        self.assertEqual(
+            quotation.transformations[0].kind,
+            TransformationKind.DECORATIVE_MARKER_OMISSION,
+        )
+        self.assertFalse(
+            any(
+                finding.severity == ReviewSeverity.CRITICAL
+                for finding in quotation.findings
+            )
+        )
+
+    def test_resolved_proposal_role_disagreement_is_informational(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page()
+            document.save(source)
+            document.close()
+            finding = ReviewFinding(
+                severity=ReviewSeverity.CRITICAL,
+                category=FindingCategory.SEMANTIC_ROLE,
+                message=(
+                    "The first-model proposal grouped roster entries incorrectly; "
+                    "the canonical plan supplies one LI per item."
+                ),
+                chosen="One LI per roster item",
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Roster",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[element(ElementRole.P, "Roster")],
+                        findings=[finding],
+                    )
+                ],
+            )
+
+            refine_document_plan(source, plan)
+
+            resolved = plan.pages[0].findings[0]
+            self.assertEqual(resolved.severity, ReviewSeverity.INFO)
+            self.assertEqual(resolved.category, FindingCategory.MODEL_DISAGREEMENT)
+            self.assertTrue(resolved.chosen.startswith("Resolved in canonical plan:"))
+
+    def test_resolved_image_alignment_disagreement_is_informational(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page()
+            document.save(source)
+            document.close()
+            finding = ReviewFinding(
+                severity=ReviewSeverity.CRITICAL,
+                category=FindingCategory.SEMANTIC_ROLE,
+                message=(
+                    "The first proposal attached the designation to the wrong name. "
+                    "Image row alignment places it beside the second name."
+                ),
+                chosen="Second name with designation",
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Roster",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[element(ElementRole.P, "Roster")],
+                        findings=[finding],
+                    )
+                ],
+            )
+
+            refine_document_plan(source, plan)
+
+            self.assertEqual(plan.pages[0].findings[0].severity, ReviewSeverity.INFO)
+
+    def test_resolved_first_model_name_error_is_informational(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page()
+            document.save(source)
+            document.close()
+            finding = ReviewFinding(
+                severity=ReviewSeverity.CRITICAL,
+                category=FindingCategory.NAME,
+                message=(
+                    "The image and both evidence streams read William; "
+                    "the first-model proposal omitted a letter."
+                ),
+                chosen="William",
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Roster",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[element(ElementRole.P, "William")],
+                        findings=[finding],
+                    )
+                ],
+            )
+
+            refine_document_plan(source, plan)
+
+            resolved = plan.pages[0].findings[0]
+            self.assertEqual(resolved.severity, ReviewSeverity.INFO)
+            self.assertEqual(resolved.category, FindingCategory.MODEL_DISAGREEMENT)
+
+
+    def test_isolated_unmarked_list_item_becomes_paragraph(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page()
+            document.save(source)
+            document.close()
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Awards",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[
+                            element(ElementRole.H2, "Award"),
+                            element(ElementRole.LI, "Ada Lovelace", top=200),
+                            element(ElementRole.H2, "Participants", top=300),
+                            element(ElementRole.LI, "Emmy Noether", top=400),
+                            element(ElementRole.LI, "Sofia Kovalevskaya", top=500),
+                        ],
+                    )
+                ],
+            )
+
+            refine_document_plan(source, plan)
+
+            self.assertEqual(
+                [item.role for item in plan.pages[0].elements],
+                [
+                    ElementRole.H2,
+                    ElementRole.P,
+                    ElementRole.H2,
+                    ElementRole.LI,
+                    ElementRole.LI,
+                ],
+            )
+            self.assertTrue(
+                any(
+                    "one-item list" in finding.message
+                    for finding in plan.pages[0].elements[1].findings
+                )
+            )
+
     def test_moves_first_page_epigraph_after_issue_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"

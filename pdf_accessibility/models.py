@@ -6,7 +6,7 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class ElementRole(str, Enum):
@@ -15,6 +15,7 @@ class ElementRole(str, Enum):
     H2 = "H2"
     H3 = "H3"
     P = "P"
+    LI = "LI"
     FIGURE = "Figure"
 
 
@@ -52,6 +53,7 @@ class TransformationKind(str, Enum):
     FORMULA_SPOKEN_EQUIVALENT = "formula_spoken_equivalent"
     DECORATIVE_LEADER_OMISSION = "decorative_leader_omission"
     DECORATIVE_MARKER_OMISSION = "decorative_marker_omission"
+    INLINE_LIST_SEPARATOR_OMISSION = "inline_list_separator_omission"
     STRUCTURAL_SEPARATOR_NORMALIZATION = "structural_separator_normalization"
     DATE_RANGE_EXPANSION = "date_range_expansion"
     WHITESPACE_NORMALIZATION = "whitespace_normalization"
@@ -359,6 +361,7 @@ class PageElement(BaseModel):
 
 class PagePlan(BaseModel):
     page_number: int = Field(ge=1)
+    document_title_candidate: str | None = Field(default=None, max_length=240)
     coordinate_space: CoordinateSpace = CoordinateSpace.UNKNOWN
     elements: list[PageElement] = Field(
         description="Elements in the exact logical reading order for assistive technology"
