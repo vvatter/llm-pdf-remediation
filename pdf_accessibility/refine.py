@@ -4,6 +4,7 @@ from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
 import re
+import unicodedata
 
 import pymupdf
 
@@ -16,6 +17,7 @@ from .models import (
     FindingCategory,
     PageElement,
     PagePlan,
+    PLAN_REVISION,
     ReviewFinding,
     ReviewSeverity,
     TextTransformation,
@@ -37,6 +39,33 @@ _MONTH_DATE_RANGE = re.compile(
     r"Dec(?:ember)?)\s+(\d{1,2})–(\d{1,2})\b",
     flags=re.IGNORECASE,
 )
+
+_FORMULA_MAPPING_MESSAGE = (
+    "Reviewed formula speech could not be mapped atomically to the printed notation."
+)
+
+
+def _find_layout_flexible_span(text: str, needle: str, start: int) -> tuple[int, int] | None:
+    direct_start = text.find(needle, start)
+    if direct_start >= 0:
+        return direct_start, direct_start + len(needle)
+    pieces = re.split(r"\s+", needle.strip())
+    if len(pieces) < 2:
+        return None
+    match = re.search(r"\s+".join(re.escape(piece) for piece in pieces), text[start:])
+    if match is None:
+        return None
+    return start + match.start(), start + match.end()
+
+
+def _looks_mathematical(text: str) -> bool:
+    return any(
+        character in _FORMULA_CHARACTERS
+        or unicodedata.category(character) == "Sm"
+        or "\u0370" <= character <= "\u03ff"
+        or 0x1D400 <= ord(character) <= 0x1D7FF
+        for character in text
+    )
 
 
 def _normalized_bbox(
@@ -91,22 +120,17 @@ def _transformation_kind(source: str, replacement: str) -> TransformationKind:
     if (
         "-" in source
         and not replacement
-        and (
-            any(character in source for character in "\r\n")
-            or re.fullmatch(r"-\s*", source)
-        )
+        and any(character in source for character in "\r\n")
     ):
         return TransformationKind.LINE_BREAK_DEHYPHENATION
     if source and not replacement and not re.sub(r"[\s←→⟵⟶]", "", source):
         return TransformationKind.DECORATIVE_MARKER_OMISSION
     if source.isspace() and replacement in {"; ", ": "}:
         return TransformationKind.STRUCTURAL_SEPARATOR_NORMALIZATION
+    if source.strip() == "|" and replacement.strip() in {",", ";", ":"}:
+        return TransformationKind.STRUCTURAL_SEPARATOR_NORMALIZATION
     if source == "–" and replacement == " to ":
         return TransformationKind.DATE_RANGE_EXPANSION
-    if any(character in _FORMULA_CHARACTERS for character in source + replacement) or re.search(
-        r"[\u0370-\u03ff]", source + replacement
-    ):
-        return TransformationKind.FORMULA_SPOKEN_EQUIVALENT
     if (
         any(character in ".·…_" for character in source)
         and not re.sub(r"[\s.·…_]", "", source)
@@ -151,7 +175,82 @@ def canonicalize_transformations(element: PageElement) -> None:
     if element.role == ElementRole.FIGURE:
         element.transformations = []
         return
+    marker_free = re.sub(r"^[\s*•●○▪■+\-–—]+", "", element.visible_text)
+    if (
+        element.accessible_text == element.visible_text
+        and marker_free != element.visible_text
+        and marker_free
+        and element.role
+        in {
+            ElementRole.DOCUMENT_TITLE,
+            ElementRole.H1,
+            ElementRole.H2,
+            ElementRole.H3,
+            ElementRole.P,
+            ElementRole.LI,
+        }
+        and any(
+            (finding.chosen or "").strip() == marker_free.strip()
+            for finding in element.findings
+        )
+    ):
+        element.accessible_text = marker_free
     visible, accessible = element.visible_text, element.accessible_text
+    declared_formulae = [
+        item
+        for item in element.transformations
+        if item.kind == TransformationKind.FORMULA_SPOKEN_EQUIVALENT
+    ]
+    formula_anchors: list[TextTransformation] = []
+    source_cursor = 0
+    target_cursor = 0
+    invalid_formulae: list[TextTransformation] = []
+    for item in declared_formulae:
+        if not item.source_text or not item.replacement_text:
+            invalid_formulae.append(item)
+            continue
+        source_span = _find_layout_flexible_span(
+            visible, item.source_text, source_cursor
+        )
+        target_start = accessible.find(item.replacement_text, target_cursor)
+        if source_span is None or target_start < 0:
+            invalid_formulae.append(item)
+            continue
+        source_start, source_end = source_span
+        target_end = target_start + len(item.replacement_text)
+        formula_anchors.append(
+            item.model_copy(
+                update={
+                    "source_text": visible[source_start:source_end],
+                    "source_start": source_start,
+                    "source_end": source_end,
+                    "target_start": target_start,
+                    "target_end": target_end,
+                }
+            )
+        )
+        source_cursor = source_end
+        target_cursor = target_end
+
+    prior_formula_mapping_failure = any(
+        finding.message == _FORMULA_MAPPING_MESSAGE for finding in element.findings
+    )
+    element.findings = [
+        finding
+        for finding in element.findings
+        if finding.message != _FORMULA_MAPPING_MESSAGE
+    ]
+    if invalid_formulae:
+        element.findings.append(
+            ReviewFinding(
+                severity=ReviewSeverity.CRITICAL,
+                category=FindingCategory.FORMULA,
+                message=_FORMULA_MAPPING_MESSAGE,
+                alternatives=[item.source_text for item in invalid_formulae],
+                chosen="Retain printed notation until an exact spoken alternative is reviewed.",
+            )
+        )
+
     transformations: list[TextTransformation] = []
     reviewed_decorative_omission = any(
         finding.category == FindingCategory.DECORATION
@@ -161,48 +260,123 @@ def canonicalize_transformations(element: PageElement) -> None:
         )
         for finding in element.findings
     )
-    matcher = SequenceMatcher(None, visible, accessible, autojunk=False)
-    for tag, source_start, source_end, target_start, target_end in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        source_text = visible[source_start:source_end]
-        replacement_text = accessible[target_start:target_end]
-        kind = _transformation_kind(source_text, replacement_text)
-        if (
-            kind == TransformationKind.UNVERIFIED
-            and reviewed_decorative_omission
-            and source_text
-            and not replacement_text
-        ):
-            kind = TransformationKind.DECORATIVE_MARKER_OMISSION
-        if (
-            kind == TransformationKind.UNVERIFIED
-            and element.role == ElementRole.LI
-            and not replacement_text
-            and (
-                source_text.strip() in {",", ";"}
-                or source_text.strip().lower() in {"and", "or", "&"}
+    unmapped_math = False
+
+    def append_gap(
+        source_start: int,
+        source_end: int,
+        target_start: int,
+        target_end: int,
+    ) -> None:
+        nonlocal unmapped_math
+        matcher = SequenceMatcher(
+            None,
+            visible[source_start:source_end],
+            accessible[target_start:target_end],
+            autojunk=False,
+        )
+        for tag, local_source_start, local_source_end, local_target_start, local_target_end in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            exact_source_start = source_start + local_source_start
+            exact_source_end = source_start + local_source_end
+            exact_target_start = target_start + local_target_start
+            exact_target_end = target_start + local_target_end
+            source_text = visible[exact_source_start:exact_source_end]
+            replacement_text = accessible[exact_target_start:exact_target_end]
+            kind = _transformation_kind(source_text, replacement_text)
+            if (
+                kind == TransformationKind.UNVERIFIED
+                and exact_source_start == 0
+                and element.role
+                in {
+                    ElementRole.DOCUMENT_TITLE,
+                    ElementRole.H1,
+                    ElementRole.H2,
+                    ElementRole.H3,
+                    ElementRole.P,
+                    ElementRole.LI,
+                }
+                and not replacement_text
+                and re.fullmatch(r"[\s*•●○▪■+\-–—]+", source_text)
+            ):
+                kind = TransformationKind.DECORATIVE_MARKER_OMISSION
+            if (
+                kind == TransformationKind.UNVERIFIED
+                and reviewed_decorative_omission
+                and source_text
+                and not replacement_text
+            ):
+                kind = TransformationKind.DECORATIVE_MARKER_OMISSION
+            if (
+                kind == TransformationKind.UNVERIFIED
+                and element.role == ElementRole.LI
+                and not replacement_text
+                and (
+                    source_text.strip() in {",", ";", "|"}
+                    or source_text.strip().lower() in {"and", "or", "&"}
+                )
+            ):
+                kind = TransformationKind.INLINE_LIST_SEPARATOR_OMISSION
+            if (
+                kind == TransformationKind.UNVERIFIED
+                and source_text in {"-", "–"}
+                and replacement_text == " to "
+                and re.search(r"\d\s*$", visible[:exact_source_start])
+                and re.match(r"\s*\d", visible[exact_source_end:])
+            ):
+                kind = TransformationKind.DATE_RANGE_EXPANSION
+            if kind == TransformationKind.UNVERIFIED and _looks_mathematical(
+                source_text + replacement_text
+            ):
+                unmapped_math = True
+            transformations.append(
+                TextTransformation(
+                    kind=kind,
+                    source_text=source_text,
+                    replacement_text=replacement_text,
+                    rationale=_transformation_rationale(kind),
+                    source_start=exact_source_start,
+                    source_end=exact_source_end,
+                    target_start=exact_target_start,
+                    target_end=exact_target_end,
+                )
             )
-        ):
-            kind = TransformationKind.INLINE_LIST_SEPARATOR_OMISSION
-        if (
-            kind == TransformationKind.UNVERIFIED
-            and source_text in {"-", "–"}
-            and replacement_text == " to "
-            and re.search(r"\d\s*$", visible[:source_start])
-            and re.match(r"\s*\d", visible[source_end:])
-        ):
-            kind = TransformationKind.DATE_RANGE_EXPANSION
-        transformations.append(
-            TextTransformation(
-                kind=kind,
-                source_text=source_text,
-                replacement_text=replacement_text,
-                rationale=_transformation_rationale(kind),
-                source_start=source_start,
-                source_end=source_end,
-                target_start=target_start,
-                target_end=target_end,
+
+    source_cursor = 0
+    target_cursor = 0
+    for anchor in formula_anchors:
+        append_gap(
+            source_cursor,
+            int(anchor.source_start),
+            target_cursor,
+            int(anchor.target_start),
+        )
+        transformations.append(anchor)
+        source_cursor = int(anchor.source_end)
+        target_cursor = int(anchor.target_end)
+    append_gap(source_cursor, len(visible), target_cursor, len(accessible))
+
+    if unmapped_math and not invalid_formulae:
+        element.findings.append(
+            ReviewFinding(
+                severity=ReviewSeverity.CRITICAL,
+                category=FindingCategory.FORMULA,
+                message=_FORMULA_MAPPING_MESSAGE,
+                chosen="Retain printed notation until an exact spoken alternative is reviewed.",
+            )
+        )
+    elif (
+        prior_formula_mapping_failure
+        and not invalid_formulae
+        and not formula_anchors
+    ):
+        element.findings.append(
+            ReviewFinding(
+                severity=ReviewSeverity.CRITICAL,
+                category=FindingCategory.FORMULA,
+                message=_FORMULA_MAPPING_MESSAGE,
+                chosen="Retain printed notation until an exact spoken alternative is reviewed.",
             )
         )
     element.transformations = transformations
@@ -217,14 +391,33 @@ def canonicalize_transformations(element: PageElement) -> None:
         )
     ]
     if any(item.kind == TransformationKind.UNVERIFIED for item in transformations):
-        element.findings.append(
-            ReviewFinding(
-                severity=ReviewSeverity.CRITICAL,
-                category=FindingCategory.TRANSFORMATION,
-                message=message,
-                chosen=accessible[:300],
+        cursor = 0
+        repaired: list[str] = []
+        for item in transformations:
+            source_start = int(item.source_start or 0)
+            source_end = int(item.source_end or source_start)
+            repaired.append(visible[cursor:source_start])
+            repaired.append(
+                item.source_text
+                if item.kind == TransformationKind.UNVERIFIED
+                else item.replacement_text
             )
+            cursor = source_end
+        repaired.append(visible[cursor:])
+        element.accessible_text = "".join(repaired)
+        repair_message = (
+            "Unapproved accessibility-only text changes were reverted to the printed source."
         )
+        if not any(finding.message == repair_message for finding in element.findings):
+            element.findings.append(
+                ReviewFinding(
+                    severity=ReviewSeverity.INFO,
+                    category=FindingCategory.TRANSFORMATION,
+                    message=repair_message,
+                    chosen=element.accessible_text[:300],
+                )
+            )
+        canonicalize_transformations(element)
 
 
 def transformation_errors(plan: DocumentPlan) -> list[str]:
@@ -236,6 +429,17 @@ def transformation_errors(plan: DocumentPlan) -> list[str]:
             cursor = 0
             rebuilt: list[str] = []
             for transformation in element.transformations:
+                if (
+                    transformation.kind
+                    == TransformationKind.FORMULA_SPOKEN_EQUIVALENT
+                    and (
+                        not transformation.source_text.strip()
+                        or not transformation.replacement_text.strip()
+                    )
+                ):
+                    errors.append(
+                        f"{element.id}: formula transformation requires notation and spoken text"
+                    )
                 spans = (
                     transformation.source_start,
                     transformation.source_end,
@@ -293,15 +497,14 @@ def _artifact_reason(
             term in alt for term in ("decorative", "flourish", "ornament")
         )
         generic_and_small = alt in _GENERIC_ALT_TEXT and (width <= 80 or height <= 25)
-        reviewed_small_decoration = (
+        reviewed_decoration = (
             not alt
-            and (width <= 80 or height <= 25)
             and any(
                 finding.category == FindingCategory.DECORATION
                 for finding in element.findings
             )
         )
-        if explicitly_decorative or generic_and_small or reviewed_small_decoration:
+        if explicitly_decorative or generic_and_small or reviewed_decoration:
             return ArtifactReason.DECORATION
     fingerprint = _furniture_fingerprint(element)
     if fingerprint and fingerprint in repeated_furniture:
@@ -419,7 +622,13 @@ def _mark_resolved_findings(findings: list[ReviewFinding]) -> None:
             and finding.category == FindingCategory.GEOMETRY
             and any(
                 term in message
-                for term in ("first-model", "first proposal", "proposal", "proposed element")
+                for term in (
+                    "first-model",
+                    "first model",
+                    "first proposal",
+                    "proposal",
+                    "proposed element",
+                )
             )
             and any(
                 term in message
@@ -431,6 +640,14 @@ def _mark_resolved_findings(findings: list[ReviewFinding]) -> None:
             and finding.category == FindingCategory.CONTENT_COVERAGE
             and "running header" in message
             and "page number" in message
+        )
+        resolved_coverage = (
+            finding.severity == ReviewSeverity.CRITICAL
+            and finding.category == FindingCategory.CONTENT_COVERAGE
+            and any(term in message for term in ("first-model", "first model", "proposal"))
+            and any(term in message for term in ("omitted", "missing"))
+            and any(term in message for term in ("canonical", "restores", "include"))
+            and bool(finding.chosen)
         )
         resolved_model_role = (
             finding.severity == ReviewSeverity.CRITICAL
@@ -467,6 +684,10 @@ def _mark_resolved_findings(findings: list[ReviewFinding]) -> None:
             finding.severity = ReviewSeverity.INFO
             finding.category = FindingCategory.ARTIFACT
             finding.chosen = "Resolved: running furniture remains visible and is explicitly artifacted."
+        elif resolved_coverage:
+            finding.severity = ReviewSeverity.INFO
+            finding.category = FindingCategory.MODEL_DISAGREEMENT
+            finding.chosen = f"Resolved in canonical plan: {finding.chosen}"
         elif resolved_model_role:
             finding.severity = ReviewSeverity.INFO
             finding.category = FindingCategory.MODEL_DISAGREEMENT
@@ -546,5 +767,5 @@ def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
         page.findings = _dedupe_findings(page.findings)
         for index, artifact in enumerate(page.artifacts, start=1):
             artifact.id = f"p{page.page_number:04d}-a{index:04d}"
-    plan.plan_revision = max(plan.plan_revision, 5)
+    plan.plan_revision = max(plan.plan_revision, PLAN_REVISION)
     return plan

@@ -33,6 +33,7 @@ def _ensure_ocr_base(source: Path, output: Path, jobs: int) -> None:
         [
             "ocrmypdf",
             "--force-ocr",
+            "--continue-on-soft-render-error",
             "--output-type",
             "pdf",
             "--optimize",
@@ -71,27 +72,9 @@ def _paths(source: Path, output_dir: Path) -> dict[str, Path]:
     }
 
 
-def _apply_native_policy(report, native_experimental: bool) -> None:
-    if report.selected_mode != RemediationMode.NATIVE or native_experimental:
-        return
-    if report.requested_mode == RemediationMode.NATIVE:
-        report.selected_mode = RemediationMode.UNSUPPORTED
-        report.reasons.append(
-            "Native mode is experimental because existing text may duplicate semantic anchors; "
-            "rerun with --native-experimental to accept that risk."
-        )
-    else:
-        report.selected_mode = RemediationMode.FACSIMILE
-        report.reasons.append(
-            "Batch-safe policy changed automatic native mode to facsimile; native mode remains "
-            "available with --native-experimental."
-        )
-
-
 def preflight_command(args: argparse.Namespace) -> int:
     source = args.input.resolve()
     report = inspect_pdf(source, RemediationMode(args.mode))
-    _apply_native_policy(report, args.native_experimental)
     path = _paths(source, args.output_dir)["preflight"]
     write_preflight(report, path)
     print(f"mode: {report.selected_mode.value}")
@@ -109,7 +92,6 @@ def run_command(args: argparse.Namespace) -> int:
     recent_titles = load_recent_titles(recent_titles_path)
     requested_mode = RemediationMode.FACSIMILE if args.ocr else RemediationMode(args.mode)
     preflight = inspect_pdf(source, requested_mode)
-    _apply_native_policy(preflight, args.native_experimental)
     write_preflight(preflight, paths["preflight"])
     if preflight.selected_mode == RemediationMode.UNSUPPORTED:
         raise RuntimeError("preflight selected unsupported mode: " + "; ".join(preflight.reasons))
@@ -127,14 +109,32 @@ def run_command(args: argparse.Namespace) -> int:
         return 0
 
     if args.base_pdf:
-        base_pdf = args.base_pdf.resolve()
-    elif preflight.selected_mode == RemediationMode.FACSIMILE:
-        base_pdf = paths["base"]
-        _ensure_ocr_base(source, base_pdf, args.ocr_jobs)
+        evidence_pdf = args.base_pdf.resolve()
+        compile_base = evidence_pdf
+        geometry_source = source
+        base_geometry_label = "ocr"
+        candidate_geometry_label = "native"
+    elif preflight.selected_mode in {RemediationMode.FACSIMILE, RemediationMode.HYBRID}:
+        evidence_pdf = paths["base"]
+        _ensure_ocr_base(source, evidence_pdf, args.ocr_jobs)
+        if preflight.selected_mode == RemediationMode.HYBRID:
+            compile_base = source
+            geometry_source = evidence_pdf
+            base_geometry_label = "native"
+            candidate_geometry_label = "ocr"
+        else:
+            compile_base = evidence_pdf
+            geometry_source = source
+            base_geometry_label = "ocr"
+            candidate_geometry_label = "native"
     else:
-        base_pdf = source
+        evidence_pdf = source
+        compile_base = source
+        geometry_source = source
+        base_geometry_label = "native"
+        candidate_geometry_label = "native"
 
-    packets = extract_page_packets(source, dpi=args.dpi, evidence_pdf=base_pdf)
+    packets = extract_page_packets(source, dpi=args.dpi, evidence_pdf=evidence_pdf)
     if args.max_pages:
         packets = packets[: args.max_pages]
     planner_model = args.model or args.planner_model
@@ -153,11 +153,17 @@ def run_command(args: argparse.Namespace) -> int:
     )
     refine_document_plan(source, plan)
     geometry_sources = compile_tagged_pdf(
-        base_pdf, paths["draft"], plan, geometry_source=source, declare_pdfua=False
+        compile_base,
+        paths["draft"],
+        plan,
+        geometry_source=geometry_source,
+        base_geometry_label=base_geometry_label,
+        candidate_geometry_label=candidate_geometry_label,
+        declare_pdfua=False,
     )
     write_document_plan(plan, paths["plan"])
     draft_report = validate_output(
-        base_pdf, paths["draft"], plan, reference_source=source
+        compile_base, paths["draft"], plan, reference_source=source
     )
     if args.max_pages:
         validation = dict(draft_report)
@@ -176,7 +182,7 @@ def run_command(args: argparse.Namespace) -> int:
         if paths["output"].exists():
             shutil.move(paths["output"], paths["output"].with_suffix(".previous.pdf"))
         validation = release_pdfua(
-            base_pdf,
+            compile_base,
             paths["draft"],
             paths["output"],
             plan,
@@ -273,7 +279,7 @@ def _add_input_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--native-experimental",
         action="store_true",
-        help="allow native mode despite possible duplicate ordinary text extraction",
+        help=argparse.SUPPRESS,
     )
 
 

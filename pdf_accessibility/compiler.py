@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from itertools import groupby
 from pathlib import Path
 
 import pikepdf
@@ -39,6 +41,10 @@ class AnchorChunk:
     token_text: str
     mcid: int
     offset: int
+    text_start: int = 0
+    text_end: int = 0
+    formula_index: int | None = None
+    formula_alt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +65,7 @@ class WordPlacement:
 class LinePlacement:
     text: str
     bbox: tuple[float, float, float, float]
+    chunks: list[AnchorChunk]
 
 
 @dataclass(frozen=True)
@@ -66,7 +73,29 @@ class StructureRegion:
     element: PageElement
     chunks: list[AnchorChunk]
     fragments: list[TextFragment]
+    lines: list[LinePlacement]
+    segments: list[StructureSegment]
+    fragment_anchored: bool = False
+
+
+@dataclass(frozen=True)
+class StructureSegment:
+    element: PageElement
+    chunks: list[AnchorChunk]
+    fragments: list[TextFragment]
     mcid: int
+    line_index: int
+    formula_index: int | None = None
+    formula_alt: str | None = None
+
+
+@dataclass(frozen=True)
+class RegionLineCandidate:
+    element: PageElement
+    chunks: list[AnchorChunk]
+    fragments: list[TextFragment]
+    logical_lines: list[LinePlacement]
+    fragment_lines: list[LinePlacement]
 
 
 def _as_contents_array(contents: pikepdf.Object | None) -> list[pikepdf.Object]:
@@ -77,18 +106,124 @@ def _as_contents_array(contents: pikepdf.Object | None) -> list[pikepdf.Object]:
     return [contents]
 
 
-def _find_anchor_font() -> Path:
+def _source_content_without_marking(
+    pdf: pikepdf.Pdf, page: pikepdf.Page
+) -> list[pikepdf.Object]:
+    """Preserve source painting operators but discard obsolete marking wrappers."""
+    original = _as_contents_array(page.obj.get(Name.Contents))
+    try:
+        instructions = list(pikepdf.parse_content_stream(page))
+    except (pikepdf.PdfError, ValueError):
+        return original
+    filtered = [
+        instruction
+        for instruction in instructions
+        if str(getattr(instruction, "operator", "")) not in {"BMC", "BDC", "EMC"}
+    ]
+    if len(filtered) == len(instructions):
+        return original
+    streams = [item for item in original if isinstance(item, pikepdf.Stream)]
+    if not streams:
+        return original
+    streams[0].write(pikepdf.unparse_content_stream(filtered))
+    for stream in streams[1:]:
+        stream.write(b"")
+    return original
+
+
+def _strip_form_xobject_marking(
+    resources: pikepdf.Object | None,
+    visited: set[tuple[int, int]],
+) -> None:
+    """Remove obsolete marked-content wrappers from nested visible Form XObjects."""
+    if resources is None:
+        return
+    for xobject in resources.get(Name.XObject, {}).values():
+        if str(xobject.get(Name.Subtype)) != "/Form":
+            continue
+        identity = xobject.objgen
+        if identity in visited:
+            continue
+        visited.add(identity)
+        try:
+            instructions = list(pikepdf.parse_content_stream(xobject))
+        except (pikepdf.PdfError, ValueError):
+            instructions = []
+        filtered = [
+            instruction
+            for instruction in instructions
+            if str(getattr(instruction, "operator", ""))
+            not in {"BMC", "BDC", "EMC"}
+        ]
+        if len(filtered) != len(instructions):
+            xobject.write(pikepdf.unparse_content_stream(filtered))
+        _strip_form_xobject_marking(xobject.get(Name.Resources), visited)
+
+
+def _link_description(annotation: pikepdf.Object) -> str:
+    existing = str(annotation.get(Name.Contents, "")).strip()
+    if existing:
+        return existing
+    action = annotation.get(Name.A, {})
+    uri = str(action.get(Name.URI, "")).strip() if isinstance(action, pikepdf.Dictionary) else ""
+    if uri:
+        return f"Link to {uri}"
+    if annotation.get(Name.Dest) is not None:
+        return "Internal document link"
+    return "Link"
+
+
+def _anchor_font_candidates() -> list[Path]:
     configured = os.getenv("A11Y_FONT_PATH")
+    texlive_noto_fonts = sorted(
+        Path("/usr/local/texlive").glob(
+            "*/texmf-dist/fonts/truetype/google/noto/NotoSans-Regular.ttf"
+        ),
+        reverse=True,
+    )
+    texlive_dejavu_fonts = sorted(
+        Path("/usr/local/texlive").glob(
+            "*/texmf-dist/fonts/truetype/public/dejavu/DejaVuSans.ttf"
+        ),
+        reverse=True,
+    )
     candidates = [
         Path(configured).expanduser() if configured else None,
         Path(__file__).parent / "fonts" / "NotoSans-Regular.ttf",
-        Path("/usr/local/texlive/2024/texmf-dist/fonts/truetype/google/noto/NotoSans-Regular.ttf"),
+        *texlive_noto_fonts,
+        *texlive_dejavu_fonts,
         Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
     ]
+    found: list[Path] = []
+    seen: set[Path] = set()
     for candidate in candidates:
-        if candidate and candidate.is_file():
-            return candidate
+        if not candidate or not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            found.append(candidate)
+            seen.add(resolved)
+    return found
+
+
+def _find_anchor_font(required_codepoints: set[int] | None = None) -> Path:
+    candidates = _anchor_font_candidates()
+    if candidates and not required_codepoints:
+        return candidates[0]
+    best: tuple[int, int, Path] | None = None
+    for index, candidate in enumerate(candidates):
+        font = TTFont(candidate, lazy=True)
+        try:
+            cmap = font.getBestCmap() or {}
+            coverage = len(required_codepoints & cmap.keys())
+        finally:
+            font.close()
+        score = (coverage, -index, candidate)
+        if best is None or score[:2] > best[:2]:
+            best = score
+    if best is not None:
+        return best[2]
     raise FileNotFoundError(
         "No open TrueType anchor font found; set A11Y_FONT_PATH to Noto Sans or DejaVu Sans"
     )
@@ -128,20 +263,19 @@ def _to_unicode_cmap(codepoints: set[int]) -> bytes:
 
 
 def _make_anchor_font(pdf: pikepdf.Pdf, plan: DocumentPlan) -> AnchorFont:
-    font_path = _find_anchor_font()
-    font_bytes = font_path.read_bytes()
-    font = TTFont(font_path, lazy=False)
-    cmap = font.getBestCmap()
     requested = {
         ord(character)
         for page in plan.pages
         for element in page.elements
-        for character in (
-            element.semantic_text
-        ) or ""
+        for character in element.extraction_text
         if ord(character) <= 0xFFFF
     }
     fallback = ord("?")
+    font_path = _find_anchor_font(requested | {fallback})
+    font_bytes = font_path.read_bytes()
+    font = TTFont(font_path, lazy=False)
+    cmap = font.getBestCmap()
+    font_name = re.sub(r"[^A-Za-z0-9_.+-]", "-", font_path.stem)
     control_codepoints = requested & {9, 10, 13}
     supported = {
         codepoint for codepoint in requested | {fallback} if codepoint in cmap
@@ -167,7 +301,7 @@ def _make_anchor_font(pdf: pikepdf.Pdf, plan: DocumentPlan) -> AnchorFont:
     descriptor = pdf.make_indirect(
         Dictionary(
             Type=Name.FontDescriptor,
-            FontName=Name("/NotoSans-Regular"),
+            FontName=Name(f"/{font_name}"),
             Flags=32,
             FontBBox=Array(
                 [
@@ -189,7 +323,7 @@ def _make_anchor_font(pdf: pikepdf.Pdf, plan: DocumentPlan) -> AnchorFont:
         Dictionary(
             Type=Name.Font,
             Subtype=Name("/CIDFontType2"),
-            BaseFont=Name("/NotoSans-Regular"),
+            BaseFont=Name(f"/{font_name}"),
             CIDSystemInfo=Dictionary(
                 Registry=String("Adobe"), Ordering=String("Identity"), Supplement=0
             ),
@@ -203,7 +337,7 @@ def _make_anchor_font(pdf: pikepdf.Pdf, plan: DocumentPlan) -> AnchorFont:
         Dictionary(
             Type=Name.Font,
             Subtype=Name.Type0,
-            BaseFont=Name("/NotoSans-Regular"),
+            BaseFont=Name(f"/{font_name}"),
             Encoding=Name("/Identity-H"),
             DescendantFonts=Array([descendant]),
             ToUnicode=Stream(pdf, _to_unicode_cmap(supported)),
@@ -433,9 +567,10 @@ def _repair_invalid_fragment_bbox(
     words: list[tuple],
     width: float,
     height: float,
+    force: bool = False,
 ) -> bool:
     bbox = _fragment_bbox_points(fragment, element, width, height)
-    if bbox[0] < bbox[2] and bbox[1] < bbox[3]:
+    if not force and bbox[0] < bbox[2] and bbox[1] < bbox[3]:
         return False
     target_keys = [
         _token_key(token.text)
@@ -445,16 +580,30 @@ def _repair_invalid_fragment_bbox(
     if not target_keys:
         return False
     source_keys = [_token_key(_word_text(word)) for word in words]
-    matcher = SequenceMatcher(None, source_keys, target_keys, autojunk=False)
     matched_boxes: list[tuple[float, float, float, float]] = []
-    matched_tokens = 0
-    for block in matcher.get_matching_blocks():
-        if not block.size:
-            continue
+    if force and len(target_keys) < 3:
+        occurrences = [
+            start
+            for start in range(len(source_keys) - len(target_keys) + 1)
+            if source_keys[start : start + len(target_keys)] == target_keys
+        ]
+        if len(occurrences) != 1:
+            return False
+        start = occurrences[0]
         matched_boxes.extend(
-            _word_bbox(word) for word in words[block.a : block.a + block.size]
+            _word_bbox(word) for word in words[start : start + len(target_keys)]
         )
-        matched_tokens += block.size
+        matched_tokens = len(target_keys)
+    else:
+        matcher = SequenceMatcher(None, source_keys, target_keys, autojunk=False)
+        matched_tokens = 0
+        for block in matcher.get_matching_blocks():
+            if not block.size:
+                continue
+            matched_boxes.extend(
+                _word_bbox(word) for word in words[block.a : block.a + block.size]
+            )
+            matched_tokens += block.size
     if matched_tokens / len(target_keys) < 0.5 or not matched_boxes:
         return False
     repaired = (
@@ -465,6 +614,19 @@ def _repair_invalid_fragment_bbox(
     )
     if repaired[0] >= repaired[2] or repaired[1] >= repaired[3]:
         return False
+    if force:
+        # A page-wide sequence match can collect common words from unrelated
+        # regions (for example a repeated event name and footer). A genuine
+        # shifted box should move while retaining roughly the same footprint;
+        # reject repairs whose scattered matches inflate either dimension.
+        original_width = max(bbox[2] - bbox[0], 0.01)
+        original_height = max(bbox[3] - bbox[1], 0.01)
+        repaired_width = repaired[2] - repaired[0]
+        repaired_height = repaired[3] - repaired[1]
+        if repaired_width > max(original_width * 3, 144.0) or repaired_height > max(
+            original_height * 3, 36.0
+        ):
+            return False
     fragment.bbox = [
         round(repaired[0] / width * 1000, 3),
         round(repaired[1] / height * 1000, 3),
@@ -564,9 +726,21 @@ def _align_element_fragments(
         )
         bbox = _fragment_bbox_points(fragment, element, width, height)
         local_words = _words_in_fragment(words, bbox)
+        local_quality = _alignment_quality(fragment_chunks, local_words)
+        if local_quality < 0.5 and _repair_invalid_fragment_bbox(
+            fragment,
+            element,
+            words,
+            width,
+            height,
+            force=True,
+        ):
+            bbox = _fragment_bbox_points(fragment, element, width, height)
+            local_words = _words_in_fragment(words, bbox)
+            local_quality = _alignment_quality(fragment_chunks, local_words)
         fragment.geometry_word_count = len(local_words)
         fragment.geometry_source = geometry_source
-        fragment.alignment_coverage = _alignment_quality(fragment_chunks, local_words)
+        fragment.alignment_coverage = local_quality
         chunk_count = max(len(fragment_chunks), 1)
         weighted_quality += fragment.alignment_coverage * chunk_count
         weighted_chunks += chunk_count
@@ -686,20 +860,61 @@ def _page_anchor_chunks(elements: list[PageElement]) -> list[list[AnchorChunk]]:
     by_element: list[list[AnchorChunk]] = []
     next_mcid = 0
     for element in elements:
-        actual_text = element.semantic_text
+        actual_text = (
+            element.alt_text or ""
+            if element.role == ElementRole.FIGURE
+            else element.extraction_text
+        )
+        formula_spans = element.formula_spans
         element_chunks: list[AnchorChunk] = []
         tokens = exact_text_tokens(actual_text)
-        for offset, token in enumerate(tokens):
-            element_chunks.append(
-                AnchorChunk(
-                    element=element,
-                    text=actual_text[token.start : token.actual_end],
-                    token_text=token.text,
-                    mcid=next_mcid,
-                    offset=offset,
+        for token in tokens:
+            boundaries = {token.start, token.actual_end}
+            boundaries.update(
+                token.start + match.end()
+                for match in re.finditer(
+                    r"\r\n|\r|\n",
+                    actual_text[token.start : token.actual_end],
                 )
             )
-            next_mcid += 1
+            for span in formula_spans:
+                if token.start < span.start < token.actual_end:
+                    boundaries.add(span.start)
+                if token.start < span.end < token.actual_end:
+                    boundaries.add(span.end)
+            ordered_boundaries = sorted(boundaries)
+            for text_start, text_end in zip(
+                ordered_boundaries, ordered_boundaries[1:]
+            ):
+                formula_index = next(
+                    (
+                        index
+                        for index, span in enumerate(formula_spans)
+                        if span.start <= text_start and text_end <= span.end
+                    ),
+                    None,
+                )
+                formula_alt = (
+                    formula_spans[formula_index].alt_text
+                    if formula_index is not None
+                    else None
+                )
+                token_start = max(text_start, token.start)
+                token_end = min(text_end, token.end)
+                element_chunks.append(
+                    AnchorChunk(
+                        element=element,
+                        text=actual_text[text_start:text_end],
+                        token_text=actual_text[token_start:token_end],
+                        mcid=next_mcid,
+                        offset=len(element_chunks),
+                        text_start=text_start,
+                        text_end=text_end,
+                        formula_index=formula_index,
+                        formula_alt=formula_alt,
+                    )
+                )
+                next_mcid += 1
         by_element.append(element_chunks)
     return by_element
 
@@ -730,7 +945,7 @@ def _same_visual_line(
 
 
 def _reviewed_region_bbox(
-    region: StructureRegion,
+    region: StructureRegion | StructureSegment,
     width: float,
     height: float,
 ) -> tuple[float, float, float, float]:
@@ -742,7 +957,7 @@ def _reviewed_region_bbox(
     )
 
 
-def _has_usable_line_evidence(region: StructureRegion) -> bool:
+def _has_usable_line_evidence(region: StructureRegion | StructureSegment) -> bool:
     return any(
         fragment.geometry_word_count > 0
         and (fragment.alignment_coverage or 0.0) >= 0.5
@@ -779,13 +994,14 @@ def _synthetic_region_lines(
         LinePlacement(
             text="".join(chunk.text for chunk in line_chunks),
             bbox=(x0, y0 + index * line_height, x1, y0 + (index + 1) * line_height),
+            chunks=line_chunks,
         )
         for index, line_chunks in enumerate(wrapped_chunks)
     ]
 
 
 def _region_lines(
-    region: StructureRegion,
+    region: StructureRegion | StructureSegment,
     placements: dict[int, list[WordPlacement]],
     width: float,
     height: float,
@@ -798,6 +1014,13 @@ def _region_lines(
     ] = []
     for chunk in region.chunks:
         word_placements = placements.get(chunk.mcid, [])
+        if not word_placements and not chunk.text.strip() and grouped:
+            # Transformation boundaries can isolate a space into its own chunk.
+            # It has no source word box and belongs to the preceding physical run;
+            # assigning the whole region fallback would collapse every visual line
+            # into one giant rectangle and create false anchor collisions.
+            grouped[-1][0].append(chunk)
+            continue
         boxes = [placement.bbox for placement in word_placements] or [fallback]
         bbox = _union_bbox(boxes)
         line_key = next(
@@ -825,6 +1048,7 @@ def _region_lines(
         LinePlacement(
             text="".join(chunk.text for chunk in chunks),
             bbox=_union_bbox(boxes),
+            chunks=chunks,
         )
         for chunks, boxes, _ in grouped
     ]
@@ -846,6 +1070,251 @@ def _text_advance(text: str, font: AnchorFont) -> int:
     return sum(font.advances.get(ord(character), fallback) for character in text)
 
 
+def _anchor_text_metrics(
+    text: str,
+    bbox: tuple[float, float, float, float],
+    font: AnchorFont,
+) -> tuple[float, float]:
+    """Return font size and horizontal scale used by a direct-text anchor."""
+    x0, y0, x1, y1 = bbox
+    font_size = max(1.0, min(72.0, (y1 - y0) * 0.82))
+    advance_em = max(_text_advance(text, font) / 1000, 0.01)
+    available_width = max(x1 - x0, 0.01)
+    font_size = max(1.0, min(font_size, available_width / advance_em))
+    natural_width = max(advance_em * font_size, 0.01)
+    horizontal_scale = max(
+        10.0,
+        min(1000.0, available_width / natural_width * 100),
+    )
+    return font_size, horizontal_scale
+
+
+def _effective_space_advance(
+    line: LinePlacement,
+    font: AnchorFont,
+) -> float:
+    if " " not in line.text:
+        return float("inf")
+    direct_text = _direct_unicode_text(line.text, font.supported_codepoints)
+    font_size, horizontal_scale = _anchor_text_metrics(
+        direct_text, line.bbox, font
+    )
+    fallback = font.advances.get(ord("?"), 600)
+    space_advance = font.advances.get(ord(" "), fallback) / 1000
+    return space_advance * font_size * horizontal_scale / 100
+
+
+def _widen_dense_logical_line(
+    line: LinePlacement,
+    obstacles: list[LinePlacement],
+    page_width: float,
+    anchor_font: AnchorFont,
+) -> LinePlacement:
+    """Give a dense semantic line more invisible horizontal room when it is safe.
+
+    The structure and Layout BBox continue to describe the printed paragraph. This box
+    is only the placement corridor for its invisible direct-Unicode run, so extending it
+    through otherwise unused page space can preserve explicit word spaces without
+    turning visual wrapping into copy/paste line breaks.
+    """
+    minimum_space_advance = 0.25
+    if _effective_space_advance(line, anchor_font) >= minimum_space_advance:
+        return line
+
+    x0, y0, x1, y1 = line.bbox
+    margin = min(18.0, page_width * 0.03)
+    gap = max(2.0, page_width * 0.005)
+    left_limit = min(x0, margin)
+    right_limit = max(x1, page_width - margin)
+    for other in obstacles:
+        if not _same_visual_line(line.bbox, other.bbox):
+            continue
+        other_x0, _, other_x1, _ = other.bbox
+        if other_x1 <= x0:
+            left_limit = max(left_limit, other_x1 + gap)
+        elif other_x0 >= x1:
+            right_limit = min(right_limit, other_x0 - gap)
+        else:
+            # The original logical boxes already compete. The ordinary collision
+            # fallback must retain their non-overlapping printed fragments.
+            return line
+
+    candidates = [
+        (x0, y0, right_limit, y1),
+        (left_limit, y0, right_limit, y1),
+    ]
+    for bbox in candidates:
+        if bbox[0] >= bbox[2] or bbox == line.bbox:
+            continue
+        widened = LinePlacement(text=line.text, bbox=bbox, chunks=line.chunks)
+        if _effective_space_advance(widened, anchor_font) >= minimum_space_advance:
+            return widened
+    return line
+
+
+def _logical_region_lines(
+    chunks: list[AnchorChunk],
+    lines: list[LinePlacement],
+    placements: dict[int, list[WordPlacement]],
+) -> list[LinePlacement]:
+    """Place one text run per explicit semantic line, ignoring visual wrapping."""
+    if not lines:
+        return []
+    groups: list[list[AnchorChunk]] = []
+    current: list[AnchorChunk] = []
+    for chunk in chunks:
+        current.append(chunk)
+        if "\n" in chunk.text or "\r" in chunk.text:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    if not groups:
+        return []
+
+    fallback = _union_bbox([line.bbox for line in lines])
+    x0, y0, x1, y1 = fallback
+    fallback_height = (y1 - y0) / len(groups)
+    logical_lines: list[LinePlacement] = []
+    for index, group in enumerate(groups):
+        boxes = [
+            placement.bbox
+            for chunk in group
+            for placement in placements.get(chunk.mcid, [])
+        ]
+        bbox = (
+            _union_bbox(boxes)
+            if boxes
+            else (
+                x0,
+                y0 + index * fallback_height,
+                x1,
+                y0 + (index + 1) * fallback_height,
+            )
+        )
+        logical_lines.append(
+            LinePlacement(
+                text="".join(chunk.text for chunk in group),
+                bbox=bbox,
+                chunks=group,
+            )
+        )
+    return logical_lines
+
+
+def _anchor_lines_overlap(left: LinePlacement, right: LinePlacement) -> bool:
+    """Whether two invisible direct-text runs would compete in spatial extraction."""
+    if not _same_visual_line(left.bbox, right.bbox):
+        return False
+    horizontal_overlap = min(left.bbox[2], right.bbox[2]) - max(
+        left.bbox[0], right.bbox[0]
+    )
+    narrower_width = max(
+        min(left.bbox[2] - left.bbox[0], right.bbox[2] - right.bbox[0]),
+        0.01,
+    )
+    return horizontal_overlap > max(1.0, narrower_width * 0.05)
+
+
+def _line_layouts_differ(
+    logical: list[LinePlacement], fragment: list[LinePlacement]
+) -> bool:
+    if len(logical) != len(fragment):
+        return True
+    return any(
+        left.text != right.text
+        or any(abs(a - b) > 0.5 for a, b in zip(left.bbox, right.bbox, strict=True))
+        for left, right in zip(logical, fragment, strict=True)
+    )
+
+
+def _colliding_region_pairs(
+    selected_lines: list[list[LinePlacement]],
+) -> list[tuple[int, int]]:
+    collisions: list[tuple[int, int]] = []
+    for left_index, left_lines in enumerate(selected_lines):
+        for right_index in range(left_index + 1, len(selected_lines)):
+            if any(
+                _anchor_lines_overlap(left, right)
+                for left in left_lines
+                for right in selected_lines[right_index]
+            ):
+                collisions.append((left_index, right_index))
+    return collisions
+
+
+def _collision_safe_region_lines(
+    candidates: list[RegionLineCandidate],
+    anchor_font: AnchorFont,
+    page_width: float,
+) -> tuple[list[list[LinePlacement]], set[int]]:
+    """Keep logical de-wrapping unless it creates overlapping invisible runs.
+
+    A logical element can have a non-rectangular footprint when it wraps around another
+    element or shares a printed line with the next element. Collapsing all of its words
+    into their union rectangle makes Acrobat spatially interleave the direct Unicode
+    anchors. In that case, retain the element's structure but place its text at the
+    reviewed physical fragments.
+    """
+    original_lines = [
+        line for candidate in candidates for line in candidate.logical_lines
+    ]
+    selected = [
+        [
+            _widen_dense_logical_line(
+                line,
+                [other for other in original_lines if other is not line],
+                page_width,
+                anchor_font,
+            )
+            for line in candidate.logical_lines
+        ]
+        for candidate in candidates
+    ]
+    fragment_anchored: set[int] = set()
+    for index, candidate in enumerate(candidates):
+        if not _line_layouts_differ(
+            selected[index], candidate.fragment_lines
+        ):
+            continue
+        if any(
+            _effective_space_advance(line, anchor_font) < 0.25
+            for line in selected[index]
+        ):
+            selected[index] = candidate.fragment_lines
+            fragment_anchored.add(index)
+
+    while True:
+        changed = False
+        for left_index, right_index in _colliding_region_pairs(selected):
+            for index in (left_index, right_index):
+                candidate = candidates[index]
+                if index in fragment_anchored or not _line_layouts_differ(
+                    candidate.logical_lines, candidate.fragment_lines
+                ):
+                    continue
+                selected[index] = candidate.fragment_lines
+                fragment_anchored.add(index)
+                changed = True
+        if not changed:
+            break
+
+    unresolved = _colliding_region_pairs(selected)
+    if unresolved:
+        examples = []
+        for left_index, right_index in unresolved[:3]:
+            left = candidates[left_index].element
+            right = candidates[right_index].element
+            examples.append(
+                f"{left.id or left.role.value} overlaps {right.id or right.role.value}"
+            )
+        raise RuntimeError(
+            "Invisible accessibility text runs still overlap after fragment-aware "
+            f"placement: {'; '.join(examples)}"
+        )
+    return selected, fragment_anchored
+
+
 def _anchor_stream(
     region: StructureRegion,
     width: float,
@@ -858,47 +1327,97 @@ def _anchor_stream(
         bbox = _reviewed_region_bbox(region, width, height)
         x0, y0, x1, y1 = bbox
         pdf_y = height - y1
+        mcid = region.segments[0].mcid
         return (
-            f"/Figure <</MCID {region.mcid}>> BDC\n"
+            f"/Figure <</MCID {mcid}>> BDC\n"
             "q\n"
             f"{x0:.3f} {pdf_y:.3f} {x1 - x0:.3f} {y1 - y0:.3f} re W n\n"
             "Q\n"
             "EMC\n"
         ).encode("ascii")
 
-    lines = _region_lines(region, placements, width, height)
-    exact_text = "".join(chunk.text for chunk in region.chunks)
-    direct_lines = [
-        _direct_unicode_text(line.text, anchor_font.supported_codepoints)
-        for line in lines
-    ]
-    properties = f"/MCID {region.mcid}"
-    if "".join(direct_lines) != exact_text:
-        actual_text = b"\xfe\xff" + exact_text.encode("utf-16-be")
-        properties += f" /ActualText <{actual_text.hex().upper()}>"
-    commands: list[str] = [
-        f"{ROLE_NAMES[region.element.role]} <<{properties}>> BDC",
-        "BT",
-    ]
-    for line, direct_text in zip(lines, direct_lines, strict=True):
+    if (
+        len(region.segments) == 1
+        and region.segments[0].formula_alt is None
+        and region.segments[0].line_index == -1
+    ):
+        segment = region.segments[0]
+        exact_text = "".join(chunk.text for chunk in region.chunks)
+        direct_lines = [
+            _direct_unicode_text(line.text, anchor_font.supported_codepoints)
+            for line in region.lines
+        ]
+        properties = f"/MCID {segment.mcid}"
+        use_actual_text = "".join(direct_lines) != exact_text
+        actual_text_properties = ""
+        if use_actual_text:
+            actual_text = b"\xfe\xff" + exact_text.encode("utf-16-be")
+            actual_text_properties = (
+                f"/Span <</ActualText <{actual_text.hex().upper()}>>> BDC"
+            )
+        commands = [
+            f"{ROLE_NAMES[region.element.role]} <<{properties}>> BDC",
+        ]
+        if actual_text_properties:
+            commands.append(actual_text_properties)
+        commands.append("BT")
+        for line, direct_text in zip(region.lines, direct_lines, strict=True):
+            x0, y0, x1, y1 = line.bbox
+            font_size, horizontal_scale = _anchor_text_metrics(
+                direct_text, line.bbox, anchor_font
+            )
+            baseline = height - y1 + font_size * 0.18
+            encoded = direct_text.encode("utf-16-be")
+            commands.append(
+                f"/A11yAnchor {font_size:.3f} Tf 3 Tr {horizontal_scale:.3f} Tz "
+                f"1 0 0 1 {x0:.3f} {baseline:.3f} Tm "
+                f"<{encoded.hex().upper()}> Tj"
+            )
+        commands.append("ET")
+        if actual_text_properties:
+            commands.append("EMC")
+        commands.append("EMC")
+        return ("\n".join(commands) + "\n").encode("ascii")
+
+    commands: list[str] = ["BT"]
+    for line_index, line in enumerate(region.lines):
+        direct_line = _direct_unicode_text(
+            line.text, anchor_font.supported_codepoints
+        )
         x0, y0, x1, y1 = line.bbox
-        font_size = max(1.0, min(72.0, (y1 - y0) * 0.82))
-        advance_em = max(_text_advance(direct_text, anchor_font) / 1000, 0.01)
-        available_width = max(x1 - x0, 0.01)
-        font_size = max(1.0, min(font_size, available_width / advance_em))
-        natural_width = max(advance_em * font_size, 0.01)
-        horizontal_scale = max(
-            10.0,
-            min(1000.0, available_width / natural_width * 100),
+        font_size, horizontal_scale = _anchor_text_metrics(
+            direct_line, line.bbox, anchor_font
         )
         baseline = height - y1 + font_size * 0.18
-        encoded = direct_text.encode("utf-16-be")
         commands.append(
             f"/A11yAnchor {font_size:.3f} Tf 3 Tr {horizontal_scale:.3f} Tz "
-            f"1 0 0 1 {x0:.3f} {baseline:.3f} Tm "
-            f"<{encoded.hex().upper()}> Tj"
+            f"1 0 0 1 {x0:.3f} {baseline:.3f} Tm"
         )
-    commands.extend(["ET", "EMC"])
+        for segment in (
+            item for item in region.segments if item.line_index == line_index
+        ):
+            exact_text = "".join(chunk.text for chunk in segment.chunks)
+            direct_text = _direct_unicode_text(
+                exact_text, anchor_font.supported_codepoints
+            )
+            properties = f"/MCID {segment.mcid}"
+            if direct_text != exact_text:
+                actual_text = b"\xfe\xff" + exact_text.encode("utf-16-be")
+                properties += f" /ActualText <{actual_text.hex().upper()}>"
+            content_role = (
+                Name("/Formula")
+                if segment.formula_alt
+                else ROLE_NAMES[region.element.role]
+            )
+            encoded = direct_text.encode("utf-16-be")
+            commands.extend(
+                [
+                    f"{content_role} <<{properties}>> BDC",
+                    f"<{encoded.hex().upper()}> Tj",
+                    "EMC",
+                ]
+            )
+    commands.append("ET")
     return ("\n".join(commands) + "\n").encode("ascii")
 
 
@@ -946,19 +1465,78 @@ def _make_role_element(
     width: float,
     height: float,
     role_name: pikepdf.Name | None = None,
-) -> pikepdf.Object:
+) -> tuple[pikepdf.Object, list[pikepdf.Object]]:
     element = region.element
+    simple_content = (
+        len(region.segments) == 1 and region.segments[0].formula_alt is None
+    )
     role_element = pdf.make_indirect(
         Dictionary(
             Type=Name.StructElem,
             S=role_name or ROLE_NAMES[element.role],
             P=parent,
             Pg=page_obj,
-            K=region.mcid,
+            K=(region.segments[0].mcid if simple_content else Array()),
         )
     )
+    mcid_parents: list[pikepdf.Object] = []
     if element.role == ElementRole.FIGURE:
         role_element[Name.Alt] = String(element.alt_text or "")
+    elif region.fragment_anchored and simple_content:
+        # Preserve the de-wrapped semantic string for viewers that honor
+        # structure-level replacement text while direct Unicode remains aligned
+        # to the non-overlapping visual fragments for spatial extractors.
+        role_element[Name.ActualText] = String(
+            "".join(chunk.text for chunk in region.chunks)
+        )
+
+    if simple_content:
+        mcid_parents.append(role_element)
+    else:
+        for formula_index, grouped_segments in groupby(
+            region.segments, key=lambda segment: segment.formula_index
+        ):
+            segments = list(grouped_segments)
+            if formula_index is None:
+                for segment in segments:
+                    role_element[Name.K].append(segment.mcid)
+                    mcid_parents.append(role_element)
+                continue
+            formula_content = (
+                segments[0].mcid
+                if len(segments) == 1
+                else Array([segment.mcid for segment in segments])
+            )
+            formula = pdf.make_indirect(
+                Dictionary(
+                    Type=Name.StructElem,
+                    S=Name("/Formula"),
+                    P=role_element,
+                    Pg=page_obj,
+                    K=formula_content,
+                    Alt=String(segments[0].formula_alt or ""),
+                )
+            )
+            formula_boxes = [
+                placement.bbox
+                for segment in segments
+                for chunk in segment.chunks
+                for placement in placements.get(chunk.mcid, [])
+            ] or [_reviewed_region_bbox(segments[0], width, height)]
+            formula[Name.A] = Dictionary(
+                O=Name.Layout,
+                BBox=Array(
+                    [
+                        round(min(box[0] for box in formula_boxes), 3),
+                        round(height - max(box[3] for box in formula_boxes), 3),
+                        round(max(box[2] for box in formula_boxes), 3),
+                        round(height - min(box[1] for box in formula_boxes), 3),
+                    ]
+                ),
+            )
+            role_element[Name.K].append(formula)
+            mcid_parents.extend([formula] * len(segments))
+
     boxes = (
         [_reviewed_region_bbox(region, width, height)]
         if element.role == ElementRole.FIGURE or not _has_usable_line_evidence(region)
@@ -980,7 +1558,7 @@ def _make_role_element(
                 ]
             ),
         )
-    return role_element
+    return role_element, mcid_parents
 
 
 def _placement_bbox(
@@ -1009,6 +1587,8 @@ def compile_tagged_pdf(
     output: Path,
     plan: DocumentPlan,
     geometry_source: Path | None = None,
+    base_geometry_label: str = "ocr",
+    candidate_geometry_label: str = "native",
     declare_pdfua: bool = False,
 ) -> list[str]:
     base_words = _extract_ocr_words(source)
@@ -1021,12 +1601,8 @@ def compile_tagged_pdf(
         plan,
         base_words,
         candidate_words,
-        primary_label=(
-            "native"
-            if geometry_source and geometry_source.resolve() == source.resolve()
-            else "ocr"
-        ),
-        candidate_label="native",
+        primary_label=base_geometry_label,
+        candidate_label=candidate_geometry_label,
     )
     with pikepdf.Pdf.open(source) as pdf:
         anchor_font = _make_anchor_font(pdf, plan)
@@ -1038,15 +1614,27 @@ def compile_tagged_pdf(
 
         parent_tree_entries = Array()
         plan_by_page = {page.page_number: page for page in plan.pages}
+        sanitized_xobjects: set[tuple[int, int]] = set()
+        next_annotation_parent = len(pdf.pages)
 
         for page_index, page in enumerate(pdf.pages):
             page_plan = plan_by_page.get(page_index + 1)
             if page_plan is None:
                 continue
 
-            original_contents = _as_contents_array(page.obj.get(Name.Contents))
-            artifact_start = Stream(pdf, b"q\n/Artifact BMC\n")
-            artifact_end = Stream(pdf, b"EMC\nQ\n")
+            _strip_form_xobject_marking(page.Resources, sanitized_xobjects)
+            original_contents = _source_content_without_marking(pdf, page)
+            # Keep the source's visible page operators intact while preventing their
+            # untagged text from duplicating the reviewed semantic anchor layer in
+            # ordinary text extraction. A single-space ActualText replacement is
+            # ignored by token extractors while still being honored by Poppler.
+            artifact_start = pdf.make_indirect(
+                Stream(
+                    pdf,
+                    b"q\n/Artifact BMC\n/Span <</ActualText <FEFF0020>>> BDC\n",
+                )
+            )
+            artifact_end = pdf.make_indirect(Stream(pdf, b"EMC\nEMC\nQ\n"))
             width = float(page.mediabox[2]) - float(page.mediabox[0])
             height = float(page.mediabox[3]) - float(page.mediabox[1])
             _ensure_anchor_font(page, anchor_font)
@@ -1078,24 +1666,119 @@ def compile_tagged_pdf(
                     derived_bbox = _placement_bbox(chunks, placements, width, height)
                     if derived_bbox:
                         element.bbox = derived_bbox
-            regions_by_element: list[list[StructureRegion]] = []
-            next_region_mcid = 0
+            candidates_by_element: list[list[RegionLineCandidate]] = []
             for element, chunks in zip(
                 page_plan.elements, chunks_by_element, strict=True
             ):
-                element_regions = []
+                element_candidates = []
                 for _, region_chunks, region_fragments in _element_structure_regions(
                     element, chunks
                 ):
-                    element_regions.append(
-                        StructureRegion(
+                    region_shell = StructureRegion(
+                        element=element,
+                        chunks=region_chunks,
+                        fragments=region_fragments,
+                        lines=[],
+                        segments=[],
+                    )
+                    if element.role == ElementRole.FIGURE:
+                        fragment_lines: list[LinePlacement] = []
+                        logical_lines: list[LinePlacement] = []
+                    else:
+                        fragment_lines = _region_lines(
+                            region_shell, placements, width, height
+                        )
+                        logical_lines = _logical_region_lines(
+                            region_chunks, fragment_lines, placements
+                        )
+                    element_candidates.append(
+                        RegionLineCandidate(
                             element=element,
                             chunks=region_chunks,
                             fragments=region_fragments,
-                            mcid=next_region_mcid,
+                            logical_lines=logical_lines,
+                            fragment_lines=fragment_lines,
                         )
                     )
-                    next_region_mcid += 1
+                candidates_by_element.append(element_candidates)
+
+            candidates = [
+                candidate
+                for element_candidates in candidates_by_element
+                for candidate in element_candidates
+            ]
+            selected_lines, fragment_anchored = _collision_safe_region_lines(
+                candidates, anchor_font, width
+            )
+
+            regions_by_element: list[list[StructureRegion]] = []
+            next_region_mcid = 0
+            candidate_index = 0
+            for element_candidates in candidates_by_element:
+                element_regions = []
+                for candidate in element_candidates:
+                    lines = selected_lines[candidate_index]
+                    segments: list[StructureSegment] = []
+                    if candidate.element.role == ElementRole.FIGURE:
+                        segments.append(
+                            StructureSegment(
+                                element=candidate.element,
+                                chunks=candidate.chunks,
+                                fragments=candidate.fragments,
+                                mcid=next_region_mcid,
+                                line_index=0,
+                            )
+                        )
+                        next_region_mcid += 1
+                    else:
+                        has_formula = any(
+                            chunk.formula_index is not None
+                            for chunk in candidate.chunks
+                        )
+                        if not has_formula:
+                            segments.append(
+                                StructureSegment(
+                                    element=candidate.element,
+                                    chunks=candidate.chunks,
+                                    fragments=candidate.fragments,
+                                    mcid=next_region_mcid,
+                                    line_index=-1,
+                                )
+                            )
+                            next_region_mcid += 1
+                        else:
+                            for line_index, line in enumerate(lines):
+                                for formula_index, grouped_chunks in groupby(
+                                    line.chunks, key=lambda chunk: chunk.formula_index
+                                ):
+                                    segment_chunks = list(grouped_chunks)
+                                    segments.append(
+                                        StructureSegment(
+                                            element=candidate.element,
+                                            chunks=segment_chunks,
+                                            fragments=candidate.fragments,
+                                            mcid=next_region_mcid,
+                                            line_index=line_index,
+                                            formula_index=formula_index,
+                                            formula_alt=(
+                                                segment_chunks[0].formula_alt
+                                                if formula_index is not None
+                                                else None
+                                            ),
+                                        )
+                                    )
+                                    next_region_mcid += 1
+                    element_regions.append(
+                        StructureRegion(
+                            element=candidate.element,
+                            chunks=candidate.chunks,
+                            fragments=candidate.fragments,
+                            lines=lines,
+                            segments=segments,
+                            fragment_anchored=candidate_index in fragment_anchored,
+                        )
+                    )
+                    candidate_index += 1
                 regions_by_element.append(element_regions)
             regions = [
                 region
@@ -1103,15 +1786,17 @@ def compile_tagged_pdf(
                 for region in element_regions
             ]
             anchor_streams = [
-                Stream(
-                    pdf,
-                    _anchor_stream(
-                        region,
-                        width,
-                        height,
-                        anchor_font,
-                        placements,
-                    ),
+                pdf.make_indirect(
+                    Stream(
+                        pdf,
+                        _anchor_stream(
+                            region,
+                            width,
+                            height,
+                            anchor_font,
+                            placements,
+                        ),
+                    )
                 )
                 for region in regions
             ]
@@ -1152,7 +1837,7 @@ def compile_tagged_pdf(
                     )
                     active_list[Name.K].append(list_item)
                     for region in element_regions:
-                        list_body = _make_role_element(
+                        list_body, owners = _make_role_element(
                             pdf,
                             region,
                             page.obj,
@@ -1163,12 +1848,12 @@ def compile_tagged_pdf(
                             role_name=Name.LBody,
                         )
                         list_item[Name.K].append(list_body)
-                        mcid_parents.append(list_body)
+                        mcid_parents.extend(owners)
                     continue
 
                 active_list = None
                 for region in element_regions:
-                    role_element = _make_role_element(
+                    role_element, owners = _make_role_element(
                         pdf,
                         region,
                         page.obj,
@@ -1178,13 +1863,35 @@ def compile_tagged_pdf(
                         height,
                     )
                     document[Name.K].append(role_element)
-                    mcid_parents.append(role_element)
+                    mcid_parents.extend(owners)
 
             parent_tree_entries.extend([page_index, Array(mcid_parents)])
+            for annotation in page.obj.get(Name.Annots, []):
+                if str(annotation.get(Name.Subtype, "")) != "/Link":
+                    continue
+                description = _link_description(annotation)
+                annotation[Name.Contents] = String(description)
+                annotation[Name.StructParent] = next_annotation_parent
+                object_reference = pdf.make_indirect(
+                    Dictionary(Type=Name.OBJR, Obj=annotation, Pg=page.obj)
+                )
+                link = pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.StructElem,
+                        S=Name.Link,
+                        P=document,
+                        Pg=page.obj,
+                        K=object_reference,
+                        Alt=String(description),
+                    )
+                )
+                document[Name.K].append(link)
+                parent_tree_entries.extend([next_annotation_parent, link])
+                next_annotation_parent += 1
 
         parent_tree = pdf.make_indirect(Dictionary(Nums=parent_tree_entries))
         structure_root[Name.ParentTree] = parent_tree
-        structure_root[Name.ParentTreeNextKey] = len(pdf.pages)
+        structure_root[Name.ParentTreeNextKey] = next_annotation_parent
 
         pdf.Root[Name.StructTreeRoot] = structure_root
         pdf.Root[Name.MarkInfo] = Dictionary(Marked=True)
@@ -1216,5 +1923,8 @@ def compile_tagged_pdf(
                         )
 
         output.parent.mkdir(parents=True, exist_ok=True)
-        pdf.save(output, min_version="1.4", linearize=True)
+        # The validated release stage performs final linearization. Keeping the
+        # intermediate save ordinary avoids qpdf object renumbering edge cases in
+        # source PDFs with large, densely shared object graphs.
+        pdf.save(output, force_version="1.7")
     return geometry_sources

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from dataclasses import dataclass
 from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator
 
 
 SCHEMA_VERSION = 5
+PLAN_REVISION = 8
 
 
 class ElementRole(str, Enum):
@@ -23,6 +26,7 @@ class RemediationMode(str, Enum):
     AUTO = "auto"
     PASS_THROUGH = "pass-through"
     NATIVE = "native"
+    HYBRID = "hybrid"
     FACSIMILE = "facsimile"
     UNSUPPORTED = "unsupported"
 
@@ -155,6 +159,26 @@ class TextTransformation(BaseModel):
     source_end: int | None = Field(default=None, ge=0)
     target_start: int | None = Field(default=None, ge=0)
     target_end: int | None = Field(default=None, ge=0)
+
+
+@dataclass(frozen=True)
+class FormulaSpan:
+    """Notation retained for extraction plus its reviewed spoken alternative."""
+
+    start: int
+    end: int
+    text: str
+    alt_text: str
+
+
+def math_extraction_text(text: str) -> str:
+    """Normalize mathematical alphabet styling that PDF text engines lose."""
+    return "".join(
+        unicodedata.normalize("NFKC", character)
+        if 0x1D400 <= ord(character) <= 0x1D7FF
+        else character
+        for character in text
+    )
 
 
 class ConfidenceProfile(BaseModel):
@@ -343,6 +367,80 @@ class PageElement(BaseModel):
     @property
     def semantic_text(self) -> str:
         return self.alt_text or "" if self.role == ElementRole.FIGURE else self.accessible_text
+
+    def _exact_transformations(self) -> list[TextTransformation] | None:
+        ordered = sorted(
+            self.transformations,
+            key=lambda item: (
+                -1 if item.source_start is None else item.source_start,
+                -1 if item.source_end is None else item.source_end,
+            ),
+        )
+        cursor = 0
+        for item in ordered:
+            if item.source_start is None or item.source_end is None:
+                return None
+            if item.source_start < cursor or item.source_end < item.source_start:
+                return None
+            if self.visible_text[item.source_start : item.source_end] != item.source_text:
+                return None
+            cursor = item.source_end
+        return ordered
+
+    @property
+    def extraction_text(self) -> str:
+        """Text used for search/copy; math notation is not replaced by speech."""
+        if self.role == ElementRole.FIGURE:
+            return ""
+        ordered = self._exact_transformations()
+        if ordered is None:
+            return self.visible_text
+        if not ordered:
+            return self.accessible_text
+        cursor = 0
+        extracted: list[str] = []
+        for item in ordered:
+            source_start = int(item.source_start)
+            source_end = int(item.source_end)
+            extracted.append(self.visible_text[cursor:source_start])
+            extracted.append(
+                math_extraction_text(item.source_text)
+                if item.kind == TransformationKind.FORMULA_SPOKEN_EQUIVALENT
+                else item.replacement_text
+            )
+            cursor = source_end
+        extracted.append(self.visible_text[cursor:])
+        return "".join(extracted)
+
+    @property
+    def formula_spans(self) -> list[FormulaSpan]:
+        """Return exact formula ranges in extraction_text with reviewed speech."""
+        ordered = self._exact_transformations()
+        if ordered is None:
+            return []
+        source_cursor = 0
+        extraction_cursor = 0
+        spans: list[FormulaSpan] = []
+        for item in ordered:
+            source_start = int(item.source_start)
+            source_end = int(item.source_end)
+            extraction_cursor += len(self.visible_text[source_cursor:source_start])
+            if item.kind == TransformationKind.FORMULA_SPOKEN_EQUIVALENT:
+                notation = math_extraction_text(item.source_text)
+                start = extraction_cursor
+                extraction_cursor += len(notation)
+                spans.append(
+                    FormulaSpan(
+                        start=start,
+                        end=extraction_cursor,
+                        text=notation,
+                        alt_text=item.replacement_text,
+                    )
+                )
+            else:
+                extraction_cursor += len(item.replacement_text)
+            source_cursor = source_end
+        return spans
 
     @property
     def text(self) -> str:

@@ -77,22 +77,24 @@ Automatic classification and execution are conservative:
 
 - **Pass-through:** the input already has tags and passes veraPDF PDF/UA-1. It is
   validated and left byte-for-byte unchanged.
-- **Native candidate:** at least 95% of nonblank pages have usable native text and all
-  used fonts are embedded with a reliable encoding. The current batch-safe policy still
-  compiles this as facsimile unless `--native-experimental` is supplied, because the
-  existing native text is not yet incorporated into the new structure tree and ordinary
-  extractors otherwise report it in addition to the semantic anchors.
+- **Native:** at least 95% of nonblank pages have usable native text and all used fonts
+  are embedded with a reliable encoding. The source page objects are preserved.
+- **Hybrid:** the fonts are embedded and reliably encoded but native Unicode coverage is
+  incomplete. OCR supplies evidence and geometry while the source page objects remain
+  the visible compilation base.
 - **Facsimile:** the PDF renders but legacy fonts, mappings, or text extraction make the
   native content unsafe. OCRmyPDF creates an optimized raster base.
 - **Unsupported:** encryption, structural damage, or render failure prevents safe work.
 
-An operator can override the selected mode, and the override is recorded. Experimental
-native mode requires both `--mode native` and `--native-experimental`; the extraction
-compatibility gate still measures the result.
+An operator can override the selected mode, and the override is recorded. The extraction
+compatibility and visual-fidelity gates still measure the result.
 
-Native mode preserves the source page objects. Facsimile mode uses OCRmyPDF with forced
-OCR, 300 DPI oversampling, and conservative image optimization. Lossy JBIG2 substitution
-is not enabled. OCR text is evidence and geometry, not the final transcript.
+Native and hybrid modes preserve the source page objects. Facsimile mode uses OCRmyPDF
+with forced OCR, 300 DPI oversampling, and conservative image optimization. OCRmyPDF may
+continue past a recoverable soft image-rendering error in a malformed legacy source;
+the mandatory source-to-base render comparison still prevents a visually changed base
+from release. Lossy JBIG2 substitution is not enabled. OCR text is evidence and geometry,
+not the final transcript.
 
 Rasterization can implicate WCAG 2.1 criteria 1.4.5 (Images of Text) and 1.4.10
 (Reflow). The evidence matrix therefore leaves facsimile rationale, high magnification,
@@ -129,7 +131,7 @@ rectangular visual block a stable identifier, and records:
 - visible fragments, their normalized boxes, and their evidence references;
 - page flows that own every visual block exactly once in reading order;
 - exact visible and accessible text;
-- declared transformations;
+- declared transformations, including atomic whole-expression formula speech;
 - semantic role and normalized bounding box;
 - four confidence dimensions;
 - native, OCR, model-agreement, and alignment evidence;
@@ -148,11 +150,31 @@ comma-separated roster may still be a list, but ordinary prose with a series rem
 paragraph. Deterministic refinement changes isolated unmarked `LI` entries to `P` so a
 screen reader is not asked to announce a one-item list.
 
+Heading roles describe the visible document's semantic outline rather than its typography.
+A heading must be visible text that introduces the content that follows. The models may split an
+explicit inline section label from its body text when the label has an exact visual fragment, but
+they may not invent an accessibility-only section name for unlabeled content. Short metadata and
+key-value labels remain paragraph content unless they genuinely introduce subsections. `H1`,
+`H2`, and `H3` express nesting rather than font size, and an `H3` requires a real parent `H2`.
+
 Logical elements and visual blocks are deliberately separate. A paragraph that begins
 at the bottom of one column and continues at the top of another remains one `P`, but it
 has two ordered rectangular fragments. A fragment may not span disjoint columns. The
 page flow makes reading order explicit even when global top-to-bottom or left-to-right
 coordinates would interleave independent articles, sidebars, or contents boxes.
+
+The direct-Unicode accessibility layer normally collapses visual wrapping within a logical
+semantic line. If fitting a long logical line inside its narrow printed paragraph box would make
+word spaces too small for reliable extraction, the invisible run first expands into otherwise
+unused horizontal page space. Expansion stays inside the page and stops before any other semantic
+run on the same baseline; the structure element's `/Layout /BBox` continues to describe only the
+true printed paragraph. Before compilation, the resulting run rectangles are compared across
+elements. If de-wrapping would make two invisible runs overlap on the same baseline, or no safe
+corridor can preserve usable word spacing, the affected element is instead anchored fragment by
+fragment at its non-overlapping printed positions while remaining a single structure element.
+Structure-level `ActualText` retains its reviewed de-wrapped string for viewers that honor it. A
+collision that remains after fragment-aware placement blocks compilation rather than allowing
+spatial text extractors to interleave characters.
 If a model returns flow ownership or order inconsistent with its own ordered elements,
 the parser discards only that invalid grouping, derives one flow from semantic element
 and fragment order, and records an informational reading-order finding. Transcription,
@@ -172,7 +194,9 @@ that way; other empty-alt figures remain release-blocking errors.
 
 On the first page, an attributed epigraph is placed after publication and
 volume/issue/date metadata and before the first article heading. Proposal/review prompt
-version 6 states this policy and the title/list policies, and the deterministic refinement applies the same narrow
+version 9 states this policy, the title/list and evidence-based heading policies, the
+atomic inline-formula contract, and the rule that only an unresolved canonical defect
+receives critical severity. The deterministic refinement applies the same narrow ordering
 rule to existing reviewed plans while recording an informational reading-order finding.
 
 Word offsets are computed from the exact accessible string. For each non-whitespace
@@ -199,22 +223,27 @@ It:
 - partitions canonical tokens by their model-reviewed visual fragments;
 - aligns each fragment only to native or OCR words inside that fragment's box;
 - retains OCR/native block and line identifiers through corrected-token alignment;
-- groups corrected tokens into measured visual lines, with a bounded synthetic line
-  layout when a region has no sufficiently aligned source words;
-- emits corrected Unicode text directly in invisible line-level `Tj` strings;
+- groups corrected tokens into measured visual lines for alignment and region geometry,
+  with a bounded synthetic layout when a region has no sufficiently aligned source words;
+- emits corrected Unicode directly as one invisible `Tj` run per explicit semantic line
+  in the canonical transcript, ignoring visual line wrapping inside that semantic line;
 - emits one semantic marked-content sequence and MCID per connected visual region;
 - emits each reviewed visual region as a separate page content stream containing one
   invisible `BT`/`ET` text object;
+- preserves normalized mathematical notation in the copy/search layer while wrapping
+  each exact inline expression in a `/Formula` child with the independently reviewed
+  spoken alternative in `/Alt`; formula and prose segments share the same logical line
+  so Formula boundaries do not introduce extraction breaks;
 - maps tab and newline controls as zero-width Unicode codes so exact joiners remain
   direct text rather than region-wide replacements;
-- uses region-wide `/ActualText` only when the embedded font cannot represent an
+- uses `/ActualText` only as a fallback when the embedded font cannot represent an
   exceptional character;
 - creates headings, figures, and single-block paragraphs directly under `/Document`;
 - groups consecutive list items as `/L` containers with `/LI` and `/LBody` descendants;
 - emits each spatially disjoint region of a multi-block paragraph as a consecutive
   direct `/P` because Acrobat otherwise reverses or loses fragment click targets;
-- stores each region's single same-page MCID as the integer child of its structure
-  element;
+- stores ordinary regions as a single same-page MCID and formula-bearing regions as an
+  ordered mixture of parent-owned text MCIDs and `/Formula` children;
 - represents each meaningful figure with a nonpainting rectangle MCID, structural
   `/Alt`, and `/Layout /BBox` instead of duplicating the description as hidden text;
 - records each text region's actual word-union box as a `/Layout /BBox` attribute;
@@ -224,9 +253,10 @@ It:
 - adds `/Tabs /S`, document language, title, viewer preference, and bookmarks.
 - adds decimal PDF page labels matching the printed pagination.
 
-The region-level MCID with direct line Unicode is an Acrobat compatibility profile, not
-part of the semantic plan. This strategy is recorded in the manifest so another compiler
-profile can be compared later without replanning the document.
+The ordinary region-level MCID, plus inline formula MCIDs inside the same direct Unicode
+line object, is an Acrobat compatibility profile rather than part of the semantic plan.
+This strategy is recorded in the manifest so another compiler profile can be compared
+later without replanning the document.
 
 The visual blocks remain authoritative plan, geometry, and text-object units. They do
 not introduce extra `/Div` or `/Span` structure wrappers. Nearby or overlapping blocks,
@@ -251,10 +281,13 @@ synthetic lines inside that block rather than borrowed from another column. A fu
 weighted aligner may improve difficult formulas and insertions, but global page
 alignment no longer controls anchor placement.
 
-One constrained legacy-repair path remains: a zero-area migrated block may recover its
-box from page words only when at least half of its visible tokens match. The recovered
-word union becomes the new block box, after which ordinary block-local alignment and
-validation apply. Valid reviewed boxes never take this path.
+Constrained evidence-repair paths remain for invalid or visibly shifted fragment boxes.
+A fragment may recover its box from ordered page words only when at least half of its
+visible tokens match. A valid but poorly aligned box may move only to a match with a
+roughly similar footprint, preventing repeated words in unrelated regions from producing
+a page-wide union. A one- or two-token fragment may move only when its exact sequence has
+one unique page occurrence. The recovered word union becomes the new fragment box, after
+which ordinary block-local alignment and validation apply.
 
 ## Validation and Release Gates
 
@@ -268,8 +301,9 @@ The draft deliberately omits the PDF/UA identification metadata. Validation then
 6. Resolves every integer MCID or MCR and decodes direct Type 0 Unicode text, falling
    back to `/ActualText` where explicitly present.
 7. Verifies every ParentTree entry and detects missing, duplicate, or orphan MCIDs.
-8. Requires nonempty text elements and alternate text for figures.
-9. Compares role and exact element text with the canonical plan.
+8. Requires nonempty text elements and alternate text for figures and formulas.
+9. Compares role, exact extractable notation, formula alternatives, and element text
+   with the canonical plan.
 10. Verifies visual-block identifiers, single flow ownership, exact flow order, bounded
     block geometry, and completed block-local alignment evidence.
 11. Reconstructs accessible text from exact transformation source/target spans.
@@ -336,13 +370,16 @@ layouts. Exact results and the changes prompted by failures are recorded in
 
 ## Current Boundaries
 
-The present roles are `DocumentTitle`, `H1`, `H2`, `H3`, `P`, `LI`, and `Figure`. The next
-semantic layer should add a document-level article graph plus captions, table of
-contents entries, formulas, quotations, and references. Explicit artifacts and page
-labels are now implemented.
+The present logical roles are `DocumentTitle`, `H1`, `H2`, `H3`, `P`, `LI`, and `Figure`.
+Inline formula semantics are derived from exact `formula_spoken_equivalent`
+transformations: notation remains available to copy/search while `/Formula` children
+carry spoken alternatives. The next semantic layer should add a document-level article
+graph plus captions, table-of-contents entries, display-math structure, quotations, and
+references. Explicit artifacts and page labels are now implemented.
 
 Other deferred work includes region/line dynamic-programming alignment, PAC automation,
-formal NVDA/JAWS scripts, native image-object tagging, mathematics font fallback, and a
+formal NVDA/JAWS scripts, native image-object tagging, richer PDF/UA-2 math interchange,
+and a
 repeatable full-corpus rebuild harness. An interactive human-remediation stage is
 explicitly out of scope; these additions can extend the saved plan and compiler without
 changing the central independently model-reviewed plan boundary.

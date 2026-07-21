@@ -30,6 +30,7 @@ from pdf_accessibility.models import (
     ReviewSeverity,
     ReviewStatus,
     TextFragment,
+    TextTransformation,
     TransformationKind,
     exact_text_tokens,
 )
@@ -38,6 +39,11 @@ from pdf_accessibility.preflight import SourceMetadata, read_source_metadata
 from pdf_accessibility.evidence import diagnostics_for, evidence_from_packet
 from pdf_accessibility.extract import PagePacket
 from pdf_accessibility.planner import (
+    HEADING_GUIDANCE,
+    PLANNER_PROMPT_VERSION,
+    PROPOSAL_SYSTEM_PROMPT,
+    REVIEW_PROMPT_VERSION,
+    REVIEW_SYSTEM_PROMPT,
     _validated_page_plan,
     ModelPageElement,
     ModelPagePlan,
@@ -81,6 +87,17 @@ def element(
 
 
 class NormalizePlanTests(unittest.TestCase):
+    def test_heading_guidance_requires_visible_semantic_hierarchy(self) -> None:
+        self.assertEqual(PLANNER_PROMPT_VERSION, "proposal-v8")
+        self.assertEqual(REVIEW_PROMPT_VERSION, "review-v9")
+        for prompt in (PROPOSAL_SYSTEM_PROMPT, REVIEW_SYSTEM_PROMPT):
+            self.assertIn(HEADING_GUIDANCE, prompt)
+            normalized = " ".join(prompt.split())
+            self.assertIn("heading must be visible text", normalized)
+            self.assertIn("short key-value or metadata label", normalized)
+            self.assertIn("H3 only for a subsection genuinely nested", normalized)
+            self.assertIn("keep the content as P rather than synthesizing one", normalized)
+
     def test_search_title_candidate_is_separate_from_printed_title(self) -> None:
         page = PagePlan(
             page_number=1,
@@ -276,6 +293,13 @@ class CompileTests(unittest.TestCase):
             document = pymupdf.open()
             page = document.new_page()
             page.insert_text((72, 72), "Visible archival text")
+            page.insert_link(
+                {
+                    "kind": pymupdf.LINK_URI,
+                    "from": pymupdf.Rect(72, 55, 190, 78),
+                    "uri": "https://example.edu/archive",
+                }
+            )
             document.save(source)
             document.close()
 
@@ -313,7 +337,7 @@ class CompileTests(unittest.TestCase):
             self.assertTrue(report["structure_matches_plan"])
             self.assertTrue(report["block_plan_valid"])
             self.assertFalse(report["declares_pdfua"])
-            self.assertFalse(report["extraction_compatible"])
+            self.assertTrue(report["extraction_compatible"])
             self.assertTrue(report["transformations_valid"])
             self.assertTrue(report["source_visual_fidelity_ok"])
             extracted = subprocess.run(
@@ -323,12 +347,23 @@ class CompileTests(unittest.TestCase):
                 check=True,
             ).stdout
             self.assertIn("Visible archival text", extracted)
+            self.assertEqual(extracted.count("Visible archival text"), 20)
             self.assertNotIn("Historical diagram", extracted)
             with pikepdf.Pdf.open(output) as pdf:
                 self.assertTrue(pdf.Root.MarkInfo.Marked)
                 self.assertEqual(str(pdf.Root.Lang), "en-US")
                 self.assertEqual(str(pdf.pages[0].obj.Tabs), "/S")
                 self.assertIn("/PageLabels", pdf.Root)
+                annotation = pdf.pages[0].Annots[0]
+                self.assertEqual(
+                    str(annotation.Contents),
+                    "Link to https://example.edu/archive",
+                )
+                self.assertGreaterEqual(int(annotation.StructParent), 1)
+                structure_roles = [
+                    str(item.S) for item in pdf.Root.StructTreeRoot.K.K
+                ]
+                self.assertIn("/Link", structure_roles)
                 anchor_font = pdf.pages[0].Resources.Font.A11yAnchor
                 self.assertEqual(str(anchor_font.Subtype), "/Type0")
                 self.assertIn("/ToUnicode", anchor_font)
@@ -366,11 +401,176 @@ class CompileTests(unittest.TestCase):
                 self.assertNotIn(b" Tj", anchor_streams[2])
                 self.assertNotIn(b"/ActualText", b"".join(anchor_streams))
                 self.assertEqual(
-                    pdf.pages[0].Contents[0].read_bytes(), b"q\n/Artifact BMC\n"
+                    pdf.pages[0].Contents[0].read_bytes(),
+                    b"q\n/Artifact BMC\n/Span <</ActualText <FEFF0020>>> BDC\n",
                 )
                 self.assertEqual(
-                    pdf.pages[0].Contents[-4].read_bytes(), b"EMC\nQ\n"
+                    pdf.pages[0].Contents[-4].read_bytes(), b"EMC\nEMC\nQ\n"
                 )
+
+    def test_anchor_font_preserves_circle_glyphs_in_extracted_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "Full and open circles")
+            document.save(source)
+            document.close()
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Circle glyphs",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[
+                            element(
+                                ElementRole.P,
+                                "● ○ Full and open circles",
+                            )
+                        ],
+                    )
+                ],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+            extracted = subprocess.run(
+                ["pdftotext", "-raw", "-enc", "UTF-8", str(output), "-"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+
+            self.assertIn("● ○ Full and open circles", extracted)
+
+    def test_inline_formula_preserves_notation_and_has_spoken_alt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=700, height=300)
+            document.save(source)
+            document.close()
+            visible = (
+                "Abstract: Given a permutation p = p₁p₂...pₙ ∈ 𝔖ₙ, a set of "
+                "indices i₁ < i₂ < ... < iₖ defines an increasing subsequence if "
+                "pᵢ₁ < pᵢ₂ < ... < pᵢₖ."
+            )
+            accessible = (
+                "Abstract: Given a permutation p equals p subscript 1 p subscript 2 "
+                "ellipsis p subscript n, an element of the symmetric group S subscript n, "
+                "a set of indices i subscript 1 is less than i subscript 2 is less than "
+                "ellipsis is less than i subscript k defines an increasing subsequence if "
+                "p subscript i subscript 1 is less than p subscript i subscript 2 is less "
+                "than ellipsis is less than p subscript i subscript k."
+            )
+            formulae = [
+                (
+                    "p = p₁p₂...pₙ ∈ 𝔖ₙ",
+                    "p equals p subscript 1 p subscript 2 ellipsis p subscript n, "
+                    "an element of the symmetric group S subscript n",
+                ),
+                (
+                    "i₁ < i₂ < ... < iₖ",
+                    "i subscript 1 is less than i subscript 2 is less than ellipsis "
+                    "is less than i subscript k",
+                ),
+                (
+                    "pᵢ₁ < pᵢ₂ < ... < pᵢₖ",
+                    "p subscript i subscript 1 is less than p subscript i subscript 2 "
+                    "is less than ellipsis is less than p subscript i subscript k",
+                ),
+            ]
+            paragraph = PageElement(
+                role=ElementRole.P,
+                visible_text=visible,
+                accessible_text=accessible,
+                transformations=[
+                    TextTransformation(
+                        kind=TransformationKind.FORMULA_SPOKEN_EQUIVALENT,
+                        source_text=notation,
+                        replacement_text=spoken,
+                        rationale="Reviewed spoken mathematics.",
+                    )
+                    for notation, spoken in formulae
+                ],
+                bbox=[50, 50, 950, 500],
+            )
+            canonicalize_transformations(paragraph)
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Permutation abstract",
+                pages=[PagePlan(page_number=1, elements=[paragraph])],
+            )
+
+            extraction_text = visible.replace("𝔖", "S")
+            extracted_formulae = [
+                formulae[0][0].replace("𝔖", "S"),
+                formulae[1][0],
+                formulae[2][0],
+            ]
+            self.assertEqual(paragraph.extraction_text, extraction_text)
+            self.assertEqual(
+                [item.text for item in paragraph.formula_spans],
+                extracted_formulae,
+            )
+            self.assertEqual(transformation_errors(plan), [])
+
+            compile_tagged_pdf(source, output, plan)
+            extracted = subprocess.run(
+                ["pdftotext", "-raw", "-enc", "UTF-8", str(output), "-"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertIn("p = p₁p₂...pₙ ∈ Sₙ", extracted)
+            self.assertIn("pᵢ₁ < pᵢ₂ < ... < pᵢₖ", extracted)
+            self.assertNotIn("subscript", extracted)
+            self.assertEqual(extracted.strip(), extraction_text)
+
+            serialized = serialize_structure_tree(output)
+            self.assertEqual(compare_structure_to_plan(serialized, plan), [])
+            formula_blocks = [
+                block
+                for block in serialized["elements"][0]["blocks"]
+                if block["role"] == "/Formula"
+            ]
+            self.assertEqual(
+                [block["text"] for block in formula_blocks],
+                extracted_formulae,
+            )
+            self.assertEqual(
+                [block["alt_text"] for block in formula_blocks],
+                [item[1] for item in formulae],
+            )
+
+    def test_structure_comparison_uses_emitted_nonempty_regions(self) -> None:
+        paragraph = PageElement(
+            role=ElementRole.P,
+            visible_fragments=[
+                TextFragment(text="“", bbox=[0, 0, 20, 20]),
+                TextFragment(text="First ", bbox=[100, 100, 400, 120]),
+                TextFragment(text="second", bbox=[100, 121, 400, 140]),
+                TextFragment(text="”", bbox=[900, 900, 920, 920]),
+            ],
+            visible_text="“First second”",
+            accessible_text="“First second”",
+            bbox=[0, 0, 920, 920],
+        )
+        plan = DocumentPlan(
+            source_file="source.pdf",
+            title="Quoted paragraph",
+            pages=[PagePlan(page_number=1, elements=[paragraph])],
+        )
+        serialized = {
+            "errors": [],
+            "elements": [
+                {"role": "/P", "text": "“First ", "alt_text": ""},
+                {"role": "/P", "text": "second”", "alt_text": ""},
+            ],
+        }
+
+        self.assertEqual(compare_structure_to_plan(serialized, plan), [])
 
     def test_fragment_alignment_is_local_when_page_words_are_interleaved(self) -> None:
         planned = PageElement(
@@ -557,17 +757,282 @@ class CompileTests(unittest.TestCase):
 
             with pikepdf.Pdf.open(output) as pdf:
                 anchor_stream = pdf.pages[0].Contents[-1].read_bytes()
-                self.assertEqual(anchor_stream.count(b" Tj\n"), 2)
+                self.assertEqual(anchor_stream.count(b" Tj\n"), 1)
                 self.assertNotIn(b"/ActualText", anchor_stream)
-                self.assertEqual(anchor_stream.count(b" Tm "), 2)
+                self.assertEqual(anchor_stream.count(b" Tm "), 1)
+            extracted = subprocess.run(
+                ["pdftotext", "-raw", "-enc", "UTF-8", str(output), "-"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertEqual(
+                extracted.strip(),
+                "First semantic line Second semantic line",
+            )
             with pymupdf.open(output) as document:
                 self.assertEqual(
                     [word[4] for word in document[0].get_text("words", sort=False)],
                     ["First", "semantic", "line", "Second", "semantic", "line"],
                 )
+                self.assertEqual(
+                    len(
+                        {
+                            (word[5], word[6])
+                            for word in document[0].get_text("words", sort=False)
+                        }
+                    ),
+                    1,
+                )
             self.assertEqual(
                 compare_structure_to_plan(serialize_structure_tree(output), plan), []
             )
+
+    def test_dense_paragraph_uses_collision_free_page_width_without_hard_wraps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            geometry = Path(temp) / "geometry.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=612, height=792)
+            document.save(source)
+            document.close()
+
+            visual_lines = [
+                "Persi Diaconis studied violin at Juilliard and magic with Dai Vernon, who has been called the greatest",
+                "magician in the US. Then he took a degree in mathematics at College of the City of New York and",
+                "doctorate in statistics at Harvard. He is Mary Sunseri Professor of Statistics and Professor of",
+                "Mathematics at Stanford University. He has held visiting positions at AT&T Bell Labs, Harvard, MIT, and",
+                "Cornell. He was a recipient of a MacArthur Grant. For more information, see the condensed version of",
+                "the entry from Mathematical People, edited by Albers and Alexanderson, 1985.",
+            ]
+            exact = " ".join(visual_lines)
+            document = pymupdf.open()
+            page = document.new_page(width=612, height=792)
+            for index, text in enumerate(visual_lines):
+                page.insert_text((182, 172 + index * 7), text, fontsize=4.25)
+            document.save(geometry)
+            document.close()
+
+            paragraph = PageElement(
+                role=ElementRole.P,
+                visible_text=exact,
+                accessible_text=exact,
+                bbox=[295, 205, 680, 275],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Dense paragraph",
+                pages=[PagePlan(page_number=1, elements=[paragraph])],
+            )
+
+            compile_tagged_pdf(source, output, plan, geometry_source=geometry)
+
+            with pikepdf.Pdf.open(output) as pdf:
+                anchor_stream = pdf.pages[0].Contents[-1].read_bytes()
+                self.assertEqual(anchor_stream.count(b" Tj\n"), 1)
+                self.assertNotIn(b"/ActualText", anchor_stream)
+                paragraph_element = pdf.Root.StructTreeRoot.K.K[0]
+                self.assertNotIn("/ActualText", paragraph_element)
+            extracted = subprocess.run(
+                ["pdftotext", "-raw", "-enc", "UTF-8", str(output), "-"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertEqual(extracted.strip(), exact)
+            self.assertEqual(
+                compare_structure_to_plan(serialize_structure_tree(output), plan), []
+            )
+
+    def test_logical_lines_preserve_semantic_breaks_not_visual_wraps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            geometry = Path(temp) / "geometry.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=400, height=250)
+            document.save(source)
+            document.close()
+            document = pymupdf.open()
+            page = document.new_page(width=400, height=250)
+            for y, text in enumerate(
+                [
+                    "2.3 Example Author",
+                    "Title: A long title that",
+                    "wraps in the source",
+                    "Abstract: First sentence continues",
+                    "without a semantic break.",
+                ],
+                start=1,
+            ):
+                page.insert_text((30, y * 35), text)
+            document.save(geometry)
+            document.close()
+            exact = (
+                "2.3 Example Author\n"
+                "Title: A long title that wraps in the source\n"
+                "Abstract: First sentence continues without a semantic break."
+            )
+            item = PageElement(
+                role=ElementRole.LI,
+                visible_text=exact,
+                accessible_text=exact,
+                bbox=[50, 50, 950, 900],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Logical lines",
+                pages=[PagePlan(page_number=1, elements=[item])],
+            )
+
+            compile_tagged_pdf(source, output, plan, geometry_source=geometry)
+
+            extracted = subprocess.run(
+                ["pdftotext", "-raw", "-enc", "UTF-8", str(output), "-"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertEqual(extracted.strip(), exact)
+            with pikepdf.Pdf.open(output) as pdf:
+                stream = pdf.pages[0].Contents[-1].read_bytes()
+                self.assertEqual(stream.count(b" Tj\n"), 3)
+                self.assertEqual(stream.count(b" Tm "), 3)
+            self.assertEqual(
+                compare_structure_to_plan(serialize_structure_tree(output), plan), []
+            )
+
+    def test_interleaved_list_items_use_nonoverlapping_fragment_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            geometry = Path(temp) / "geometry.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=400, height=200)
+            document.save(source)
+            document.close()
+
+            introduction = "Two additional items:"
+            first_top = "(i) Friday in Hall A:"
+            first_bottom = "First topic"
+            second = "(ii) Saturday in Hall B: Second topic"
+            document = pymupdf.open()
+            page = document.new_page(width=400, height=200)
+            page.insert_text((30, 70), introduction)
+            page.insert_text((160, 70), first_top)
+            page.insert_text((30, 95), first_bottom)
+            page.insert_text((120, 95), second)
+            document.save(geometry)
+            document.close()
+
+            introduction_element = PageElement(
+                role=ElementRole.P,
+                visible_fragments=[
+                    TextFragment(text=introduction, bbox=[75, 280, 385, 370])
+                ],
+                visible_text=introduction,
+                accessible_text=introduction,
+                bbox=[75, 280, 385, 370],
+            )
+            first_item = PageElement(
+                role=ElementRole.LI,
+                visible_fragments=[
+                    TextFragment(text=first_top, bbox=[400, 280, 690, 370]),
+                    TextFragment(text=first_bottom, bbox=[75, 405, 250, 495]),
+                ],
+                visible_text=f"{first_top} {first_bottom}",
+                accessible_text=f"{first_top} {first_bottom}",
+                bbox=[75, 280, 690, 495],
+            )
+            second_item = PageElement(
+                role=ElementRole.LI,
+                visible_fragments=[
+                    TextFragment(text=second, bbox=[300, 405, 845, 495])
+                ],
+                visible_text=second,
+                accessible_text=second,
+                bbox=[300, 405, 845, 495],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Interleaved items",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[introduction_element, first_item, second_item],
+                    )
+                ],
+            )
+
+            compile_tagged_pdf(source, output, plan, geometry_source=geometry)
+
+            with pikepdf.Pdf.open(output) as pdf:
+                streams = [item.read_bytes() for item in pdf.pages[0].Contents]
+                list_streams = [stream for stream in streams if b"/LBody" in stream]
+                self.assertEqual(len(list_streams), 2)
+                self.assertEqual(list_streams[0].count(b" Tj\n"), 2)
+                self.assertEqual(list_streams[1].count(b" Tj\n"), 1)
+                structure_children = list(pdf.Root.StructTreeRoot.K.K)
+                list_items = list(structure_children[1].K)
+                first_body = list_items[0].K[0]
+                self.assertEqual(
+                    str(first_body.ActualText),
+                    f"{first_top} {first_bottom}",
+                )
+
+            serialized = serialize_structure_tree(output)
+            self.assertEqual(compare_structure_to_plan(serialized, plan), [])
+            extracted = subprocess.run(
+                ["pdftotext", "-raw", "-enc", "UTF-8", str(output), "-"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            expected = " ".join(
+                [introduction, first_top, first_bottom, second]
+            )
+            self.assertEqual(" ".join(extracted.split()), expected)
+
+            with pymupdf.open(output) as document:
+                words = document[0].get_text("words", sort=True)
+                first_word = next(word for word in words if word[4] == "First")
+                second_marker = next(word for word in words if word[4] == "(ii)")
+                self.assertLess(first_word[2], second_marker[0])
+
+    def test_unresolvable_anchor_overlap_blocks_compilation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            geometry = Path(temp) / "geometry.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=300, height=150)
+            document.save(source)
+            document.close()
+            document = pymupdf.open()
+            page = document.new_page(width=300, height=150)
+            page.insert_text((30, 60), "Same place")
+            document.save(geometry)
+            document.close()
+            duplicated = [
+                PageElement(
+                    role=ElementRole.P,
+                    visible_text="Same place",
+                    accessible_text="Same place",
+                    bbox=[100, 300, 400, 500],
+                )
+                for _ in range(2)
+            ]
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Overlap",
+                pages=[PagePlan(page_number=1, elements=duplicated)],
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "Invisible accessibility text runs still overlap"
+            ):
+                compile_tagged_pdf(source, output, plan, geometry_source=geometry)
 
     def test_low_agreement_title_uses_reviewed_region_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -713,6 +1178,101 @@ class CompileTests(unittest.TestCase):
         self.assertTrue(0 <= top < bottom <= 1000)
         self.assertEqual(planned.visible_fragments[0].alignment_coverage, 1)
 
+    def test_valid_but_shifted_fragment_box_is_repaired_from_page_text(self) -> None:
+        planned = PageElement(
+            role=ElementRole.P,
+            visible_fragments=[
+                TextFragment(
+                    text="Mark three non-collinear points",
+                    bbox=[100, 500, 600, 600],
+                )
+            ],
+            visible_text="Mark three non-collinear points",
+            accessible_text="Mark three non-collinear points",
+            bbox=[100, 500, 600, 600],
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+
+        _align_element_fragments(
+            planned,
+            chunks,
+            [
+                (20.0, 20.0, 35.0, 30.0, "Mark"),
+                (37.0, 20.0, 52.0, 30.0, "three"),
+                (54.0, 20.0, 85.0, 30.0, "non-collinear"),
+                (87.0, 20.0, 105.0, 30.0, "points"),
+                (10.0, 50.0, 25.0, 60.0, "unrelated"),
+                (27.0, 50.0, 40.0, 60.0, "line"),
+            ],
+            width=120,
+            height=100,
+            geometry_source="native",
+        )
+
+        left, top, right, bottom = planned.visible_fragments[0].bbox
+        self.assertLess(top, 400)
+        self.assertLess(left, right)
+        self.assertLess(top, bottom)
+        self.assertEqual(planned.visible_fragments[0].alignment_coverage, 1)
+
+    def test_shifted_box_repair_rejects_scattered_common_words(self) -> None:
+        original_bbox = [300.0, 50.0, 700.0, 90.0]
+        planned = PageElement(
+            role=ElementRole.DOCUMENT_TITLE,
+            visible_fragments=[
+                TextFragment(
+                    text="14th Ramanujan Colloquium",
+                    bbox=list(original_bbox),
+                )
+            ],
+            visible_text="14th Ramanujan Colloquium",
+            accessible_text="14th Ramanujan Colloquium",
+            bbox=list(original_bbox),
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+
+        _align_element_fragments(
+            planned,
+            chunks,
+            [
+                (30.0, 5.0, 40.0, 8.0, "14th"),
+                (30.0, 50.0, 55.0, 54.0, "Ramanujan"),
+                (30.0, 90.0, 60.0, 94.0, "Colloquium"),
+            ],
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertEqual(planned.visible_fragments[0].bbox, original_bbox)
+
+    def test_shifted_box_repair_accepts_unique_short_fragment(self) -> None:
+        planned = PageElement(
+            role=ElementRole.P,
+            visible_fragments=[
+                TextFragment(text="Athens.", bbox=[300, 500, 400, 550])
+            ],
+            visible_text="Athens.",
+            accessible_text="Athens.",
+            bbox=[300, 500, 400, 550],
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+
+        _align_element_fragments(
+            planned,
+            chunks,
+            [
+                (20.0, 20.0, 35.0, 30.0, "Athens."),
+                (20.0, 70.0, 35.0, 80.0, "unrelated"),
+            ],
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertLess(planned.visible_fragments[0].bbox[1], 400)
+        self.assertEqual(planned.visible_fragments[0].alignment_coverage, 1)
+
     def test_structure_serializer_preserves_exact_text_and_detects_parent_tree_damage(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"
@@ -763,6 +1323,11 @@ class CompileTests(unittest.TestCase):
             document.new_page()
             document.save(draft)
             document.close()
+            pdf2_draft = Path(temp) / "draft-v2.pdf"
+            with pikepdf.Pdf.open(draft) as pdf:
+                pdf.save(pdf2_draft, force_version="2.0")
+            draft = pdf2_draft
+            self.assertTrue(draft.read_bytes().startswith(b"%PDF-2.0"))
 
             plan = DocumentPlan(
                 source_file="source.pdf",
@@ -788,6 +1353,7 @@ class CompileTests(unittest.TestCase):
                 datetime(2026, 7, 19, 12, 30, tzinfo=timezone.utc),
                 source_metadata,
             )
+            self.assertTrue(candidate.read_bytes().startswith(b"%PDF-1.7"))
 
             with pikepdf.Pdf.open(draft) as pdf:
                 with pdf.open_metadata() as metadata:
@@ -833,6 +1399,36 @@ class CompileTests(unittest.TestCase):
                 plan,
                 source_metadata=source_metadata,
             )
+            self.assertTrue(report["remediation_metadata_valid"])
+
+    def test_absent_xmp_description_remains_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            draft = Path(temp) / "draft.pdf"
+            candidate = Path(temp) / "candidate.pdf"
+            document = pymupdf.open()
+            document.new_page()
+            document.save(draft)
+            document.close()
+            plan = DocumentPlan(
+                source_file="source.pdf",
+                source_sha256="a" * 64,
+                title="Test",
+                pages=[],
+            )
+            source_metadata = SourceMetadata()
+            add_pdfua_declaration(
+                draft,
+                candidate,
+                plan,
+                source_metadata=source_metadata,
+            )
+            report = validate_output(
+                draft,
+                candidate,
+                plan,
+                source_metadata=source_metadata,
+            )
+            self.assertEqual(report["remediation_metadata"]["description"], "")
             self.assertTrue(report["remediation_metadata_valid"])
 
 
@@ -930,7 +1526,7 @@ class PlanMigrationTests(unittest.TestCase):
 
 
 class RecentTitleTests(unittest.TestCase):
-    def test_local_history_is_created_and_keeps_recent_unique_titles(self) -> None:
+    def test_local_history_preserves_all_titles_and_loads_recent_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / ".recent-titles.json"
 
@@ -939,14 +1535,55 @@ class RecentTitleTests(unittest.TestCase):
             remember_title(path, "First Document", limit=2)
             remember_title(path, "Second Document", limit=2)
             remember_title(path, "First Document", limit=2)
+            remember_title(path, "Third Document", limit=2)
 
             self.assertEqual(
                 load_recent_titles(path, limit=2),
-                ["Second Document", "First Document"],
+                ["First Document", "Third Document"],
+            )
+            self.assertEqual(
+                load_recent_titles(path),
+                ["Second Document", "First Document", "Third Document"],
+            )
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["titles"],
+                ["Second Document", "First Document", "Third Document"],
             )
 
 
 class DeterministicRefinementTests(unittest.TestCase):
+    def test_formula_mapping_tolerates_layout_line_breaks(self) -> None:
+        visible = "The estimate assumes 1 << M\n<< N."
+        spoken = "one is much less than M, which is much less than N"
+        paragraph = PageElement(
+            role=ElementRole.P,
+            visible_text=visible,
+            accessible_text=f"The estimate assumes {spoken}.",
+            transformations=[
+                TextTransformation(
+                    kind=TransformationKind.FORMULA_SPOKEN_EQUIVALENT,
+                    source_text="1 << M << N",
+                    replacement_text=spoken,
+                    rationale="Reviewed spoken inequality.",
+                )
+            ],
+            bbox=[100, 100, 900, 200],
+        )
+
+        canonicalize_transformations(paragraph)
+
+        formulae = paragraph.formula_spans
+        self.assertEqual(len(formulae), 1)
+        self.assertEqual(formulae[0].text, "1 << M\n<< N")
+        self.assertEqual(formulae[0].alt_text, spoken)
+        self.assertEqual(paragraph.extraction_text, visible)
+        self.assertFalse(
+            any(
+                finding.severity == ReviewSeverity.CRITICAL
+                for finding in paragraph.findings
+            )
+        )
+
     def test_numeric_hyphen_to_spoken_range_is_approved(self) -> None:
         heading = element(
             ElementRole.H3,
@@ -990,6 +1627,45 @@ class DeterministicRefinementTests(unittest.TestCase):
         self.assertEqual(
             trailing.transformations[0].kind,
             TransformationKind.INLINE_LIST_SEPARATOR_OMISSION,
+        )
+
+        pipe = element(ElementRole.LI, "Alexa Panos |")
+        pipe.accessible_text = "Alexa Panos"
+        canonicalize_transformations(pipe)
+        self.assertEqual(
+            pipe.transformations[0].kind,
+            TransformationKind.INLINE_LIST_SEPARATOR_OMISSION,
+        )
+
+    def test_visual_pipe_can_be_normalized_to_spoken_punctuation(self) -> None:
+        caption = element(ElementRole.P, "Node Chair | Steelcase")
+        caption.accessible_text = "Node Chair, Steelcase"
+
+        canonicalize_transformations(caption)
+
+        self.assertEqual(
+            caption.transformations[0].kind,
+            TransformationKind.STRUCTURAL_SEPARATOR_NORMALIZATION,
+        )
+
+    def test_undeclared_math_rewrite_is_reverted_and_blocks_release(self) -> None:
+        paragraph = PageElement(
+            role=ElementRole.P,
+            visible_text="Let p = p₁p₂...pₙ.",
+            accessible_text="Let p equals p subscript 1 pₙ.",
+            bbox=[100, 100, 900, 200],
+        )
+
+        canonicalize_transformations(paragraph)
+
+        self.assertEqual(paragraph.accessible_text, paragraph.visible_text)
+        self.assertEqual(paragraph.transformations, [])
+        self.assertTrue(
+            any(
+                finding.severity == ReviewSeverity.CRITICAL
+                and finding.category == FindingCategory.FORMULA
+                for finding in paragraph.findings
+            )
         )
 
     def test_reviewer_confirmed_ornament_is_a_declared_omission(self) -> None:
@@ -1051,6 +1727,44 @@ class DeterministicRefinementTests(unittest.TestCase):
             self.assertEqual(resolved.severity, ReviewSeverity.INFO)
             self.assertEqual(resolved.category, FindingCategory.MODEL_DISAGREEMENT)
             self.assertTrue(resolved.chosen.startswith("Resolved in canonical plan:"))
+
+    def test_resolved_first_model_geometry_is_informational(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page()
+            document.save(source)
+            document.close()
+            finding = ReviewFinding(
+                severity=ReviewSeverity.CRITICAL,
+                category=FindingCategory.GEOMETRY,
+                message=(
+                    "The first model placed table-cell fragments substantially to the "
+                    "right of their printed columns. Canonical geometry now follows "
+                    "the visible columns."
+                ),
+                chosen="Use image-derived table columns with native row evidence.",
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Program",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[element(ElementRole.P, "Program")],
+                        findings=[finding],
+                    )
+                ],
+            )
+
+            refine_document_plan(source, plan)
+
+            resolved = plan.pages[0].findings[0]
+            self.assertEqual(resolved.severity, ReviewSeverity.INFO)
+            self.assertEqual(
+                resolved.chosen,
+                "Resolved: canonical geometry is normalized and evidence-derived.",
+            )
 
     def test_resolved_image_alignment_disagreement_is_informational(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1305,7 +2019,7 @@ class DeterministicRefinementTests(unittest.TestCase):
                 plan.pages[0].artifacts[0].reason, ArtifactReason.WRITING_LINE
             )
 
-    def test_moves_reviewed_empty_alt_flourish_to_artifacts(self) -> None:
+    def test_moves_reviewed_empty_alt_decoration_to_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"
             document = pymupdf.open()
@@ -1315,12 +2029,12 @@ class DeterministicRefinementTests(unittest.TestCase):
             flourish = PageElement(
                 role=ElementRole.FIGURE,
                 alt_text=None,
-                bbox=[900, 900, 940, 920],
+                bbox=[0, 0, 1000, 100],
                 findings=[
                     ReviewFinding(
                         severity=ReviewSeverity.INFO,
                         category=FindingCategory.DECORATION,
-                        message="The small flourish is decorative.",
+                        message="The page-wide banner is decorative.",
                         chosen="Retain as an unlabelled decorative figure.",
                     )
                 ],
@@ -1399,6 +2113,28 @@ class DeterministicRefinementTests(unittest.TestCase):
                 bbox=[100, 500, 900, 600],
                 review_status=ReviewStatus.MODEL_REVIEWED,
             )
+            marked_heading = PageElement(
+                role=ElementRole.H2,
+                visible_text="* ATRIUM ROOM",
+                accessible_text="* ATRIUM ROOM",
+                bbox=[100, 650, 900, 700],
+                review_status=ReviewStatus.MODEL_REVIEWED,
+                findings=[
+                    ReviewFinding(
+                        severity=ReviewSeverity.WARNING,
+                        category=FindingCategory.TRANSCRIPTION,
+                        message="The reviewed heading omits its visual marker.",
+                        chosen="ATRIUM ROOM",
+                    )
+                ],
+            )
+            marked_list_item = PageElement(
+                role=ElementRole.LI,
+                visible_text="- seating group 1",
+                accessible_text="seating group 1",
+                bbox=[100, 750, 900, 800],
+                review_status=ReviewStatus.MODEL_REVIEWED,
+            )
             plan = DocumentPlan(
                 source_file=source.name,
                 title="Sample",
@@ -1406,7 +2142,13 @@ class DeterministicRefinementTests(unittest.TestCase):
                     PagePlan(
                         page_number=1,
                         coordinate_space=CoordinateSpace.NORMALIZED,
-                        elements=[dehyphenated, unverified, date_range],
+                        elements=[
+                            dehyphenated,
+                            unverified,
+                            date_range,
+                            marked_heading,
+                            marked_list_item,
+                        ],
                     )
                 ],
             )
@@ -1417,12 +2159,30 @@ class DeterministicRefinementTests(unittest.TestCase):
                 dehyphenated.transformations[0].kind,
                 TransformationKind.LINE_BREAK_DEHYPHENATION,
             )
-            self.assertEqual(unverified.transformations[0].kind, TransformationKind.UNVERIFIED)
+            self.assertEqual(unverified.accessible_text, "sucess")
+            self.assertEqual(unverified.transformations, [])
+            self.assertTrue(
+                any(
+                    finding.category == FindingCategory.TRANSFORMATION
+                    and finding.severity == ReviewSeverity.INFO
+                    for finding in unverified.findings
+                )
+            )
             self.assertEqual(date_range.visible_text, "September 15–17, 2006.")
             self.assertEqual(date_range.accessible_text, "September 15 to 17, 2006.")
             self.assertEqual(
                 date_range.transformations[0].kind,
                 TransformationKind.DATE_RANGE_EXPANSION,
+            )
+            self.assertEqual(marked_heading.accessible_text, "ATRIUM ROOM")
+            self.assertEqual(
+                marked_heading.transformations[0].kind,
+                TransformationKind.DECORATIVE_MARKER_OMISSION,
+            )
+            self.assertEqual(marked_list_item.accessible_text, "seating group 1")
+            self.assertEqual(
+                marked_list_item.transformations[0].kind,
+                TransformationKind.DECORATIVE_MARKER_OMISSION,
             )
             self.assertEqual(transformation_errors(plan), [])
 

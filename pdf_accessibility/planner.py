@@ -21,6 +21,7 @@ from .evidence import (
 from .extract import PagePacket
 from .models import (
     SCHEMA_VERSION,
+    PLAN_REVISION,
     DocumentPlan,
     ArtifactReason,
     ArtifactRecord,
@@ -41,10 +42,24 @@ from .models import (
 from .plans import load_document_plan, sha256_file, write_document_plan
 
 
-PLANNER_PROMPT_VERSION = "proposal-v6"
-REVIEW_PROMPT_VERSION = "review-v6"
+PLANNER_PROMPT_VERSION = "proposal-v8"
+REVIEW_PROMPT_VERSION = "review-v9"
+COMPATIBLE_PLANNER_PROMPT_VERSIONS = {PLANNER_PROMPT_VERSION}
+COMPATIBLE_REVIEW_PROMPT_VERSIONS = {REVIEW_PROMPT_VERSION}
 
-PROPOSAL_SYSTEM_PROMPT = """You propose an accessibility transcription and semantic plan for a
+HEADING_GUIDANCE = """Treat heading roles as a semantic outline, not a typography inventory. A
+heading must be visible text that labels the content that follows; never invent
+accessibility-only heading wording or derive a name for an unlabeled section merely to make the
+outline more complete. Do not promote a byline, standalone name, caption, or short key-value or
+metadata label to a heading solely because it is bold, large, isolated, or followed by a value.
+An explicit visible section label may be split from adjacent body text and tagged as a heading
+when its function is unmistakable and its own exact visual fragment can be identified. Use H1 for
+the primary content title, H2 for peer sections under it, and H3 only for a subsection genuinely
+nested beneath the preceding H2. Levels express hierarchy, not font size; do not skip a level or
+use H3 for a collection of fields. When no visible heading exists, keep the content as P rather
+than synthesizing one."""
+
+PROPOSAL_SYSTEM_PROMPT = f"""You propose an accessibility transcription and semantic plan for a
 historical fixed-layout PDF page. The printed page is the historical source of record. Preserve
 its spelling, punctuation, capitalization, names, numbers, formula notation, and authored errors.
 Never silently regularize or correct it.
@@ -57,10 +72,20 @@ date-range spoken expansion, or whitespace normalization. Record every such tran
 text are evidence only and can be corrupt. Always choose a result, preserve visual page order,
 and record uncertainty in findings rather than stopping.
 
-Use DocumentTitle once on the first page; H1 for article titles; H2/H3 for genuine nested
-headings; P for body copy, bylines, quotations, contents entries, captions, and other meaningful
-text; LI for each item in a genuine list; and Figure for meaningful graphics with concise alt
-text. A recipient, participant, officer, or similar explicit roster should use one consecutive LI
+For mathematics, preserve the exact printed Unicode notation in visible_text and supply a clear,
+semantic spoken equivalent in accessible_text. Record each complete inline expression as one
+formula_spoken_equivalent transformation whose source_text is the exact contiguous printed
+expression and whose replacement_text is its complete spoken description. Never decompose a
+formula transformation into character-level or operator-level edits. Prefer mathematical meaning
+such as "the symmetric group S sub n" over visual glyph names such as "blackletter S" when the
+meaning is supported by the page context.
+
+Use DocumentTitle once on the first page for the visible overall document or publication title;
+use P for body copy, bylines, quotations, contents entries, captions, and other meaningful text;
+LI for each item in a genuine list; and Figure for meaningful graphics with concise alt text.
+{HEADING_GUIDANCE}
+
+A recipient, participant, officer, or similar explicit roster should use one consecutive LI
 element per logical item, whether its items are line-separated or compactly comma-separated. Give
 each item only its own printed text and visual fragment. Do not split ordinary prose merely because
 it contains a comma-separated series, and do not create a one-item list solely because a lone name
@@ -90,13 +115,21 @@ available field, keyword-stuff, or make the title long. Recent titles in the use
 and consistency context only; follow relevant examples and ignore unrelated ones. On other pages,
 leave document_title_candidate null."""
 
-REVIEW_SYSTEM_PROMPT = """You are the independent final semantic reviewer for a historical PDF
+REVIEW_SYSTEM_PROMPT = f"""You are the independent final semantic reviewer for a historical PDF
 accessibility plan. The page image and printed content are authoritative. Evidence text may be
 corrupt. Inspect the image and evidence before considering the first model's proposal. Return one
 canonical PagePlan, choosing explicitly among plausible readings. Do not modernize, summarize,
 correct spelling, expand abbreviations, or invent obscured words. Preserve visible wording and
 declare every allowed accessibility-only transformation. Preserve visual page order. Findings,
-including critical findings, are advisories: always choose a canonical result and continue.
+including critical findings, are advisories: always choose a canonical result and continue. Use
+critical severity only for a defect or unresolved uncertainty that remains in the canonical result
+and should block release. If the canonical result resolves an error found in the proposal, record
+that correction as warning or info rather than critical.
+For mathematics, preserve exact printed notation in visible_text, put a semantic spoken
+equivalent in accessible_text, and record every complete inline expression as one atomic
+formula_spoken_equivalent transformation. Never split formula speech into character-level or
+operator-level edits. Prefer mathematical meaning over visual glyph names when context supports
+it.
 Use separate confidence dimensions and log alternatives for names, dates, numbers, URLs,
 formulas, uncertain transcription, roles, geometry, and reading order. Return atomic rectangular
 visible fragments with unique block IDs plus flows that own every block exactly once. Preserve a
@@ -106,7 +139,8 @@ manufacture a list from comma-separated prose or an isolated unmarked entry. On 
 masthead, keep any epigraph or attributed quotation after
 publication and issue metadata and before the first article heading. Independently review the
 page-1 document_title_candidate for concise search-result usefulness and consistency with relevant
-recent titles; it is metadata, not a transcription, and must not be copied into visible text."""
+recent titles; it is metadata, not a transcription, and must not be copied into visible text.
+{HEADING_GUIDANCE}"""
 
 
 class ModelPageElement(BaseModel):
@@ -413,6 +447,10 @@ def _archive(path: Path) -> None:
         path.unlink()
 
 
+def _plan_requires_deterministic_refresh(plan: DocumentPlan) -> bool:
+    return plan.plan_revision < PLAN_REVISION
+
+
 def build_document_plan(
     source: Path,
     packets: list[PagePacket],
@@ -441,6 +479,7 @@ def build_document_plan(
             in {ReviewStatus.MODEL_REVIEWED, ReviewStatus.MANUAL_MODIFIED}
             and requested_pages <= existing_pages
             and not force_review
+            and not _plan_requires_deterministic_refresh(existing_plan)
         ):
             return existing_plan
         legacy_pages = {page.page_number: page for page in existing_plan.pages}
@@ -477,7 +516,8 @@ def build_document_plan(
             saved_proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
             if (
                 saved_proposal.get("schema_version") != SCHEMA_VERSION
-                or saved_proposal.get("prompt_version") != PLANNER_PROMPT_VERSION
+                or saved_proposal.get("prompt_version")
+                not in COMPATIBLE_PLANNER_PROMPT_VERSIONS
             ):
                 _archive(proposal_path)
         if proposal_path.exists():
@@ -499,36 +539,39 @@ def build_document_plan(
             )
 
     pending = [number for number in sorted(packet_by_page) if number not in proposals]
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = {
-            executor.submit(
-                propose_page,
-                client,
-                planner_model,
-                planner_reasoning,
-                packet_by_page[number],
-                evidence_by_page[number],
-                recent_titles,
-            ): number
-            for number in pending
-        }
-        for future in as_completed(futures):
-            number = futures[future]
-            proposal, response_id = future.result()
-            proposals[number] = (proposal, response_id)
-            _write_once(
-                page_dir / f"{number:04d}.proposal.json",
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "source_sha256": source_hash,
-                    "model": planner_model,
-                    "reasoning_effort": planner_reasoning,
-                    "response_id": response_id,
-                    "prompt_version": PLANNER_PROMPT_VERSION,
-                    "proposal": proposal.model_dump(mode="json"),
-                },
-            )
-            print(f"proposed page {number}/{len(packets)}")
+    batch_size = max(1, workers)
+    for offset in range(0, len(pending), batch_size):
+        batch = pending[offset : offset + batch_size]
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = {
+                executor.submit(
+                    propose_page,
+                    client,
+                    planner_model,
+                    planner_reasoning,
+                    packet_by_page[number],
+                    evidence_by_page[number],
+                    recent_titles,
+                ): number
+                for number in batch
+            }
+            for future in as_completed(futures):
+                number = futures[future]
+                proposal, response_id = future.result()
+                proposals[number] = (proposal, response_id)
+                _write_once(
+                    page_dir / f"{number:04d}.proposal.json",
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "source_sha256": source_hash,
+                        "model": planner_model,
+                        "reasoning_effort": planner_reasoning,
+                        "response_id": response_id,
+                        "prompt_version": PLANNER_PROMPT_VERSION,
+                        "proposal": proposal.model_dump(mode="json"),
+                    },
+                )
+                print(f"proposed page {number}/{len(packets)}")
 
     reviews: dict[int, PageReview] = {}
     for number in sorted(packet_by_page):
@@ -539,7 +582,8 @@ def build_document_plan(
             saved_review = json.loads(review_path.read_text(encoding="utf-8"))
             if (
                 saved_review.get("schema_version") != SCHEMA_VERSION
-                or saved_review.get("prompt_version") != REVIEW_PROMPT_VERSION
+                or saved_review.get("prompt_version")
+                not in COMPATIBLE_REVIEW_PROMPT_VERSIONS
             ):
                 _archive(review_path)
         if review_path.exists():
@@ -549,63 +593,65 @@ def build_document_plan(
             reviews[number] = PageReview.model_validate(data.get("review", data))
 
     pending_reviews = [number for number in sorted(packet_by_page) if number not in reviews]
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = {}
-        for number in pending_reviews:
-            proposal, _ = proposals[number]
-            diagnostics = diagnostics_for(proposal, evidence_by_page[number])
-            futures[
-                executor.submit(
-                    review_page,
-                    client,
-                    reviewer_model,
-                    reviewer_reasoning,
-                    packet_by_page[number],
-                    evidence_by_page[number],
-                    diagnostics,
-                    proposal,
-                    recent_titles,
+    for offset in range(0, len(pending_reviews), batch_size):
+        batch = pending_reviews[offset : offset + batch_size]
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = {}
+            for number in batch:
+                proposal, _ = proposals[number]
+                diagnostics = diagnostics_for(proposal, evidence_by_page[number])
+                futures[
+                    executor.submit(
+                        review_page,
+                        client,
+                        reviewer_model,
+                        reviewer_reasoning,
+                        packet_by_page[number],
+                        evidence_by_page[number],
+                        diagnostics,
+                        proposal,
+                        recent_titles,
+                    )
+                ] = (number, diagnostics)
+            for future in as_completed(futures):
+                number, diagnostics = futures[future]
+                decision, response_id = future.result()
+                canonical = decision.canonical_page
+                canonical.page_number = number
+                canonical.review_status = ReviewStatus.MODEL_REVIEWED
+                proposal, proposal_response_id = proposals[number]
+                planner_reviewer_agreement = text_agreement(
+                    "\n".join(element.semantic_text for element in proposal.elements),
+                    "\n".join(element.semantic_text for element in canonical.elements),
                 )
-            ] = (number, diagnostics)
-        for future in as_completed(futures):
-            number, diagnostics = futures[future]
-            decision, response_id = future.result()
-            canonical = decision.canonical_page
-            canonical.page_number = number
-            canonical.review_status = ReviewStatus.MODEL_REVIEWED
-            proposal, proposal_response_id = proposals[number]
-            planner_reviewer_agreement = text_agreement(
-                "\n".join(element.semantic_text for element in proposal.elements),
-                "\n".join(element.semantic_text for element in canonical.elements),
-            )
-            for element in canonical.elements:
-                element.review_status = ReviewStatus.MODEL_REVIEWED
-                element.evidence.native_agreement = diagnostics.proposal_native_agreement
-                element.evidence.ocr_agreement = diagnostics.proposal_ocr_agreement
-                element.evidence.planner_reviewer_agreement = planner_reviewer_agreement
-            review = PageReview(
-                page_number=number,
-                canonical_page=canonical,
-                findings=decision.findings,
-                proposal_model=planner_model,
-                reviewer_model=reviewer_model,
-                proposal_response_id=proposal_response_id,
-                reviewer_response_id=response_id,
-            )
-            reviews[number] = review
-            _write_once(
-                page_dir / f"{number:04d}.review.json",
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "source_sha256": source_hash,
-                    "model": reviewer_model,
-                    "reasoning_effort": reviewer_reasoning,
-                    "response_id": response_id,
-                    "prompt_version": REVIEW_PROMPT_VERSION,
-                    "review": review.model_dump(mode="json"),
-                },
-            )
-            print(f"reviewed page {number}/{len(packets)}")
+                for element in canonical.elements:
+                    element.review_status = ReviewStatus.MODEL_REVIEWED
+                    element.evidence.native_agreement = diagnostics.proposal_native_agreement
+                    element.evidence.ocr_agreement = diagnostics.proposal_ocr_agreement
+                    element.evidence.planner_reviewer_agreement = planner_reviewer_agreement
+                review = PageReview(
+                    page_number=number,
+                    canonical_page=canonical,
+                    findings=decision.findings,
+                    proposal_model=planner_model,
+                    reviewer_model=reviewer_model,
+                    proposal_response_id=proposal_response_id,
+                    reviewer_response_id=response_id,
+                )
+                reviews[number] = review
+                _write_once(
+                    page_dir / f"{number:04d}.review.json",
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "source_sha256": source_hash,
+                        "model": reviewer_model,
+                        "reasoning_effort": reviewer_reasoning,
+                        "response_id": response_id,
+                        "prompt_version": REVIEW_PROMPT_VERSION,
+                        "review": review.model_dump(mode="json"),
+                    },
+                )
+                print(f"reviewed page {number}/{len(packets)}")
 
     pages = normalize_document_pages(
         source, [reviews[number].canonical_page for number in sorted(reviews)]
@@ -618,7 +664,7 @@ def build_document_plan(
         language="en-US",
         pages=pages,
         review_status=ReviewStatus.MODEL_REVIEWED,
-        plan_revision=5,
+        plan_revision=PLAN_REVISION,
     )
     write_document_plan(plan, checkpoint_path)
     return plan

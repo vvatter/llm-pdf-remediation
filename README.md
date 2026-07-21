@@ -45,8 +45,8 @@ models never write PDF instructions directly.
 
 The page-1 review also chooses a concise PDF title with search results and browser tabs
 in mind. A local ignored `.recent-titles.json` file is created automatically and supplies
-a few of that user's recent titles as optional consistency examples; a title is added
-only after its PDF is successfully released.
+that user's accumulated titles as optional consistency examples. A title is added only
+after its PDF is successfully released.
 
 The production workflow is unattended. Uncertain readings are recorded without
 pausing the run, and the second model must still choose a result. Human editing is not a
@@ -81,9 +81,10 @@ automatic fallback to another model.
 
 ## Commands
 
-Preflight classifies pass-through, native-preserving, facsimile, or unsupported mode
-and saves its evidence. Automatic native candidates use facsimile mode by default until
-native content can be tagged without duplicating ordinary text extraction:
+Preflight classifies pass-through, native-preserving, hybrid, facsimile, or unsupported
+mode and saves its evidence. Documents with usable embedded Unicode text and fonts preserve
+their native page content. Hybrid mode uses OCR as advisory evidence while compiling onto
+the untouched source pages; facsimile mode remains available for scanned or unreliable input:
 
 ```sh
 remediate-pdf preflight src/document.pdf
@@ -95,12 +96,12 @@ Run the complete pipeline:
 remediate-pdf run src/document.pdf
 ```
 
-Force facsimile mode when the preflight result has been reviewed. Native mode is an
-explicit experimental path:
+Override the automatic choice when the preflight result has been reviewed:
 
 ```sh
 remediate-pdf run src/document.pdf --mode facsimile
-remediate-pdf run src/document.pdf --mode native --native-experimental
+remediate-pdf run src/document.pdf --mode hybrid
+remediate-pdf run src/document.pdf --mode native
 ```
 
 Re-run model stages explicitly:
@@ -149,7 +150,12 @@ equality, qpdf integrity, every MCID and ParentTree relationship, and an exact
 element-by-element structure-tree transcript. It also proves that exact transformation
 spans reconstruct the accessible text, checks that every visual block has one ordered
 flow owner and block-local geometry, and requires `pdftotext -raw` to agree with the
-semantic transcript without duplication. The selected base is compared with the
+copy/search transcript without duplication. Inline mathematical notation remains
+extractable while each reviewed formula receives a separate spoken alternative in a
+`Formula` structure element. Formula rewrites that cannot be mapped atomically to the
+printed notation block release. Text elements use the explicit semantic line boundaries
+in the reviewed transcript rather than the printed line positions, so ordinary visual
+wrapping does not become hard wrapping in copy/paste. The selected base is compared with the
 original at 72 and 150 DPI, and the final PDF must match that base exactly. Only a
 temporary candidate receives
 `pdfuaid:part=1`. The final accessible filename is published only if veraPDF PDF/UA-1
@@ -165,8 +171,8 @@ brief remediation summary crediting ChatGPT 5.6 Sol. The release gate verifies t
 metadata. The remediation summary and original encoding software are mirrored into PDF
 custom properties so Acrobat exposes them in its Custom document-properties tab.
 
-Model findings, including critical findings, are logged but do not interrupt a batch.
-They remain visible in the anomaly report. NVDA or JAWS testing, Acrobat reflow, and
+Informational and warning findings remain visible in the anomaly report without interrupting
+a batch. Unresolved critical findings withhold release. NVDA or JAWS testing, Acrobat reflow, and
 manual WCAG checks are still needed as external evidence for an institutional
 conformance claim; they do not create an interactive remediation or approval stage.
 

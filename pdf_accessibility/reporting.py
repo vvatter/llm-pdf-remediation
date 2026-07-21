@@ -9,12 +9,27 @@ import json
 from pathlib import Path
 import subprocess
 
+import pymupdf
+
 from .compiler import _find_anchor_font
 from .extract import PagePacket
 from .models import DocumentPlan, FindingCategory, RemediationMode
 from .planner import PLANNER_PROMPT_VERSION, REVIEW_PROMPT_VERSION
 from .plans import plan_sha256, sha256_file
 from .preflight import PreflightReport
+
+
+def _report_image_data_url(packet: PagePacket) -> str:
+    """Make a review-sized JPEG instead of embedding the model's full PNG."""
+    try:
+        encoded = packet.image_data_url.split(",", 1)[1]
+        pixmap = pymupdf.Pixmap(base64.b64decode(encoded))
+        while max(pixmap.width, pixmap.height) > 2000:
+            pixmap.shrink(1)
+        preview = pixmap.tobytes("jpeg", jpg_quality=72)
+        return "data:image/jpeg;base64," + base64.b64encode(preview).decode("ascii")
+    except (IndexError, ValueError, RuntimeError):
+        return packet.image_data_url
 
 
 def _version(command: list[str]) -> str | None:
@@ -115,7 +130,7 @@ def write_anomaly_reports(
         packet = packet_by_page.get(page_number)
         page_plan = plan_by_page.get(page_number)
         image = (
-            f'<img src="{html.escape(packet.image_data_url)}" alt="Rendered page {page_number}">'
+            f'<img src="{html.escape(_report_image_data_url(packet))}" alt="Rendered page {page_number}">'
             if packet
             else ""
         )
@@ -236,7 +251,14 @@ def build_manifest(
     page_artifact_dir: Path | None = None,
     geometry_sources: list[str] | None = None,
 ) -> dict[str, object]:
-    font_path = _find_anchor_font()
+    required_codepoints = {
+        ord(character)
+        for page in plan.pages
+        for element in page.elements
+        for character in element.extraction_text
+        if ord(character) <= 0xFFFF
+    }
+    font_path = _find_anchor_font(required_codepoints)
     page_hashes = [
         hashlib.sha256(base64.b64decode(packet.image_data_url.split(",", 1)[1])).hexdigest()
         for packet in packets
@@ -272,7 +294,8 @@ def build_manifest(
         },
         "responses": responses,
         "ocr": {
-            "force_ocr": preflight.selected_mode == RemediationMode.FACSIMILE,
+            "force_ocr": preflight.selected_mode
+            in {RemediationMode.FACSIMILE, RemediationMode.HYBRID},
             "output_type": "pdf",
             "optimize": 3,
             "jpeg_quality": 88,
@@ -280,9 +303,10 @@ def build_manifest(
             "oversample_dpi": 300,
         },
         "compiler_strategy": {
-            "marked_content_granularity": "visual_region",
-            "unicode_text_strategy": "direct_unicode_per_ocr_line",
-            "actual_text_strategy": "exceptional_region_fallback_only",
+            "marked_content_granularity": "visual_region_with_inline_formula_mcids",
+            "unicode_text_strategy": "one_direct_unicode_run_per_semantic_line",
+            "actual_text_strategy": "exceptional_character_fallback_only",
+            "paragraph_copy_strategy": "canonical_semantic_lines_without_visual_wraps",
             "geometry_alignment": "block_local_with_ocr_line_identity",
             "structure_regions": "direct_visual_regions_integer_mcids",
             "fragmented_paragraph_strategy": "separate_direct_paragraph_regions",
@@ -291,7 +315,8 @@ def build_manifest(
             "content_stream_scope": "visual_region",
             "figure_proxy": "nonpainting_geometry_with_structural_alt",
             "layout_attributes": "word_union_bbox",
-            "parent_tree_granularity": "visual_region",
+            "formula_strategy": "extractable_notation_with_structural_spoken_alt",
+            "parent_tree_granularity": "visual_region_and_inline_formula",
             "target_reader_profile": "acrobat",
         },
         "geometry_sources": geometry_sources or [],

@@ -1152,3 +1152,150 @@ extraction compatibility; qpdf and veraPDF PDF/UA-1 also passed for all nine.
 **Decision:** `llm-pdf-remediation` is the producer of the remediated derivative, not
 the creator or author of its source content. Only a candidate that passes the complete
 release pipeline retains the project provenance marker.
+
+## 2026-07-20: Atomic Inline Mathematics
+
+A 2023 program abstract exposed a semantic failure that the structural gates could not
+detect. The independent review had supplied three correct whole-expression spoken
+alternatives, but deterministic character-level re-diffing fragmented them and retained
+a mixture of speech, raw subscripts, and omitted notation. The released PDF exactly
+matched that corrupted canonical plan, demonstrating that plan self-consistency is not
+proof of mathematical correctness.
+
+Formula transformations are now preserved as exact atomic source/target anchors.
+Undeclared or unmappable mathematical rewrites revert to printed notation and leave a
+critical formula finding that blocks release. New proposal/review prompt version 7 asks
+for one complete transformation per inline expression; compatible version-6 review
+checkpoints remain reusable.
+
+The compiler now separates the two text needs. Copy/search extraction retains normalized
+mathematical notation, including subscripts and operators; mathematical alphabet styling
+that PDF text engines do not preserve reliably is normalized to its semantic base letter
+(for example, blackletter `𝔖ₙ` becomes `Sₙ`). The tag tree places each expression in an
+inline `/Formula` child whose `/Alt` contains the reviewed spoken equivalent. Formula and
+prose MCIDs share the region's line-level invisible text object, so tag boundaries do not
+introduce copy/paste line breaks.
+
+Validation compares formula notation and alternatives exactly, verifies every formula
+MCID and ParentTree owner, and requires Poppler extraction to match the notation-bearing
+transcript. Regression coverage includes the full permutation example, a mathematical
+alphabet character, multiple inline formulas, and an undeclared partial rewrite.
+
+The rebuilt 2023 program passed exact rendering, qpdf, structure, transformation,
+extraction, metadata, and veraPDF PDF/UA-1 gates. Its first abstract now copies as
+`p = p₁p₂...pₙ ∈ Sₙ`, `i₁ < i₂ < ... < iₖ`, and
+`pᵢ₁ < pᵢ₂ < ... < pᵢₖ`, with separate spoken alternatives in the Formula tags.
+
+## 2026-07-20: Logical Paragraph Copy Text
+
+The direct-Unicode line layer deliberately followed measured OCR/native line geometry.
+That made Acrobat paragraph targets clickable but also allowed copy/paste to retain
+every printed line ending even when the reviewed plan identified one natural paragraph.
+
+The first de-wrapping candidate kept those positioned `Tj` strings and added the exact
+canonical transcript in a nested `/Span /ActualText`. Poppler honored that construction,
+the regression suite passed, and the release gates succeeded. The user's PDF viewer did
+not honor it and continued to copy the underlying visual-line strings. This falsified
+the strategy for the actual target environment.
+
+The compiler now emits one direct Unicode text run per *explicit semantic line* in the
+canonical transcript. A paragraph with no intentional newline therefore has one run,
+regardless of how many printed lines it occupies. A combined program entry can retain
+intentional author, mentor, title, and abstract boundaries while ignoring wrapping
+inside its title and abstract. Measured word geometry still determines the region and
+Formula boxes but no longer divides extractable text. `/ActualText` returns to its
+exceptional-character fallback role.
+
+Formula notation and prose share the same logical line while retaining distinct prose
+and inline `/Formula` MCIDs. Spatially disjoint regions and true page crossings remain
+separate because moving semantic text away from the page where it is visibly printed
+would damage location fidelity. In this 2023 program, two abstracts actually cross page
+boundaries: one after `human`, and one at the printed hyphenation `engage-` / `ment.`.
+
+Regression coverage now distinguishes five visual source lines from three intentional
+semantic lines and requires copy extraction to match the canonical boundaries exactly.
+The complete 43-test suite passes. The rebuilt 2023 program passes exact rendering,
+qpdf, structure, transformation, metadata, and veraPDF PDF/UA-1 gates, with exact
+Poppler extraction token agreement and count ratio of `1.0`. Complete titles and
+abstracts within each page now extract without visual hard wraps; the first mathematical
+abstract remains continuous with its Formula alternatives intact.
+
+## 2026-07-20: Evidence-Based Heading Outlines
+
+Two visually different one-page documents exposed inconsistent heading decisions: short field
+labels were plausible candidates for overly deep headings, while unlabeled biographical prose
+tempted the creation of a convenient but invisible section title. Both choices would make the
+assistive-technology outline diverge from the visible document.
+
+Proposal and review prompt version 8 now define headings as visible navigational labels for the
+content that follows. They forbid synthesized accessibility-only headings, distinguish headings
+from bylines, captions, standalone names, and key-value metadata, and require levels to encode
+actual nesting rather than typography. An explicit inline section label may still become a
+heading when it has its own exact visual fragment. Previous prompt checkpoints are intentionally
+incompatible so the revised guidance is applied the next time an existing source is explicitly
+run; no PDFs were rebuilt as part of this change.
+
+## 2026-07-20: Collision-Safe Accessibility Text
+
+An inline list wrapping across two printed lines exposed a viewer-dependent extraction failure.
+The first logical item occupied the right side of one line and the left side of the next, while
+the second item occupied the remainder of that second line. Logical de-wrapping placed both
+complete direct-Unicode items into overlapping rectangles on nearly the same baseline. Preview
+followed content order, but Acrobat spatially interleaved their characters. Poppler extraction
+remained correct, so the existing release gate did not reveal the problem.
+
+The compiler now checks direct-text line rectangles across semantic elements. When logical
+de-wrapping creates a collision, it retains the approved structure but emits the affected text at
+its physical fragments, with structure-level `ActualText` carrying the de-wrapped replacement for
+supporting viewers. If fragment-aware placement cannot resolve the overlap, compilation stops.
+Regression coverage reproduces the L-shaped first item and also requires an irreducible overlap to
+fail. A Maynard candidate built from the existing reviewed plan passed exact structure and
+extraction comparison, visual fidelity, qpdf, metadata validation, and veraPDF PDF/UA-1.
+
+## 2026-07-20: Full One-Page Document Batch Hardening
+
+The first full run of short, visually varied documents exposed three general reliability issues.
+Some malformed legacy image objects produced OCRmyPDF soft-render errors even though the source
+and resulting base remained renderable. OCR now continues past that narrowly recoverable error;
+the unchanged mandatory source-to-base visual comparison remains the release authority.
+
+Several otherwise sound canonical plans also contained valid-looking fragment boxes shifted away
+from their printed text. The compiler may now repair a poorly aligned box from ordered page-text
+evidence. The repair retains a roughly similar footprint so common words scattered across a page
+cannot expand into one false region, and a fragment shorter than three tokens moves only when its
+exact token sequence occurs once on the page. Regression tests cover a genuine shifted paragraph,
+a repeated scattered title, and a unique short fragment.
+
+Review prompt version 9 reserves critical severity for defects or unresolved uncertainty still
+present in the canonical result. Corrections to the first model are warning or informational
+findings instead. Deterministic refinement also recognizes established descriptions of resolved
+proposal geometry and evidence disagreements, preventing a repaired canonical plan from being
+blocked by a stale severity label. Metadata validation now normalizes an absent XMP scalar to an
+empty value instead of the string `None`.
+
+The corpus contained 54 source files representing 53 unique documents; the two Wei inputs were
+byte-identical. All 53 unique releases passed the internal structure, transcript, transformation,
+visual-fidelity, extraction, and metadata gates, plus qpdf integrity and veraPDF PDF/UA-1. The
+complete 51-test regression suite also passed after the batch.
+
+## 2026-07-21: Collision-Free Width for Dense Paragraph Anchors
+
+Two visually similar one-page documents exposed different copy behavior even though each
+biography was correctly represented as one semantic `P` with no explicit newline. The shorter
+biography fit in one direct-Unicode run. Fitting the longer biography inside its narrow printed
+union box reduced its effective word-space width below the extraction-safety threshold, so the
+compiler correctly protected its words but fell back to six visual-line runs. Copy/paste therefore
+retained the printed hard wraps.
+
+Dense logical lines now get one additional placement attempt before physical-line fallback. The
+compiler expands the invisible run rightward, then leftward if needed, inside a page-bounded
+horizontal corridor that does not cross another semantic run on the same baseline. The tagged
+element's `/Layout /BBox` remains the exact visual paragraph box; only the invisible text-placement
+corridor grows. Existing collision detection still restores fragment anchors for interleaved,
+non-rectangular, or genuinely competing layouts.
+
+A temporary reconstruction of the longer paragraph copied as one continuous line, retained an
+identical render at 72, 150, and 300 DPI, and passed qpdf, structure serialization, and veraPDF
+PDF/UA-1. Regression coverage now requires a Diaconis-length paragraph printed across six narrow
+lines to compile as one `Tj` run with exact one-line extraction, while the earlier interleaved-list
+test still requires physical fragment placement. The complete suite now contains 52 passing tests.

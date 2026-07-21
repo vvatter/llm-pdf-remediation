@@ -216,7 +216,7 @@ def inspect_pdf(
                         text_characters=characters,
                         invalid_character_ratio=invalid_ratio,
                         usable_native_text=blank
-                        or (characters >= 50 and invalid_ratio <= 0.005),
+                        or (characters >= 20 and invalid_ratio <= 0.005),
                     )
                 )
                 for xref, extension, font_type, base_font, resource_name, encoding, *_ in page.get_fonts(full=True):
@@ -261,15 +261,22 @@ def inspect_pdf(
             automatic = RemediationMode.PASS_THROUGH
             reasons.append("The existing tagged PDF passes veraPDF PDF/UA-1 validation.")
         else:
-            automatic = (
-                RemediationMode.NATIVE
-                if native_ratio >= 0.95 and fonts_embedded and fonts_unicode
-                else RemediationMode.FACSIMILE
-            )
+            if native_ratio >= 0.95 and fonts_embedded and fonts_unicode:
+                automatic = RemediationMode.NATIVE
+            elif fonts_embedded and fonts_unicode:
+                automatic = RemediationMode.HYBRID
+            else:
+                automatic = RemediationMode.FACSIMILE
             reasons.append("Existing tags are not a validated PDF/UA-1 pass-through candidate.")
     elif native_ratio >= 0.95 and fonts_embedded and fonts_unicode:
         automatic = RemediationMode.NATIVE
         reasons.append("At least 95% of nonblank pages have usable native Unicode text and fonts.")
+    elif fonts_embedded and fonts_unicode:
+        automatic = RemediationMode.HYBRID
+        reasons.append(
+            "Native Unicode text is incomplete; OCR evidence will be combined with "
+            "the preserved source page content."
+        )
     else:
         automatic = RemediationMode.FACSIMILE
         if native_ratio < 0.95:

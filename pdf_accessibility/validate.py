@@ -19,8 +19,8 @@ from .models import (
     SCHEMA_VERSION,
     DocumentPlan,
     ElementRole,
+    ReviewSeverity,
     ReviewStatus,
-    fragment_region_groups,
 )
 from .plans import plan_sha256
 from .preflight import SourceMetadata, read_source_metadata, run_verapdf
@@ -58,6 +58,14 @@ def plan_is_approved(plan: DocumentPlan) -> bool:
         page.review_status in approved
         and all(element.review_status in approved for element in page.elements)
         for page in plan.pages
+    )
+
+
+def critical_finding_count(plan: DocumentPlan) -> int:
+    return sum(
+        finding.severity == ReviewSeverity.CRITICAL
+        for page in plan.pages
+        for finding in [*page.findings, *(item for element in page.elements for item in element.findings)]
     )
 
 
@@ -138,37 +146,42 @@ def _remediation_metadata_status(
     source_metadata: SourceMetadata | None = None,
 ) -> dict[str, object]:
     source_metadata = source_metadata or SourceMetadata()
+
+    def metadata_text(value: object) -> str:
+        """Normalize absent XMP scalar properties to the empty string."""
+        return "" if value is None else str(value)
+
     with pdf.open_metadata(
         set_pikepdf_as_editor=False, update_docinfo=False
     ) as metadata:
         values = {
-            "tool": str(metadata.get(f"{REMEDIATION_PREFIX}:tool", "")),
-            "version": str(metadata.get(f"{REMEDIATION_PREFIX}:version", "")),
-            "remediation_date": str(
+            "tool": metadata_text(metadata.get(f"{REMEDIATION_PREFIX}:tool", "")),
+            "version": metadata_text(metadata.get(f"{REMEDIATION_PREFIX}:version", "")),
+            "remediation_date": metadata_text(
                 metadata.get(f"{REMEDIATION_PREFIX}:remediationDate", "")
             ),
-            "schema_version": str(
+            "schema_version": metadata_text(
                 metadata.get(f"{REMEDIATION_PREFIX}:schemaVersion", "")
             ),
-            "source_sha256": str(
+            "source_sha256": metadata_text(
                 metadata.get(f"{REMEDIATION_PREFIX}:sourceSha256", "")
             ),
-            "canonical_plan_sha256": str(
+            "canonical_plan_sha256": metadata_text(
                 metadata.get(f"{REMEDIATION_PREFIX}:canonicalPlanSha256", "")
             ),
-            "xmp_creator_tool": str(metadata.get("xmp:CreatorTool", "")),
-            "remediation": str(
+            "xmp_creator_tool": metadata_text(metadata.get("xmp:CreatorTool", "")),
+            "remediation": metadata_text(
                 metadata.get(f"{REMEDIATION_PREFIX}:remediation", "")
             ),
-            "original_encoding_software": str(
+            "original_encoding_software": metadata_text(
                 metadata.get(
                     f"{REMEDIATION_PREFIX}:originalEncodingSoftware", ""
                 )
             ),
             "xmp_authors": metadata.get("dc:creator", []) or [],
-            "description": str(metadata.get("dc:description", "")),
-            "xmp_keywords": str(metadata.get("pdf:Keywords", "")),
-            "xmp_creation_date": str(metadata.get("xmp:CreateDate", "")),
+            "description": metadata_text(metadata.get("dc:description", "")),
+            "xmp_keywords": metadata_text(metadata.get("pdf:Keywords", "")),
+            "xmp_creation_date": metadata_text(metadata.get("xmp:CreateDate", "")),
         }
     producer = str(pdf.docinfo.get(Name.Producer, ""))
     creator = str(pdf.docinfo.get(Name.Creator, ""))
@@ -553,6 +566,12 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
                     child_chunks, child_mcrs, descendants = resolve_children(
                         content_item, logical_index
                     )
+                    child_role = str(content_item.get("/S", ""))
+                    child_alt = str(content_item.get("/Alt", ""))
+                    if child_role == "/Formula" and not child_alt.strip():
+                        errors.append(
+                            f"structure element {logical_index} has a Formula child without alternate text"
+                        )
                     attributes = content_item.get("/A", {})
                     bbox = (
                         [float(value) for value in attributes.get("/BBox", [])]
@@ -562,8 +581,9 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
                     blocks.append(
                         {
                             "id": str(content_item.get("/ID", "")),
-                            "role": str(content_item.get("/S", "")),
+                            "role": child_role,
                             "text": "".join(child_chunks),
+                            "alt_text": child_alt,
                             "bbox": bbox,
                             "mcrs": child_mcrs,
                         }
@@ -624,6 +644,8 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
 
         for element in children:
             role = str(element.get("/S", ""))
+            if role == "/Link":
+                continue
             if role != "/L":
                 append_record(element, role)
                 continue
@@ -683,24 +705,22 @@ def compare_structure_to_plan(serialized: dict[str, object], plan: DocumentPlan)
     cursor = 0
     for index, element in enumerate(expected):
         expected_role = EXPECTED_PDF_ROLES[element.role]
-        region_count = 1
-        if element.role == ElementRole.P and len(element.visible_fragments) > 1:
-            groups = fragment_region_groups(element.visible_fragments)
-            if len(groups) > 1:
-                region_count = len(groups)
-                if (
-                    cursor < len(actual)
-                    and actual[cursor]["role"] == expected_role
-                    and actual[cursor]["text"] == element.semantic_text
-                ):
-                    region_count = 1
-        records = actual[cursor : cursor + region_count]
-        cursor += region_count
-        if len(records) != region_count:
-            errors.append(
-                f"element {index} has {len(records)} structure regions; "
-                f"expected {region_count}"
-            )
+        expected_text = "" if element.role == ElementRole.FIGURE else element.extraction_text
+        if element.role == ElementRole.FIGURE:
+            records = actual[cursor : cursor + 1]
+            cursor += len(records)
+        else:
+            records = []
+            accumulated = ""
+            while cursor < len(actual) and accumulated != expected_text:
+                record = actual[cursor]
+                records.append(record)
+                cursor += 1
+                accumulated += str(record["text"])
+                if not expected_text.startswith(accumulated):
+                    break
+        if not records:
+            errors.append(f"element {index} has no structure regions")
             continue
         for region_index, record in enumerate(records):
             if record["role"] != expected_role:
@@ -708,9 +728,31 @@ def compare_structure_to_plan(serialized: dict[str, object], plan: DocumentPlan)
                     f"element {index} region {region_index} role "
                     f"{record['role']} != {expected_role}"
                 )
-        expected_text = "" if element.role == ElementRole.FIGURE else element.semantic_text
         if "".join(str(record["text"]) for record in records) != expected_text:
             errors.append(f"element {index} exact text does not match canonical plan")
+        expected_formulae = element.formula_spans
+        actual_formulae = [
+            block
+            for record in records
+            for block in record.get("blocks", [])
+            if block.get("role") == "/Formula"
+        ]
+        if len(actual_formulae) != len(expected_formulae):
+            errors.append(
+                f"element {index} has {len(actual_formulae)} Formula children; "
+                f"canonical plan requires {len(expected_formulae)}"
+            )
+        for formula_index, (actual_formula, expected_formula) in enumerate(
+            zip(actual_formulae, expected_formulae)
+        ):
+            if actual_formula.get("text") != expected_formula.text:
+                errors.append(
+                    f"element {index} formula {formula_index} notation does not match canonical plan"
+                )
+            if actual_formula.get("alt_text") != expected_formula.alt_text:
+                errors.append(
+                    f"element {index} formula {formula_index} alternate text does not match canonical plan"
+                )
         if (
             element.role == ElementRole.FIGURE
             and records[0]["alt_text"] != (element.alt_text or "")
@@ -771,7 +813,7 @@ def _extraction_compatibility(
         check=False,
     )
     expected_text = "\n".join(
-        element.semantic_text
+        element.extraction_text
         for page in plan.pages
         for element in page.elements
         if element.role != ElementRole.FIGURE
@@ -884,7 +926,7 @@ def add_pdfua_declaration(
         candidate.unlink()
     with pikepdf.Pdf.open(draft) as pdf:
         _apply_remediation_metadata(pdf, plan, remediated_at, source_metadata)
-        pdf.save(candidate, min_version="1.4", linearize=True)
+        pdf.save(candidate, force_version="1.7", linearize=True)
 
 
 def release_pdfua(
@@ -913,6 +955,7 @@ def release_pdfua(
     report["verapdf_report"] = vera_report
     plan_approved = plan_is_approved(plan)
     report["plan_approved"] = plan_approved
+    report["critical_finding_count"] = critical_finding_count(plan)
     machine_ok = all(
         [
             report["visual_match"],
@@ -929,6 +972,7 @@ def release_pdfua(
             report["remediation_metadata_valid"],
             vera_ok is True,
             plan_approved,
+            report["critical_finding_count"] == 0,
         ]
     )
     report["released"] = machine_ok
