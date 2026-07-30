@@ -100,6 +100,8 @@ def run_command(args: argparse.Namespace) -> int:
             "source": str(source),
             "pass_through": True,
             "verapdf_pdfua_ok": preflight.pdfua_valid,
+            "form_accessibility_errors": preflight.form_accessibility_errors,
+            "form_accessibility_policy_ok": not preflight.form_accessibility_errors,
             "released": True,
             "note": "The input PDF was not modified.",
         }

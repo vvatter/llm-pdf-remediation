@@ -33,7 +33,7 @@ foundation release.
 ```text
 source PDF
     |
-    +--> preflight --> pass-through / native / facsimile / unsupported
+    +--> preflight --> pass-through / native / hybrid / facsimile / unsupported
     |
     +--> page image + native evidence + OCR evidence
                     |
@@ -48,7 +48,7 @@ source PDF
                             always chooses a canonical page
                                     |
                                     v
-                           canonical schema-v5 plan
+                           canonical schema-v7 plan
                                     |
                  selected visible base + geometry
                                     |
@@ -75,8 +75,10 @@ font encodings, existing tags, and existing PDF/UA validity.
 
 Automatic classification and execution are conservative:
 
-- **Pass-through:** the input already has tags and passes veraPDF PDF/UA-1. It is
-  validated and left byte-for-byte unchanged.
+- **Pass-through:** the input already has tags, passes veraPDF PDF/UA-1, and passes
+  project policy checks that veraPDF may not enforce. In particular, every AcroForm
+  terminal field must have a meaningful explicit `/TU` accessible name matching its
+  associated `/Form /Alt`. A conforming input is left byte-for-byte unchanged.
 - **Native:** at least 95% of nonblank pages have usable native text and all used fonts
   are embedded with a reliable encoding. The source page objects are preserved.
 - **Hybrid:** the fonts are embedded and reliably encoded but native Unicode coverage is
@@ -125,7 +127,7 @@ source/page hashes are retained in the build record.
 
 ## Canonical Schema
 
-Schema version 5 gives every element a stable `pNNNN-eNNNN` identifier, gives every
+Schema version 7 gives every element a stable `pNNNN-eNNNN` identifier, gives every
 rectangular visual block a stable identifier, and records:
 
 - visible fragments, their normalized boxes, and their evidence references;
@@ -138,6 +140,8 @@ rectangular visual block a stable identifier, and records:
 - findings, alternatives, and chosen readings;
 - review status;
 - deterministic word offsets.
+- complete table coordinates, header scopes, and row/column spans;
+- one reviewed accessible description for every supplied interactive widget.
 
 Page 1 may also carry a reviewed `document_title_candidate`. It is PDF metadata rather
 than printed transcription. The reviewer chooses it for concise usefulness in browser
@@ -149,6 +153,11 @@ elements form a list; headings and paragraphs create explicit list boundaries. A
 comma-separated roster may still be a list, but ordinary prose with a series remains a
 paragraph. Deterministic refinement changes isolated unmarked `LI` entries to `P` so a
 screen reader is not asked to announce a one-item list.
+
+`TH` and `TD` represent genuine two-dimensional tables whose row or column relationships
+carry meaning. Repeated rosters, schedules, rubrics, and similar grids remain tables even
+when their data-entry cells are blank. Deterministic refinement supplies any omitted empty
+`TD` needed for a rectangular PDF/UA grid; it never invents text for a blank cell.
 
 Heading roles describe the visible document's semantic outline rather than its typography.
 A heading must be visible text that introduces the content that follows. The models may split an
@@ -193,8 +202,8 @@ figure is treated as decoration only when the reviewed findings explicitly class
 that way; other empty-alt figures remain release-blocking errors.
 
 On the first page, an attributed epigraph is placed after publication and
-volume/issue/date metadata and before the first article heading. Proposal/review prompt
-version 9 states this policy, the title/list and evidence-based heading policies, the
+volume/issue/date metadata and before the first article heading. The current proposal and
+review prompts state this policy, the title/list/table and evidence-based heading policies, the
 atomic inline-formula contract, and the rule that only an unresolved canonical defect
 receives critical severity. The deterministic refinement applies the same narrow ordering
 rule to existing reviewed plans while recording an informational reading-order finding.
@@ -205,9 +214,9 @@ the next token. Concatenating `text[start:actual_end]` exactly reconstructs punc
 newlines, nonbreaking spaces, and other joiners. This replaces the earlier practice of
 appending a generic space to every word.
 
-Schema-v1 and schema-v4 plans migrate automatically and are marked `legacy_unreviewed`.
-Reviewed schema-v2 and schema-v3 plans retain their approval while their geometry and default
-page flows are migrated.
+Older plans migrate automatically and are marked `legacy_unreviewed` when their saved
+approval is not compatible with the current schema. Compatible reviewed plans retain their
+approval while new geometry, flow, table, and form defaults are migrated.
 Original JSON is backed up. The next ordinary run can use each schema-v1 page as a
 proposal and put it through the independent review stage.
 
@@ -240,6 +249,11 @@ It:
   exceptional character;
 - creates headings, figures, and single-block paragraphs directly under `/Document`;
 - groups consecutive list items as `/L` containers with `/LI` and `/LBody` descendants;
+- groups reviewed table cells into `/Table` and `/TR` containers, with scoped `/TH`, `/TD`,
+  row/column spans, and explicit empty data cells;
+- preserves AcroForm field dictionaries, widget order, values, options, flags, and actions,
+  writes each reviewed accessible name to the terminal field dictionary's `/TU`, and
+  associates each widget with a `/Form` structure element carrying the same `/Alt`;
 - emits each spatially disjoint region of a multi-block paragraph as a consecutive
   direct `/P` because Acrobat otherwise reverses or loses fragment click targets;
 - stores ordinary regions as a single same-page MCID and formula-bearing regions as an
@@ -304,14 +318,18 @@ The draft deliberately omits the PDF/UA identification metadata. Validation then
 8. Requires nonempty text elements and alternate text for figures and formulas.
 9. Compares role, exact extractable notation, formula alternatives, and element text
    with the canonical plan.
-10. Verifies visual-block identifiers, single flow ownership, exact flow order, bounded
+10. Compares table grids, header scopes, and spans and verifies the source/output form
+    field tree, every terminal field `/TU`, every widget's `/Form /Alt`, and their exact
+    agreement with the reviewed canonical description.
+11. Verifies visual-block identifiers, single flow ownership, exact flow order, bounded
     block geometry, and completed block-local alignment evidence.
-11. Reconstructs accessible text from exact transformation source/target spans.
-12. Compares Poppler `pdftotext -raw` tokens with the canonical transcript and rejects
+12. Reconstructs accessible text from exact transformation source/target spans.
+13. Compares Poppler `pdftotext -raw` tokens with the canonical transcript and rejects
     duplicated or substantially missing ordinary extraction.
-13. Samples original-to-base renders at 72 and 150 DPI and requires every page's mean
-    normalized channel difference to be at most 0.052 and material-difference fraction
-    to be at most 0.25.
+14. Samples original-to-base renders at 72 and 150 DPI and requires every page's mean
+    normalized channel difference to be at most 0.060 at 72 DPI and 0.052 at 150 DPI,
+    with material-difference fraction at most 0.25. The slightly wider low-resolution
+    tolerance accommodates raster antialiasing only when the sharper sample also passes.
 
 Only after these checks does a temporary candidate receive `pdfuaid:part=1` and its
 release provenance. The project is recorded as the PDF producer, while misleading
@@ -370,7 +388,8 @@ layouts. Exact results and the changes prompted by failures are recorded in
 
 ## Current Boundaries
 
-The present logical roles are `DocumentTitle`, `H1`, `H2`, `H3`, `P`, `LI`, and `Figure`.
+The present logical roles are `DocumentTitle`, `H1`, `H2`, `H3`, `P`, `LI`, `Figure`,
+`TH`, and `TD`; interactive widgets are represented separately as `/Form` structure elements.
 Inline formula semantics are derived from exact `formula_spoken_equivalent`
 transformations: notation remains available to copy/search while `/Formula` children
 carry spoken alternatives. The next semantic layer should add a document-level article

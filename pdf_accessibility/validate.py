@@ -15,6 +15,7 @@ from pikepdf import Name
 from pikepdf.models.metadata import PdfMetadata
 
 from . import __version__
+from .forms import form_accessibility_errors, form_snapshot
 from .models import (
     SCHEMA_VERSION,
     DocumentPlan,
@@ -48,6 +49,8 @@ EXPECTED_PDF_ROLES = {
     ElementRole.H3: "/H3",
     ElementRole.P: "/P",
     ElementRole.LI: "/LI",
+    ElementRole.TH: "/TH",
+    ElementRole.TD: "/TD",
     ElementRole.FIGURE: "/Figure",
 }
 
@@ -252,6 +255,31 @@ def _render_hashes(path: Path, dpi: int = 120) -> list[str]:
     return hashes
 
 
+_SOURCE_MEAN_TOLERANCE_BY_DPI = {72: 0.06, 150: 0.052}
+_SOURCE_MATERIAL_DIFFERENCE_TOLERANCE = 0.25
+
+
+def _fidelity_within_tolerance(
+    results: dict[str, object], dimensions_match: bool
+) -> bool:
+    if not dimensions_match:
+        return False
+    for dpi, mean_tolerance in _SOURCE_MEAN_TOLERANCE_BY_DPI.items():
+        sample = results.get(str(dpi))
+        if not isinstance(sample, dict):
+            return False
+        mean = sample.get("maximum_page_mean_absolute_channel_difference")
+        fraction = sample.get("maximum_page_sample_fraction_over_16")
+        if (
+            mean is None
+            or fraction is None
+            or float(mean) > mean_tolerance
+            or float(fraction) > _SOURCE_MATERIAL_DIFFERENCE_TOLERANCE
+        ):
+            return False
+    return True
+
+
 def _source_visual_fidelity(reference: Path, selected_base: Path) -> dict[str, object]:
     results: dict[str, object] = {}
     dimensions_match = True
@@ -334,28 +362,16 @@ def _source_visual_fidelity(reference: Path, selected_base: Path) -> dict[str, o
             ),
             "pages": page_metrics,
         }
-    means = [
-        item["maximum_page_mean_absolute_channel_difference"]
-        for item in results.values()
-        if item["maximum_page_mean_absolute_channel_difference"] is not None
-    ]
-    fractions = [
-        item["maximum_page_sample_fraction_over_16"]
-        for item in results.values()
-        if item["maximum_page_sample_fraction_over_16"] is not None
-    ]
-    within_tolerance = bool(
-        dimensions_match
-        and means
-        and max(means) <= 0.052
-        and max(fractions) <= 0.25
-    )
+    within_tolerance = _fidelity_within_tolerance(results, dimensions_match)
     return {
         "dimensions_match": dimensions_match,
         "sampled_dpi": results,
         "thresholds": {
-            "maximum_mean_absolute_channel_difference": 0.052,
-            "maximum_sample_fraction_over_16": 0.25,
+            "maximum_mean_absolute_channel_difference_by_dpi": {
+                str(dpi): tolerance
+                for dpi, tolerance in _SOURCE_MEAN_TOLERANCE_BY_DPI.items()
+            },
+            "maximum_sample_fraction_over_16": _SOURCE_MATERIAL_DIFFERENCE_TOLERANCE,
         },
         "within_tolerance": within_tolerance,
     }
@@ -607,6 +623,12 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
             element: pikepdf.Object,
             role: str,
             container_role: str | None = None,
+            table_row: int | None = None,
+            table_column: int | None = None,
+            header_scope: str | None = None,
+            table_row_span: int = 1,
+            table_column_span: int = 1,
+            allow_empty: bool = False,
         ) -> None:
             element_index = len(records)
             chunks, mcrs, blocks = resolve_children(element, element_index)
@@ -625,7 +647,7 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
                 )
             if role == "/Figure" and not alt.strip():
                 errors.append(f"figure structure element {element_index} has no alternate text")
-            if not text and not (semantic_role == "/Figure" and alt):
+            if not text and not allow_empty and not (semantic_role == "/Figure" and alt):
                 errors.append(f"structure element {element_index} is empty")
             records.append(
                 {
@@ -636,6 +658,11 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
                     "alt_text": alt,
                     "mcrs": mcrs,
                     "blocks": blocks,
+                    "table_row": table_row,
+                    "table_column": table_column,
+                    "header_scope": header_scope,
+                    "table_row_span": table_row_span,
+                    "table_column_span": table_column_span,
                 }
             )
             element_id = str(element.get("/ID", ""))
@@ -644,7 +671,128 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
 
         for element in children:
             role = str(element.get("/S", ""))
-            if role == "/Link":
+            if role in {"/Link", "/Form"}:
+                continue
+            if role == "/Table":
+                table_rows = element.get("/K", [])
+                if isinstance(table_rows, pikepdf.Dictionary):
+                    table_rows = [table_rows]
+                if not table_rows:
+                    errors.append("table structure element has no rows")
+                active_row_spans: dict[int, int] = {}
+                for row_index, table_row in enumerate(table_rows):
+                    if row_index:
+                        active_row_spans = {
+                            column: remaining - 1
+                            for column, remaining in active_row_spans.items()
+                            if remaining > 1
+                        }
+                    if (
+                        not isinstance(table_row, pikepdf.Dictionary)
+                        or str(table_row.get("/S", "")) != "/TR"
+                    ):
+                        errors.append(f"table row {row_index} is not a /TR structure element")
+                        continue
+                    row_parent = table_row.get("/P")
+                    if row_parent is None or row_parent.objgen != element.objgen:
+                        errors.append(f"table row {row_index} has the wrong parent")
+                    cells = table_row.get("/K", [])
+                    if isinstance(cells, pikepdf.Dictionary):
+                        cells = [cells]
+                    if not cells:
+                        errors.append(f"table row {row_index} has no cells")
+                    grid_column = 0
+                    while grid_column in active_row_spans:
+                        grid_column += 1
+                    for cell in cells:
+                        cell_role = (
+                            str(cell.get("/S", ""))
+                            if isinstance(cell, pikepdf.Dictionary)
+                            else ""
+                        )
+                        if cell_role not in {"/TH", "/TD"}:
+                            errors.append(
+                                f"table row {row_index} has a non-cell structural child"
+                            )
+                            continue
+                        cell_parent = cell.get("/P")
+                        if cell_parent is None or cell_parent.objgen != table_row.objgen:
+                            errors.append(
+                                f"table row {row_index} cell {grid_column} has the wrong parent"
+                            )
+                        raw_attributes = cell.get("/A")
+                        attribute_items = (
+                            list(raw_attributes)
+                            if isinstance(raw_attributes, pikepdf.Array)
+                            else [raw_attributes]
+                        )
+                        table_attributes = next(
+                            (
+                                item
+                                for item in attribute_items
+                                if isinstance(item, pikepdf.Dictionary)
+                                and str(item.get("/O", "")) == "/Table"
+                            ),
+                            None,
+                        )
+                        row_span = int(
+                            table_attributes.get("/RowSpan", 1)
+                            if table_attributes is not None
+                            else 1
+                        )
+                        column_span = int(
+                            table_attributes.get("/ColSpan", 1)
+                            if table_attributes is not None
+                            else 1
+                        )
+                        scope = (
+                            str(table_attributes.get("/Scope", ""))
+                            if table_attributes is not None
+                            else ""
+                        )
+                        if cell_role == "/TH" and scope not in {"/Row", "/Column"}:
+                            errors.append(
+                                f"table header at row {row_index}, column {grid_column} "
+                                "has no valid Scope"
+                            )
+                        content_items = cell.get("/K", [])
+                        if isinstance(content_items, (int, pikepdf.Dictionary)):
+                            content_items = [content_items]
+                        has_layout_attributes = any(
+                            isinstance(item, pikepdf.Dictionary)
+                            and str(item.get("/O", "")) == "/Layout"
+                            for item in attribute_items
+                        )
+                        if (
+                            not content_items
+                            and cell_role == "/TD"
+                            and not has_layout_attributes
+                        ):
+                            # A structural placeholder preserves the grid position of a
+                            # genuinely empty visible cell; it has no canonical text record.
+                            grid_column += column_span
+                            while grid_column in active_row_spans:
+                                grid_column += 1
+                            continue
+                        append_record(
+                            cell,
+                            cell_role,
+                            container_role="/Table",
+                            table_row=row_index,
+                            table_column=grid_column,
+                            header_scope=scope.removeprefix("/") or None,
+                            table_row_span=row_span,
+                            table_column_span=column_span,
+                            allow_empty=not content_items and cell_role == "/TD",
+                        )
+                        if row_span > 1:
+                            for column in range(grid_column, grid_column + column_span):
+                                active_row_spans[column] = max(
+                                    active_row_spans.get(column, 0), row_span
+                                )
+                        grid_column += column_span
+                        while grid_column in active_row_spans:
+                            grid_column += 1
                 continue
             if role != "/L":
                 append_record(element, role)
@@ -709,6 +857,9 @@ def compare_structure_to_plan(serialized: dict[str, object], plan: DocumentPlan)
         if element.role == ElementRole.FIGURE:
             records = actual[cursor : cursor + 1]
             cursor += len(records)
+        elif element.role == ElementRole.TD and not expected_text:
+            records = actual[cursor : cursor + 1]
+            cursor += len(records)
         else:
             records = []
             accumulated = ""
@@ -758,6 +909,26 @@ def compare_structure_to_plan(serialized: dict[str, object], plan: DocumentPlan)
             and records[0]["alt_text"] != (element.alt_text or "")
         ):
             errors.append(f"figure {index} alternate text does not match canonical plan")
+        if element.role in {ElementRole.TH, ElementRole.TD}:
+            record = records[0]
+            if record.get("container_role") != "/Table":
+                errors.append(f"table cell {index} is not contained in a Table")
+            for key, expected_value in (
+                ("table_row", element.table_row),
+                ("table_column", element.table_column),
+                ("table_row_span", element.table_row_span or 1),
+                ("table_column_span", element.table_column_span or 1),
+            ):
+                if record.get(key) != expected_value:
+                    errors.append(
+                        f"table cell {index} {key} {record.get(key)} != {expected_value}"
+                    )
+            expected_scope = element.header_scope.value if element.header_scope else None
+            if record.get("header_scope") != expected_scope:
+                errors.append(
+                    f"table cell {index} header_scope "
+                    f"{record.get('header_scope')} != {expected_scope}"
+                )
     if cursor != len(actual):
         errors.append(
             f"structure has {len(actual)} regions; canonical plan accounts for {cursor}"
@@ -842,6 +1013,75 @@ def _extraction_compatibility(
     }
 
 
+def _preserved_form_state(snapshot: dict[str, object]) -> dict[str, object]:
+    return {
+        key: snapshot.get(key)
+        for key in ("acroform_present", "xfa_present", "field_count", "widget_count")
+    } | {
+        "widgets": [
+            {
+                key: value
+                for key, value in widget.items()
+                if key
+                not in {
+                    "accessible_name_source",
+                    "description",
+                    "field_owner",
+                    "structure_label",
+                    "tooltip",
+                }
+            }
+            for widget in snapshot.get("widgets", [])
+        ]
+    }
+
+
+def _form_description_errors(
+    snapshot: dict[str, object], plan: DocumentPlan | None
+) -> list[str]:
+    if plan is None:
+        return []
+    errors = form_accessibility_errors(snapshot)
+    actual_widgets = list(snapshot.get("widgets", []))
+    for page in plan.pages:
+        actual = [
+            (
+                str(widget.get("tooltip", "")).strip(),
+                str(widget.get("structure_label", "")).strip(),
+            )
+            for widget in actual_widgets
+            if int(widget.get("page", 0)) == page.page_number
+        ]
+        expected_by_index = {
+            widget.widget_index: widget.description.strip()
+            for widget in page.form_widgets
+        }
+        if set(expected_by_index) != set(range(len(actual))):
+            errors.append(
+                f"page {page.page_number}: canonical form descriptions do not account "
+                "for every output widget"
+            )
+            continue
+        expected = [expected_by_index[index] for index in range(len(actual))]
+        for widget_index, (
+            (actual_tooltip, actual_structure_label),
+            expected_description,
+        ) in enumerate(
+            zip(actual, expected, strict=True)
+        ):
+            if actual_tooltip != expected_description:
+                errors.append(
+                    f"page {page.page_number} widget {widget_index}: terminal field /TU "
+                    "does not match canonical plan"
+                )
+            if actual_structure_label != expected_description:
+                errors.append(
+                    f"page {page.page_number} widget {widget_index}: Form structure /Alt "
+                    "does not match canonical plan"
+                )
+    return errors
+
+
 def validate_output(
     source: Path,
     output: Path,
@@ -859,6 +1099,13 @@ def validate_output(
     extraction = _extraction_compatibility(output, plan)
     plan_transformation_errors = transformation_errors(plan) if plan else []
     plan_block_errors = block_plan_errors(plan) if plan else []
+    source_form = form_snapshot(reference_source or source)
+    output_form = form_snapshot(output)
+    form_fields_preserved = _preserved_form_state(source_form) == _preserved_form_state(
+        output_form
+    )
+    form_description_errors = _form_description_errors(output_form, plan)
+    output_form_accessibility_errors = form_accessibility_errors(output_form)
     with pikepdf.Pdf.open(output) as pdf:
         has_structure_tree = "/StructTreeRoot" in pdf.Root
         marked = bool(pdf.Root.get("/MarkInfo", {}).get("/Marked", False))
@@ -907,6 +1154,13 @@ def validate_output(
         "transformations_valid": not plan_transformation_errors,
         "block_plan_errors": plan_block_errors,
         "block_plan_valid": not plan_block_errors,
+        "source_form": source_form,
+        "output_form": output_form,
+        "form_fields_preserved": form_fields_preserved,
+        "form_description_errors": form_description_errors,
+        "form_descriptions_match_plan": not form_description_errors,
+        "form_accessibility_errors": output_form_accessibility_errors,
+        "form_accessibility_policy_ok": not output_form_accessibility_errors,
         "source_visual_fidelity": source_fidelity,
         "source_visual_fidelity_ok": (
             source_fidelity["within_tolerance"] if source_fidelity else True
@@ -967,6 +1221,9 @@ def release_pdfua(
             report["page_labels_present"],
             report["transformations_valid"],
             report["block_plan_valid"],
+            report["form_fields_preserved"],
+            report["form_descriptions_match_plan"],
+            report["form_accessibility_policy_ok"],
             report["extraction_compatible"],
             report["declares_pdfua"],
             report["remediation_metadata_valid"],

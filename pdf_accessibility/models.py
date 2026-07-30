@@ -8,8 +8,8 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 
 
-SCHEMA_VERSION = 5
-PLAN_REVISION = 8
+SCHEMA_VERSION = 7
+PLAN_REVISION = 11
 
 
 class ElementRole(str, Enum):
@@ -19,7 +19,14 @@ class ElementRole(str, Enum):
     H3 = "H3"
     P = "P"
     LI = "LI"
+    TH = "TH"
+    TD = "TD"
     FIGURE = "Figure"
+
+
+class TableHeaderScope(str, Enum):
+    ROW = "Row"
+    COLUMN = "Column"
 
 
 class RemediationMode(str, Enum):
@@ -307,6 +314,15 @@ class PageElement(BaseModel):
     transformations: list[TextTransformation] = Field(default_factory=list)
     tokens: list[TextToken] = Field(default_factory=list)
     alt_text: str | None = Field(default=None, description="Concise figure alternative text")
+    table_id: str | None = Field(
+        default=None,
+        description="Stable identifier shared by every cell in one genuine data table",
+    )
+    table_row: int | None = Field(default=None, ge=0)
+    table_column: int | None = Field(default=None, ge=0)
+    table_row_span: int | None = Field(default=None, ge=1)
+    table_column_span: int | None = Field(default=None, ge=1)
+    header_scope: TableHeaderScope | None = None
     bbox: list[float] = Field(
         min_length=4,
         max_length=4,
@@ -354,10 +370,34 @@ class PageElement(BaseModel):
             self.accessible_text = self.visible_text
         if not self.visible_fragments and (self.visible_text or self.role == ElementRole.FIGURE):
             self.visible_fragments = [TextFragment(text=self.visible_text, bbox=self.bbox)]
-        if self.role != ElementRole.FIGURE and not self.accessible_text.strip():
+        if self.role not in {ElementRole.FIGURE, ElementRole.TD} and not self.accessible_text.strip():
             raise ValueError("non-figure elements require accessible text")
         token_text = self.alt_text or "" if self.role == ElementRole.FIGURE else self.accessible_text
         self.tokens = exact_text_tokens(token_text)
+        table_roles = {ElementRole.TH, ElementRole.TD}
+        if self.role in table_roles:
+            if not (self.table_id or "").strip():
+                raise ValueError("table cells require table_id")
+            if self.table_row is None or self.table_column is None:
+                raise ValueError("table cells require zero-based table_row and table_column")
+            self.table_row_span = self.table_row_span or 1
+            self.table_column_span = self.table_column_span or 1
+            if self.role == ElementRole.TH and self.header_scope is None:
+                raise ValueError("TH elements require Row or Column header_scope")
+            if self.role == ElementRole.TD and self.header_scope is not None:
+                raise ValueError("TD elements cannot have header_scope")
+        elif any(
+            value is not None
+            for value in (
+                self.table_id,
+                self.table_row,
+                self.table_column,
+                self.table_row_span,
+                self.table_column_span,
+                self.header_scope,
+            )
+        ):
+            raise ValueError("table metadata is only valid on TH and TD elements")
         return self
 
     @property
@@ -457,6 +497,18 @@ class PageElement(BaseModel):
         return self.findings[0].message if self.findings else None
 
 
+class FormWidgetPlan(BaseModel):
+    widget_index: int = Field(
+        ge=0,
+        description="Zero-based index in the page's supplied interactive-widget evidence",
+    )
+    description: str = Field(
+        min_length=1,
+        max_length=240,
+        description="Concise visible-context accessible name for the interactive control",
+    )
+
+
 class PagePlan(BaseModel):
     page_number: int = Field(ge=1)
     document_title_candidate: str | None = Field(default=None, max_length=240)
@@ -464,6 +516,7 @@ class PagePlan(BaseModel):
     elements: list[PageElement] = Field(
         description="Elements in the exact logical reading order for assistive technology"
     )
+    form_widgets: list[FormWidgetPlan] = Field(default_factory=list)
     artifacts: list[ArtifactRecord] = Field(default_factory=list)
     flows: list[PageFlow] = Field(default_factory=list)
     page_ambiguities: list[str] = Field(default_factory=list)
@@ -472,8 +525,35 @@ class PagePlan(BaseModel):
 
     @model_validator(mode="after")
     def assign_stable_ids(self) -> "PagePlan":
+        widget_indices = [widget.widget_index for widget in self.form_widgets]
+        if len(widget_indices) != len(set(widget_indices)):
+            raise ValueError(f"page {self.page_number} has duplicate form widget indices")
+        closed_tables: set[str] = set()
+        active_table: str | None = None
+        previous_position: tuple[int, int] | None = None
         block_ids: list[str] = []
         for index, element in enumerate(self.elements, start=1):
+            if element.role in {ElementRole.TH, ElementRole.TD}:
+                table_id = str(element.table_id)
+                if active_table != table_id:
+                    if active_table is not None:
+                        closed_tables.add(active_table)
+                    if table_id in closed_tables:
+                        raise ValueError(
+                            f"page {self.page_number} table {table_id!r} cells must be consecutive"
+                        )
+                    active_table = table_id
+                    previous_position = None
+                position = (int(element.table_row), int(element.table_column))
+                if previous_position is not None and position <= previous_position:
+                    raise ValueError(
+                        f"page {self.page_number} table {table_id!r} cells must be in row-major order"
+                    )
+                previous_position = position
+            elif active_table is not None:
+                closed_tables.add(active_table)
+                active_table = None
+                previous_position = None
             if not element.id:
                 element.id = f"p{self.page_number:04d}-e{index:04d}"
             for fragment_index, fragment in enumerate(element.visible_fragments, start=1):

@@ -18,6 +18,11 @@ with accessibility software. The finished file is checked automatically before i
 released. Automated checks are useful, but they do not replace testing with the PDF
 reader and assistive technology used by the intended audience.
 
+When the source contains an AcroForm, the pipeline preserves its editable controls,
+adds reviewed accessible names from the visible context, and tags the controls in the
+document structure. Printed blanks and checkboxes that were never interactive remain
+static rather than being silently converted into fields.
+
 The first completed collection contains nine complex historical PDFs. The project is
 intended for old documents whose original publishing files are no longer available.
 
@@ -131,7 +136,7 @@ Each input receives a work directory under `build/` containing:
 - `pages/*.evidence.json`: native and OCR evidence
 - `pages/*.proposal.json`: immutable Terra proposal checkpoint
 - `pages/*.review.json`: immutable Sol decision checkpoint
-- `*.plan.json`: schema-v5 canonical plan used by the compiler
+- `*.plan.json`: schema-v7 canonical plan used by the compiler
 - `*.draft.pdf`: tagged draft without a PDF/UA declaration
 - `*.accessible.pdf`: published only after every machine gate passes
 - `*.validation.json`: render, qpdf, structure-tree, and veraPDF results
@@ -139,7 +144,7 @@ Each input receives a work directory under `build/` containing:
 - `*.wcag.json`: per-criterion WCAG 2.1 AA evidence matrix
 - `*.manifest.json`: hashes, models, prompts, tools, font, and compiler strategy
 
-Old schema-v1 through schema-v4 plans migrate automatically. The original is preserved as
+Old schema-v1 through schema-v6 plans migrate automatically. The original is preserved as
 `*.plan.legacy.json`. Existing reviewed or manually modified canonical plans are not
 overwritten unless a force option is supplied.
 
@@ -160,6 +165,13 @@ original at 72 and 150 DPI, and the final PDF must match that base exactly. Only
 temporary candidate receives
 `pdfuaid:part=1`. The final accessible filename is published only if veraPDF PDF/UA-1
 also passes.
+
+For tables, validation compares the complete row/column grid, headers, scopes, and spans;
+blank structural cells are explicit. For interactive forms, it compares the source and
+output field trees, widget order, types, flags, values, options, and actions, and requires
+every reviewed accessible name to survive identically in the terminal field's `/TU`
+tooltip and the widget's `/Form /Alt`. A veraPDF PDF/UA-1 pass does not qualify a form
+for pass-through when these project policy checks fail.
 
 Released files identify `llm-pdf-remediation` as their PDF producer. Preflight snapshots
 the source authors, Subject, Keywords, XMP description, creation date, and encoding

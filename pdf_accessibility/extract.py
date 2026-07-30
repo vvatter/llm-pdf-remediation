@@ -8,6 +8,15 @@ import pymupdf
 
 
 @dataclass(frozen=True)
+class FormWidgetPacket:
+    widget_index: int
+    name: str
+    tooltip: str
+    field_type: str
+    bbox: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
 class PagePacket:
     page_number: int
     width: float
@@ -17,6 +26,7 @@ class PagePacket:
     native_words: tuple[tuple[float, float, float, float, str], ...] = ()
     ocr_text: str = ""
     ocr_words: tuple[tuple[float, float, float, float, str], ...] = ()
+    form_widgets: tuple[FormWidgetPacket, ...] = ()
 
 
 def _compact_embedded_text(page: pymupdf.Page, limit: int = 24_000) -> str:
@@ -37,6 +47,27 @@ def _words(page: pymupdf.Page) -> tuple[tuple[float, float, float, float, str], 
     return tuple(
         (float(x0), float(y0), float(x1), float(y1), str(word))
         for x0, y0, x1, y1, word, *_ in page.get_text("words", sort=False)
+    )
+
+
+def _form_widgets(page: pymupdf.Page) -> tuple[FormWidgetPacket, ...]:
+    widgets = page.widgets()
+    if widgets is None:
+        return ()
+    return tuple(
+        FormWidgetPacket(
+            widget_index=widget_index,
+            name=str(widget.field_name or ""),
+            tooltip=str(widget.field_label or ""),
+            field_type=str(widget.field_type_string or ""),
+            bbox=(
+                float(widget.rect.x0),
+                float(widget.rect.y0),
+                float(widget.rect.x1),
+                float(widget.rect.y1),
+            ),
+        )
+        for widget_index, widget in enumerate(widgets)
     )
 
 
@@ -73,6 +104,7 @@ def extract_page_packets(
                     native_words=_words(page),
                     ocr_text=_compact_embedded_text(evidence_page),
                     ocr_words=_words(evidence_page),
+                    form_widgets=_form_widgets(page),
                 )
             )
     if evidence_document:

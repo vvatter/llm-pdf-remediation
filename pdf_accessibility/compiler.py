@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from statistics import median
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -13,6 +14,13 @@ import pymupdf
 from fontTools.ttLib import TTFont
 from pikepdf import Array, Dictionary, Name, OutlineItem, Stream, String
 
+from .forms import (
+    description_is_generic,
+    field_tooltip,
+    inherited_field_value,
+    set_field_tooltip,
+    terminal_field_dictionary,
+)
 from .models import (
     DocumentPlan,
     ElementRole,
@@ -30,6 +38,8 @@ ROLE_NAMES = {
     ElementRole.H3: Name.H3,
     ElementRole.P: Name.P,
     ElementRole.LI: Name.LBody,
+    ElementRole.TH: Name("/TH"),
+    ElementRole.TD: Name("/TD"),
     ElementRole.FIGURE: Name.Figure,
 }
 
@@ -96,6 +106,7 @@ class RegionLineCandidate:
     fragments: list[TextFragment]
     logical_lines: list[LinePlacement]
     fragment_lines: list[LinePlacement]
+    reviewed_fragment_lines: list[LinePlacement]
 
 
 def _as_contents_array(contents: pikepdf.Object | None) -> list[pikepdf.Object]:
@@ -160,6 +171,45 @@ def _strip_form_xobject_marking(
         _strip_form_xobject_marking(xobject.get(Name.Resources), visited)
 
 
+def _remove_cidsets(pdf: pikepdf.Pdf) -> None:
+    """Drop optional CIDSet streams that commonly misdescribe embedded subsets.
+
+    PDF/UA does not require CIDSet. If one is present, however, it must enumerate
+    every glyph in the embedded CID font program; several office generators write
+    stale subsets that fail validation despite rendering correctly.
+    """
+    for obj in pdf.objects:
+        if (
+            isinstance(obj, pikepdf.Dictionary)
+            and str(obj.get(Name.Type, "")) == "/FontDescriptor"
+            and Name("/CIDSet") in obj
+        ):
+            del obj[Name("/CIDSet")]
+
+
+def _repair_missing_cid_to_gid_maps(pdf: pikepdf.Pdf) -> None:
+    """Make the implicit identity mapping explicit for embedded Type 2 CIDFonts.
+
+    PDF viewers use identity mapping when CIDToGIDMap is absent, but PDF/UA
+    requires an embedded CIDFontType2 dictionary to contain the entry. Adding
+    /Identity records the source font's existing behavior without changing its
+    glyph selection or page appearance.
+    """
+    for obj in pdf.objects:
+        if (
+            not isinstance(obj, pikepdf.Dictionary)
+            or str(obj.get("/Subtype", "")) != "/CIDFontType2"
+            or "/CIDToGIDMap" in obj
+        ):
+            continue
+        descriptor = obj.get("/FontDescriptor")
+        if not isinstance(descriptor, pikepdf.Dictionary) or not any(
+            key in descriptor for key in ("/FontFile2", "/FontFile3")
+        ):
+            continue
+        obj[Name("/CIDToGIDMap")] = Name("/Identity")
+
+
 def _link_description(annotation: pikepdf.Object) -> str:
     existing = str(annotation.get(Name.Contents, "")).strip()
     if existing:
@@ -171,6 +221,113 @@ def _link_description(annotation: pikepdf.Object) -> str:
     if annotation.get(Name.Dest) is not None:
         return "Internal document link"
     return "Link"
+
+
+def _appearance_text_is_blank(stream: pikepdf.Stream) -> bool:
+    """Whether an appearance paints text but only whitespace."""
+    try:
+        instructions = list(pikepdf.parse_content_stream(stream))
+    except (pikepdf.PdfError, ValueError):
+        return False
+    saw_text = False
+    for instruction in instructions:
+        operator = str(instruction.operator)
+        if operator not in {"Tj", "TJ", "'", '"'}:
+            continue
+        saw_text = True
+        for operand in instruction.operands:
+            values = list(operand) if isinstance(operand, pikepdf.Array) else [operand]
+            for value in values:
+                if isinstance(value, (int, float)):
+                    continue
+                if str(value).replace("\x00", "").strip():
+                    return False
+    return saw_text
+
+
+def _strip_appearance_text_objects(stream: pikepdf.Stream) -> None:
+    try:
+        instructions = list(pikepdf.parse_content_stream(stream))
+    except (pikepdf.PdfError, ValueError):
+        return
+    filtered = []
+    text_depth = 0
+    for instruction in instructions:
+        operator = str(instruction.operator)
+        if operator == "BT":
+            text_depth += 1
+            continue
+        if operator == "ET" and text_depth:
+            text_depth -= 1
+            continue
+        if not text_depth:
+            filtered.append(instruction)
+    stream.write(pikepdf.unparse_content_stream(filtered))
+
+
+def _appearance_streams(widget: pikepdf.Object) -> list[pikepdf.Stream]:
+    streams: list[pikepdf.Stream] = []
+    for appearance in widget.get("/AP", {}).values():
+        if isinstance(appearance, pikepdf.Stream):
+            streams.append(appearance)
+        elif isinstance(appearance, pikepdf.Dictionary):
+            streams.extend(
+                item
+                for item in appearance.values()
+                if isinstance(item, pikepdf.Stream)
+            )
+    return streams
+
+
+def _sanitize_empty_widget_appearances(widget: pikepdf.Object) -> None:
+    """Remove dormant noncompliant font use without changing an empty field's view."""
+    field_type = str(inherited_field_value(widget, "/FT") or "")
+    value = str(inherited_field_value(widget, "/V") or "")
+    field_flags = int(inherited_field_value(widget, "/Ff") or 0)
+    if field_type in {"/Tx", "/Ch"} and not value.strip():
+        for stream in _appearance_streams(widget):
+            if _appearance_text_is_blank(stream):
+                _strip_appearance_text_objects(stream)
+        return
+    if field_type != "/Btn" or value not in {"", "/Off"}:
+        return
+    if field_flags & (1 << 16):
+        # A pushbutton may use its appearance text as its visible label.
+        return
+    for appearance in widget.get("/AP", {}).values():
+        if not isinstance(appearance, pikepdf.Dictionary) or isinstance(
+            appearance, pikepdf.Stream
+        ):
+            continue
+        off = appearance.get("/Off")
+        for state_name, stream in appearance.items():
+            if str(state_name) == "/Off" or not isinstance(stream, pikepdf.Stream):
+                continue
+            bbox = [float(item) for item in stream.get("/BBox", [0, 0, 12, 12])]
+            if len(bbox) != 4:
+                continue
+            x0, y0, x1, y1 = bbox
+            width = max(x1 - x0, 1.0)
+            height = max(y1 - y0, 1.0)
+            line_width = max(min(width, height) * 0.1, 0.6)
+            if field_flags & (1 << 15):
+                marker = (
+                    f"q 0 g {x0 + width * 0.28:.3f} {y0 + height * 0.28:.3f} "
+                    f"{width * 0.44:.3f} {height * 0.44:.3f} re f Q\n"
+                )
+            else:
+                marker = (
+                    f"q 0 0 0 RG {line_width:.3f} w "
+                    f"{x0 + width * 0.16:.3f} {y0 + height * 0.52:.3f} m "
+                    f"{x0 + width * 0.40:.3f} {y0 + height * 0.24:.3f} l "
+                    f"{x0 + width * 0.84:.3f} {y0 + height * 0.80:.3f} l S Q\n"
+                )
+            base = off.read_bytes() if isinstance(off, pikepdf.Stream) else b""
+            stream.write(base + marker.encode("ascii"))
+            if isinstance(off, pikepdf.Stream) and off.get("/Resources") is not None:
+                stream[Name.Resources] = off.get("/Resources")
+            elif "/Resources" in stream:
+                del stream[Name.Resources]
 
 
 def _anchor_font_candidates() -> list[Path]:
@@ -581,19 +738,47 @@ def _repair_invalid_fragment_bbox(
         return False
     source_keys = [_token_key(_word_text(word)) for word in words]
     matched_boxes: list[tuple[float, float, float, float]] = []
-    if force and len(target_keys) < 3:
-        occurrences = [
+    occurrences = (
+        [
             start
             for start in range(len(source_keys) - len(target_keys) + 1)
             if source_keys[start : start + len(target_keys)] == target_keys
         ]
-        if len(occurrences) != 1:
-            return False
-        start = occurrences[0]
+        if force
+        else []
+    )
+    if occurrences:
+        if len(occurrences) == 1:
+            start = occurrences[0]
+        else:
+            original_origin = (bbox[0], bbox[1])
+            original_height = max(bbox[3] - bbox[1], 0.01)
+            ranked_occurrences = []
+            for occurrence in occurrences:
+                occurrence_boxes = [
+                    _word_bbox(word)
+                    for word in words[occurrence : occurrence + len(target_keys)]
+                ]
+                occurrence_bbox = _union_bbox(occurrence_boxes)
+                occurrence_origin = (occurrence_bbox[0], occurrence_bbox[1])
+                distance = (
+                    (occurrence_origin[0] - original_origin[0]) ** 2
+                    + (occurrence_origin[1] - original_origin[1]) ** 2
+                ) ** 0.5
+                ranked_occurrences.append((distance, occurrence))
+            ranked_occurrences.sort()
+            nearest_distance, start = ranked_occurrences[0]
+            next_distance = ranked_occurrences[1][0]
+            if nearest_distance > max(original_height * 3, 36.0) or (
+                next_distance - nearest_distance < max(original_height, 12.0)
+            ):
+                return False
         matched_boxes.extend(
             _word_bbox(word) for word in words[start : start + len(target_keys)]
         )
         matched_tokens = len(target_keys)
+    elif force and len(target_keys) < 3:
+        return False
     else:
         matcher = SequenceMatcher(None, source_keys, target_keys, autojunk=False)
         matched_tokens = 0
@@ -604,7 +789,8 @@ def _repair_invalid_fragment_bbox(
                 _word_bbox(word) for word in words[block.a : block.a + block.size]
             )
             matched_tokens += block.size
-    if matched_tokens / len(target_keys) < 0.5 or not matched_boxes:
+    minimum_match = 0.8 if force and len(target_keys) >= 3 else 0.5
+    if matched_tokens / len(target_keys) < minimum_match or not matched_boxes:
         return False
     repaired = (
         min(box[0] for box in matched_boxes),
@@ -623,8 +809,11 @@ def _repair_invalid_fragment_bbox(
         original_height = max(bbox[3] - bbox[1], 0.01)
         repaired_width = repaired[2] - repaired[0]
         repaired_height = repaired[3] - repaired[1]
+        short_unique_fragment = len(target_keys) < 3
+        height_factor = 3.0 if short_unique_fragment else 1.5
+        height_floor = 36.0 if short_unique_fragment else 24.0
         if repaired_width > max(original_width * 3, 144.0) or repaired_height > max(
-            original_height * 3, 36.0
+            original_height * height_factor, height_floor
         ):
             return False
     fragment.bbox = [
@@ -713,10 +902,21 @@ def _align_element_fragments(
     height: float,
     geometry_source: str,
 ) -> dict[int, list[WordPlacement]]:
-    placements: dict[int, list[WordPlacement]] = {}
-    weighted_quality = 0.0
-    weighted_chunks = 0
-    for fragment, fragment_chunks in _chunks_by_fragment(element, chunks):
+    fragment_groups = _chunks_by_fragment(element, chunks)
+    original_boxes = {
+        id(fragment): list(fragment.bbox or element.bbox)
+        for fragment, _ in fragment_groups
+    }
+    aligned: list[
+        tuple[
+            TextFragment,
+            list[AnchorChunk],
+            tuple[float, float, float, float],
+            list[tuple],
+            float,
+        ]
+    ] = []
+    for fragment, fragment_chunks in fragment_groups:
         _repair_invalid_fragment_bbox(
             fragment,
             element,
@@ -727,7 +927,7 @@ def _align_element_fragments(
         bbox = _fragment_bbox_points(fragment, element, width, height)
         local_words = _words_in_fragment(words, bbox)
         local_quality = _alignment_quality(fragment_chunks, local_words)
-        if local_quality < 0.5 and _repair_invalid_fragment_bbox(
+        if local_quality <= 0.5 and _repair_invalid_fragment_bbox(
             fragment,
             element,
             words,
@@ -738,6 +938,65 @@ def _align_element_fragments(
             bbox = _fragment_bbox_points(fragment, element, width, height)
             local_words = _words_in_fragment(words, bbox)
             local_quality = _alignment_quality(fragment_chunks, local_words)
+        aligned.append(
+            (fragment, fragment_chunks, bbox, local_words, local_quality)
+        )
+
+    deltas = []
+    for fragment, *_ in aligned:
+        original = original_boxes[id(fragment)]
+        current = list(fragment.bbox or element.bbox)
+        delta = (current[0] - original[0], current[1] - original[1])
+        if abs(delta[0]) > 1 or abs(delta[1]) > 1:
+            deltas.append(delta)
+    if len(deltas) >= 2:
+        delta_x = median(item[0] for item in deltas)
+        delta_y = median(item[1] for item in deltas)
+        if (
+            max(item[0] for item in deltas) - min(item[0] for item in deltas) <= 40
+            and max(item[1] for item in deltas) - min(item[1] for item in deltas) <= 40
+        ):
+            repaired_aligned = []
+            for fragment, fragment_chunks, bbox, local_words, local_quality in aligned:
+                original = original_boxes[id(fragment)]
+                current = list(fragment.bbox or element.bbox)
+                moved = abs(current[0] - original[0]) > 1 or abs(
+                    current[1] - original[1]
+                ) > 1
+                if not moved and local_quality < 0.5:
+                    shifted = [
+                        original[0] + delta_x,
+                        original[1] + delta_y,
+                        original[2] + delta_x,
+                        original[3] + delta_y,
+                    ]
+                    if (
+                        0 <= shifted[0] < shifted[2] <= 1000
+                        and 0 <= shifted[1] < shifted[3] <= 1000
+                    ):
+                        fragment.bbox = [round(value, 3) for value in shifted]
+                        shifted_bbox = _fragment_bbox_points(
+                            fragment, element, width, height
+                        )
+                        shifted_words = _words_in_fragment(words, shifted_bbox)
+                        shifted_quality = _alignment_quality(
+                            fragment_chunks, shifted_words
+                        )
+                        if shifted_quality > local_quality:
+                            bbox = shifted_bbox
+                            local_words = shifted_words
+                            local_quality = shifted_quality
+                        else:
+                            fragment.bbox = original
+                repaired_aligned.append(
+                    (fragment, fragment_chunks, bbox, local_words, local_quality)
+                )
+            aligned = repaired_aligned
+
+    placements: dict[int, list[WordPlacement]] = {}
+    weighted_quality = 0.0
+    weighted_chunks = 0
+    for fragment, fragment_chunks, bbox, local_words, local_quality in aligned:
         fragment.geometry_word_count = len(local_words)
         fragment.geometry_source = geometry_source
         fragment.alignment_coverage = local_quality
@@ -1065,6 +1324,24 @@ def _region_lines(
     return _synthetic_region_lines(region.chunks, lines[0].bbox)
 
 
+def _reviewed_fragment_lines(
+    region: StructureRegion | StructureSegment,
+    width: float,
+    height: float,
+) -> list[LinePlacement]:
+    return [
+        LinePlacement(
+            text="".join(chunk.text for chunk in fragment_chunks),
+            bbox=_fragment_bbox_points(fragment, region.element, width, height),
+            chunks=fragment_chunks,
+        )
+        for fragment, fragment_chunks in _chunks_by_fragment(
+            region.element, region.chunks
+        )
+        if fragment_chunks
+    ]
+
+
 def _text_advance(text: str, font: AnchorFont) -> int:
     fallback = font.advances.get(ord("?"), 600)
     return sum(font.advances.get(ord(character), fallback) for character in text)
@@ -1299,6 +1576,32 @@ def _collision_safe_region_lines(
         if not changed:
             break
 
+    # Word-level evidence can occasionally map repeated prose to a neighboring
+    # paragraph even when the reviewed fragment rectangles are sound. In that
+    # case, use those reviewed rectangles as the final spatial-extraction anchor.
+    while True:
+        changed = False
+        collisions = _colliding_region_pairs(selected)
+        for left_index, right_index in collisions:
+            if (left_index, right_index) not in _colliding_region_pairs(selected):
+                continue
+            for index in (left_index, right_index):
+                reviewed = candidates[index].reviewed_fragment_lines
+                if not reviewed or selected[index] == reviewed:
+                    continue
+                prior_lines = selected[index]
+                prior_collision_count = len(_colliding_region_pairs(selected))
+                selected[index] = reviewed
+                if len(_colliding_region_pairs(selected)) < prior_collision_count:
+                    fragment_anchored.add(index)
+                    changed = True
+                    break
+                selected[index] = prior_lines
+            if changed:
+                break
+        if not changed:
+            break
+
     unresolved = _colliding_region_pairs(selected)
     if unresolved:
         examples = []
@@ -1425,6 +1728,8 @@ def _element_structure_regions(
     element: PageElement,
     chunks: list[AnchorChunk],
 ) -> list[tuple[str, list[AnchorChunk], list[TextFragment]]]:
+    if element.role == ElementRole.TD and not element.semantic_text.strip():
+        return []
     regions: list[tuple[str, list[AnchorChunk], list[TextFragment]]] = [
         (element.id, chunks, element.visible_fragments)
     ]
@@ -1454,6 +1759,46 @@ def _element_structure_regions(
             ) == "".join(chunk.text for chunk in chunks):
                 regions = candidate_regions
     return regions
+
+
+def _make_empty_table_cell(
+    pdf: pikepdf.Pdf,
+    page_obj: pikepdf.Object,
+    parent: pikepdf.Object,
+    width: float,
+    height: float,
+    element: PageElement | None = None,
+) -> pikepdf.Object:
+    table_attributes = Dictionary(O=Name.Table)
+    attributes: pikepdf.Object = table_attributes
+    if element is not None:
+        left, top, right, bottom = element.bbox
+        layout_attributes = Dictionary(
+            O=Name.Layout,
+            BBox=Array(
+                [
+                    round(left / 1000 * width, 3),
+                    round(height - bottom / 1000 * height, 3),
+                    round(right / 1000 * width, 3),
+                    round(height - top / 1000 * height, 3),
+                ]
+            ),
+        )
+        if int(element.table_row_span or 1) > 1:
+            table_attributes[Name("/RowSpan")] = int(element.table_row_span or 1)
+        if int(element.table_column_span or 1) > 1:
+            table_attributes[Name("/ColSpan")] = int(element.table_column_span or 1)
+        attributes = Array([layout_attributes, table_attributes])
+    return pdf.make_indirect(
+        Dictionary(
+            Type=Name.StructElem,
+            S=Name("/TD"),
+            P=parent,
+            Pg=page_obj,
+            K=Array(),
+            A=attributes,
+        )
+    )
 
 
 def _make_role_element(
@@ -1547,7 +1892,7 @@ def _make_role_element(
         ]
     )
     if boxes:
-        role_element[Name.A] = Dictionary(
+        layout_attributes = Dictionary(
             O=Name.Layout,
             BBox=Array(
                 [
@@ -1557,6 +1902,21 @@ def _make_role_element(
                     round(height - min(box[1] for box in boxes), 3),
                 ]
             ),
+        )
+        role_element[Name.A] = layout_attributes
+    if element.role in {ElementRole.TH, ElementRole.TD}:
+        table_attributes = Dictionary(O=Name.Table)
+        if element.role == ElementRole.TH:
+            table_attributes[Name("/Scope")] = Name(f"/{element.header_scope.value}")
+        if int(element.table_row_span or 1) > 1:
+            table_attributes[Name("/RowSpan")] = int(element.table_row_span or 1)
+        if int(element.table_column_span or 1) > 1:
+            table_attributes[Name("/ColSpan")] = int(element.table_column_span or 1)
+        existing_attributes = role_element.get(Name.A)
+        role_element[Name.A] = (
+            Array([existing_attributes, table_attributes])
+            if existing_attributes is not None
+            else table_attributes
         )
     return role_element, mcid_parents
 
@@ -1605,6 +1965,8 @@ def compile_tagged_pdf(
         candidate_label=candidate_geometry_label,
     )
     with pikepdf.Pdf.open(source) as pdf:
+        _remove_cidsets(pdf)
+        _repair_missing_cid_to_gid_maps(pdf)
         anchor_font = _make_anchor_font(pdf, plan)
         structure_root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
         document = pdf.make_indirect(
@@ -1612,7 +1974,7 @@ def compile_tagged_pdf(
         )
         structure_root[Name.K] = document
 
-        parent_tree_entries = Array()
+        parent_tree_entries: list[tuple[int, pikepdf.Object]] = []
         plan_by_page = {page.page_number: page for page in plan.pages}
         sanitized_xobjects: set[tuple[int, int]] = set()
         next_annotation_parent = len(pdf.pages)
@@ -1698,6 +2060,13 @@ def compile_tagged_pdf(
                             fragments=region_fragments,
                             logical_lines=logical_lines,
                             fragment_lines=fragment_lines,
+                            reviewed_fragment_lines=(
+                                []
+                                if element.role == ElementRole.FIGURE
+                                else _reviewed_fragment_lines(
+                                    region_shell, width, height
+                                )
+                            ),
                         )
                     )
                 candidates_by_element.append(element_candidates)
@@ -1808,10 +2177,22 @@ def compile_tagged_pdf(
 
             mcid_parents: list[pikepdf.Object] = []
             active_list: pikepdf.Object | None = None
+            active_table: pikepdf.Object | None = None
+            active_table_id: str | None = None
+            active_table_row: int | None = None
+            table_row_element: pikepdf.Object | None = None
+            active_table_row_spans: dict[int, int] = {}
+            next_table_column = 0
             for element, element_regions in zip(
                 page_plan.elements, regions_by_element, strict=True
             ):
                 if element.role == ElementRole.LI:
+                    active_table = None
+                    active_table_id = None
+                    active_table_row = None
+                    table_row_element = None
+                    active_table_row_spans = {}
+                    next_table_column = 0
                     if active_list is None:
                         active_list = pdf.make_indirect(
                             Dictionary(
@@ -1851,7 +2232,104 @@ def compile_tagged_pdf(
                         mcid_parents.extend(owners)
                     continue
 
+                if element.role in {ElementRole.TH, ElementRole.TD}:
+                    active_list = None
+                    table_id = str(element.table_id)
+                    if active_table is None or table_id != active_table_id:
+                        active_table = pdf.make_indirect(
+                            Dictionary(
+                                Type=Name.StructElem,
+                                S=Name.Table,
+                                P=document,
+                                K=Array(),
+                            )
+                        )
+                        document[Name.K].append(active_table)
+                        active_table_id = table_id
+                        active_table_row = None
+                        table_row_element = None
+                        active_table_row_spans = {}
+                        next_table_column = 0
+                    if int(element.table_row) != active_table_row:
+                        if active_table_row is not None:
+                            row_delta = int(element.table_row) - active_table_row
+                            for _ in range(max(0, row_delta)):
+                                active_table_row_spans = {
+                                    column: remaining - 1
+                                    for column, remaining in active_table_row_spans.items()
+                                    if remaining > 1
+                                }
+                        table_row_element = pdf.make_indirect(
+                            Dictionary(
+                                Type=Name.StructElem,
+                                S=Name("/TR"),
+                                P=active_table,
+                                K=Array(),
+                            )
+                        )
+                        active_table[Name.K].append(table_row_element)
+                        active_table_row = int(element.table_row)
+                        next_table_column = 0
+                        while next_table_column in active_table_row_spans:
+                            next_table_column += 1
+                    while next_table_column < int(element.table_column):
+                        if next_table_column not in active_table_row_spans:
+                            table_row_element[Name.K].append(
+                                _make_empty_table_cell(
+                                    pdf,
+                                    page.obj,
+                                    table_row_element,
+                                    width,
+                                    height,
+                                )
+                            )
+                        next_table_column += 1
+                    if not element_regions:
+                        table_row_element[Name.K].append(
+                            _make_empty_table_cell(
+                                pdf,
+                                page.obj,
+                                table_row_element,
+                                width,
+                                height,
+                                element,
+                            )
+                        )
+                    else:
+                        for region in element_regions:
+                            cell, owners = _make_role_element(
+                                pdf,
+                                region,
+                                page.obj,
+                                table_row_element,
+                                placements,
+                                width,
+                                height,
+                            )
+                            table_row_element[Name.K].append(cell)
+                            mcid_parents.extend(owners)
+                    row_span = int(element.table_row_span or 1)
+                    column_span = int(element.table_column_span or 1)
+                    if row_span > 1:
+                        for column in range(
+                            int(element.table_column),
+                            int(element.table_column) + column_span,
+                        ):
+                            active_table_row_spans[column] = max(
+                                active_table_row_spans.get(column, 0), row_span
+                            )
+                    next_table_column = int(element.table_column) + column_span
+                    while next_table_column in active_table_row_spans:
+                        next_table_column += 1
+                    continue
+
                 active_list = None
+                active_table = None
+                active_table_id = None
+                active_table_row = None
+                table_row_element = None
+                active_table_row_spans = {}
+                next_table_column = 0
                 for region in element_regions:
                     role_element, owners = _make_role_element(
                         pdf,
@@ -1865,7 +2343,74 @@ def compile_tagged_pdf(
                     document[Name.K].append(role_element)
                     mcid_parents.extend(owners)
 
-            parent_tree_entries.extend([page_index, Array(mcid_parents)])
+            parent_tree_entries.append((page_index, Array(mcid_parents)))
+            # Preserve the source widget sequence: it is the document's existing
+            # interaction order and is usually more intentional than small geometric
+            # differences between text, choice, signature, and checkbox rectangles.
+            widgets = [
+                annotation
+                for annotation in page.obj.get(Name.Annots, [])
+                if str(annotation.get(Name.Subtype, "")) == "/Widget"
+            ]
+            planned_widget_descriptions = {
+                item.widget_index: item.description.strip()
+                for item in page_plan.form_widgets
+            }
+            if set(planned_widget_descriptions) != set(range(len(widgets))):
+                raise RuntimeError(
+                    f"Page {page_index + 1} canonical plan must describe every interactive "
+                    "widget exactly once"
+                )
+            field_descriptions: dict[tuple[int, int], str] = {}
+            for widget_index, annotation in enumerate(widgets):
+                _sanitize_empty_widget_appearances(annotation)
+                planned_description = planned_widget_descriptions[widget_index]
+                if description_is_generic(planned_description):
+                    raise RuntimeError(
+                        f"Page {page_index + 1} widget {widget_index} still has a generic "
+                        "accessible description"
+                    )
+                owner = terminal_field_dictionary(annotation)
+                owner_identity = (
+                    owner.objgen
+                    if owner.objgen != (0, 0)
+                    else (0, id(owner))
+                )
+                previous_description = field_descriptions.get(owner_identity)
+                if (
+                    previous_description is not None
+                    and previous_description != planned_description
+                ):
+                    raise RuntimeError(
+                        f"Page {page_index + 1} widgets sharing terminal field "
+                        f"{owner_identity} have inconsistent accessible descriptions"
+                    )
+                field_descriptions[owner_identity] = planned_description
+                set_field_tooltip(annotation, planned_description)
+                description = field_tooltip(annotation)
+                if description != planned_description:
+                    raise RuntimeError(
+                        "Interactive form terminal field did not retain its reviewed /TU"
+                    )
+                annotation[Name.P] = page.obj
+                annotation[Name.StructParent] = next_annotation_parent
+                object_reference = pdf.make_indirect(
+                    Dictionary(Type=Name.OBJR, Obj=annotation, Pg=page.obj)
+                )
+                form = pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.StructElem,
+                        S=Name.Form,
+                        P=document,
+                        Pg=page.obj,
+                        K=object_reference,
+                        Alt=String(description),
+                    )
+                )
+                document[Name.K].append(form)
+                parent_tree_entries.append((next_annotation_parent, form))
+                next_annotation_parent += 1
+
             for annotation in page.obj.get(Name.Annots, []):
                 if str(annotation.get(Name.Subtype, "")) != "/Link":
                     continue
@@ -1886,10 +2431,13 @@ def compile_tagged_pdf(
                     )
                 )
                 document[Name.K].append(link)
-                parent_tree_entries.extend([next_annotation_parent, link])
+                parent_tree_entries.append((next_annotation_parent, link))
                 next_annotation_parent += 1
 
-        parent_tree = pdf.make_indirect(Dictionary(Nums=parent_tree_entries))
+        parent_tree_numbers = Array()
+        for key, value in sorted(parent_tree_entries, key=lambda item: item[0]):
+            parent_tree_numbers.extend([key, value])
+        parent_tree = pdf.make_indirect(Dictionary(Nums=parent_tree_numbers))
         structure_root[Name.ParentTree] = parent_tree
         structure_root[Name.ParentTreeNextKey] = next_annotation_parent
 
@@ -1901,6 +2449,14 @@ def compile_tagged_pdf(
             Nums=Array([0, Dictionary(S=Name("/D"), St=1)])
         )
         pdf.docinfo[Name.Title] = String(plan.title)
+        # Rebuild XMP from a clean package. Some legacy Ghostscript files use a
+        # nonempty rdf:about identifier, causing pikepdf to append new Dublin
+        # Core and PDF/UA properties in a second description that veraPDF does
+        # not recognize as the document's main XMP package. Source metadata
+        # that must survive remediation is restored from the preflight snapshot
+        # during release.
+        if Name.Metadata in pdf.Root:
+            del pdf.Root[Name.Metadata]
         with pdf.open_metadata(set_pikepdf_as_editor=False) as metadata:
             metadata["dc:title"] = plan.title
             metadata["dc:language"] = [plan.language]

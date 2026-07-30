@@ -1,7 +1,64 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
+import tempfile
+import time
+from typing import Iterator
+
+
+@contextmanager
+def _history_lock(path: Path) -> Iterator[Path]:
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock-v2")
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(descriptor, str(os.getpid()).encode("ascii"))
+            os.close(descriptor)
+            break
+        except FileExistsError:
+            try:
+                stale = time.time() - lock_path.stat().st_mtime > 300
+            except FileNotFoundError:
+                continue
+            if stale:
+                lock_path.unlink(missing_ok=True)
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for recent-title lock: {lock_path}")
+            time.sleep(0.02)
+    try:
+        yield path
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def _write_title_history(path: Path, titles: list[str]) -> None:
+    payload = json.dumps({"titles": titles}, ensure_ascii=False, indent=2) + "\n"
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_name = temporary.name
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
 
 def _clean_titles(values: object) -> list[str]:
     if not isinstance(values, list):
@@ -15,10 +72,8 @@ def _clean_titles(values: object) -> list[str]:
 
 
 def _read_title_history(path: Path) -> list[str]:
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        path.write_text('{"titles": []}\n', encoding="utf-8")
+        _write_title_history(path, [])
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -31,20 +86,19 @@ def load_recent_titles(
     path: Path, limit: int | None = None
 ) -> list[str]:
     """Create and return the local title history used as prompt context."""
-    titles = _read_title_history(path)
+    with _history_lock(path) as resolved_path:
+        titles = _read_title_history(resolved_path)
     return titles if limit is None else titles[-max(1, limit) :]
 
 
 def remember_title(
     path: Path, title: str, limit: int | None = None
 ) -> list[str]:
-    titles = _read_title_history(path)
-    normalized = " ".join(title.split())
-    titles = [item for item in titles if item != normalized]
-    if normalized:
-        titles.append(normalized)
-    path.resolve().write_text(
-        json.dumps({"titles": titles}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    with _history_lock(path) as resolved_path:
+        titles = _read_title_history(resolved_path)
+        normalized = " ".join(title.split())
+        titles = [item for item in titles if item != normalized]
+        if normalized:
+            titles.append(normalized)
+        _write_title_history(resolved_path, titles)
     return titles if limit is None else titles[-max(1, limit) :]

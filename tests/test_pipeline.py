@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 import subprocess
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from pathlib import Path
@@ -13,8 +15,13 @@ import pymupdf
 from pydantic import ValidationError
 
 from pdf_accessibility.compiler import (
+    AnchorFont,
+    LinePlacement,
+    RegionLineCandidate,
     _align_element_fragments,
+    _collision_safe_region_lines,
     _page_anchor_chunks,
+    _repair_missing_cid_to_gid_maps,
     compile_tagged_pdf,
 )
 from pdf_accessibility.models import (
@@ -23,23 +30,38 @@ from pdf_accessibility.models import (
     DocumentPlan,
     ElementRole,
     FindingCategory,
+    FormWidgetPlan,
     PageElement,
     PageFlow,
     PagePlan,
+    RemediationMode,
     ReviewFinding,
     ReviewSeverity,
     ReviewStatus,
     TextFragment,
+    TableHeaderScope,
     TextTransformation,
     TransformationKind,
     exact_text_tokens,
 )
 from pdf_accessibility.plans import load_document_plan
-from pdf_accessibility.preflight import SourceMetadata, read_source_metadata
+from pdf_accessibility.forms import (
+    form_snapshot,
+    set_field_tooltip,
+    terminal_field_dictionary,
+)
+from pdf_accessibility.preflight import (
+    SourceMetadata,
+    inspect_pdf,
+    read_source_metadata,
+    run_verapdf,
+)
 from pdf_accessibility.evidence import diagnostics_for, evidence_from_packet
 from pdf_accessibility.extract import PagePacket
 from pdf_accessibility.planner import (
     HEADING_GUIDANCE,
+    RUNNING_MATTER_GUIDANCE,
+    TABLE_GUIDANCE,
     PLANNER_PROMPT_VERSION,
     PROPOSAL_SYSTEM_PROMPT,
     REVIEW_PROMPT_VERSION,
@@ -55,6 +77,8 @@ from pdf_accessibility.planner import (
 )
 from pdf_accessibility.title_history import load_recent_titles, remember_title
 from pdf_accessibility.refine import (
+    _complete_rectangular_table_grids,
+    _normalize_static_form_markers,
     canonicalize_transformations,
     refine_document_plan,
     transformation_errors,
@@ -64,6 +88,7 @@ from pdf_accessibility.validate import (
     REMEDIATION_SUMMARY,
     REMEDIATION_TOOL,
     add_pdfua_declaration,
+    _fidelity_within_tolerance,
     compare_structure_to_plan,
     plan_is_approved,
     serialize_structure_tree,
@@ -88,15 +113,26 @@ def element(
 
 class NormalizePlanTests(unittest.TestCase):
     def test_heading_guidance_requires_visible_semantic_hierarchy(self) -> None:
-        self.assertEqual(PLANNER_PROMPT_VERSION, "proposal-v8")
-        self.assertEqual(REVIEW_PROMPT_VERSION, "review-v9")
+        self.assertEqual(PLANNER_PROMPT_VERSION, "proposal-v18")
+        self.assertEqual(REVIEW_PROMPT_VERSION, "review-v18")
         for prompt in (PROPOSAL_SYSTEM_PROMPT, REVIEW_SYSTEM_PROMPT):
             self.assertIn(HEADING_GUIDANCE, prompt)
+            self.assertIn(RUNNING_MATTER_GUIDANCE, prompt)
+            self.assertIn(TABLE_GUIDANCE, prompt)
             normalized = " ".join(prompt.split())
             self.assertIn("heading must be visible text", normalized)
             self.assertIn("short key-value or metadata label", normalized)
             self.assertIn("H3 only for a subsection genuinely nested", normalized)
             self.assertIn("keep the content as P rather than synthesizing one", normalized)
+            self.assertIn("genuine two-dimensional data table", normalized)
+            self.assertIn("repeated roster, schedule, comparison matrix", normalized)
+            self.assertIn("cells consecutively in row-major order", normalized)
+            self.assertIn("each logical row spans the same number of columns", normalized)
+            self.assertIn("printed title is generic", normalized)
+            self.assertIn("exactly one form_widgets entry", normalized)
+            self.assertIn("terminal field's /TU tooltip", normalized)
+            self.assertIn("Do not return an instruction-only label", normalized)
+            self.assertIn("generic internal identifiers", normalized)
 
     def test_search_title_candidate_is_separate_from_printed_title(self) -> None:
         page = PagePlan(
@@ -110,6 +146,42 @@ class NormalizePlanTests(unittest.TestCase):
             "Spring Celebration, UF Mathematics, 2024",
         )
         self.assertEqual(page.elements[0].accessible_text, "Spring Celebration")
+
+    def test_incomplete_proposal_table_is_left_for_independent_review(self) -> None:
+        page = _validated_page_plan(
+            {
+                "coordinate_space": "normalized_0_1000",
+                "elements": [
+                    {
+                        "role": "TH",
+                        "visible_text": "Printed Names",
+                        "accessible_text": "Printed Names",
+                        "table_id": "roster",
+                        "bbox": [100, 100, 400, 150],
+                    },
+                    {
+                        "role": "TD",
+                        "visible_text": "",
+                        "accessible_text": "",
+                        "table_id": "roster",
+                        "table_row": 1,
+                        "bbox": [100, 160, 400, 220],
+                    },
+                ],
+            },
+            1,
+            recover_incomplete_tables=True,
+        )
+
+        self.assertEqual([element.role for element in page.elements], [ElementRole.P])
+        self.assertEqual(page.elements[0].visible_text, "Printed Names")
+        self.assertTrue(
+            any(
+                finding.category == FindingCategory.SEMANTIC_ROLE
+                and finding.severity == ReviewSeverity.WARNING
+                for finding in page.findings
+            )
+        )
 
     def test_invalid_model_flow_is_rebuilt_from_semantic_order(self) -> None:
         page = PagePlan(
@@ -185,6 +257,52 @@ class NormalizePlanTests(unittest.TestCase):
 
 
 class CompileTests(unittest.TestCase):
+    def test_missing_embedded_cid_to_gid_map_becomes_explicit_identity(self) -> None:
+        with pikepdf.Pdf.new() as pdf:
+            descriptor = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/FontDescriptor"),
+                    FontFile2=pdf.make_stream(b"embedded font program"),
+                )
+            )
+            embedded = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/CIDFontType2"),
+                    FontDescriptor=descriptor,
+                )
+            )
+            unembedded = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/CIDFontType2"),
+                    FontDescriptor=pdf.make_indirect(
+                        pikepdf.Dictionary(Type=pikepdf.Name("/FontDescriptor"))
+                    ),
+                )
+            )
+
+            _repair_missing_cid_to_gid_maps(pdf)
+
+            self.assertEqual(str(embedded.CIDToGIDMap), "/Identity")
+            self.assertNotIn("/CIDToGIDMap", unembedded)
+
+    def test_source_fidelity_allows_low_resolution_raster_antialiasing_only(self) -> None:
+        samples = {
+            "72": {
+                "maximum_page_mean_absolute_channel_difference": 0.0567,
+                "maximum_page_sample_fraction_over_16": 0.2083,
+            },
+            "150": {
+                "maximum_page_mean_absolute_channel_difference": 0.0371,
+                "maximum_page_sample_fraction_over_16": 0.1308,
+            },
+        }
+
+        self.assertTrue(_fidelity_within_tolerance(samples, True))
+        samples["150"]["maximum_page_mean_absolute_channel_difference"] = 0.0567
+        self.assertFalse(_fidelity_within_tolerance(samples, True))
+
     def test_consecutive_list_items_compile_as_a_real_list(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"
@@ -235,6 +353,199 @@ class CompileTests(unittest.TestCase):
             )
             self.assertEqual(serialized["errors"], [])
             self.assertEqual(compare_structure_to_plan(serialized, plan), [])
+
+    def test_genuine_data_table_compiles_with_headers_and_empty_corner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=600, height=400)
+            document.save(source)
+            document.close()
+
+            def cell(
+                role: ElementRole,
+                text: str,
+                row: int,
+                column: int,
+                scope: TableHeaderScope | None = None,
+                top: float = 200,
+            ) -> PageElement:
+                return PageElement(
+                    role=role,
+                    visible_text=text,
+                    accessible_text=text,
+                    table_id="performance-rubric",
+                    table_row=row,
+                    table_column=column,
+                    header_scope=scope,
+                    bbox=[100 + 250 * column, top, 330 + 250 * column, top + 80],
+                )
+
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Performance Rubric",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[
+                            element(ElementRole.H1, "Performance rubric", top=60),
+                            cell(ElementRole.TH, "January", 0, 1, TableHeaderScope.COLUMN),
+                            cell(ElementRole.TH, "May", 0, 2, TableHeaderScope.COLUMN),
+                            cell(
+                                ElementRole.TH,
+                                "Meets expectations",
+                                1,
+                                0,
+                                TableHeaderScope.ROW,
+                                top=400,
+                            ),
+                            cell(ElementRole.TD, "Pass one exam", 1, 1, top=400),
+                            cell(ElementRole.TD, "Pass two exams", 1, 2, top=400),
+                            cell(
+                                ElementRole.TH,
+                                "Below expectations",
+                                2,
+                                0,
+                                TableHeaderScope.ROW,
+                                top=600,
+                            ),
+                            cell(ElementRole.TD, "", 2, 1, top=600),
+                            cell(ElementRole.TD, "No pass", 2, 2, top=600),
+                        ],
+                    )
+                ],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+
+            with pikepdf.Pdf.open(output) as pdf:
+                children = list(pdf.Root.StructTreeRoot.K.K)
+                self.assertEqual([str(child.S) for child in children], ["/H1", "/Table"])
+                rows = list(children[1].K)
+                self.assertEqual([str(row.S) for row in rows], ["/TR", "/TR", "/TR"])
+                self.assertEqual(
+                    [str(item.S) for item in rows[0].K], ["/TD", "/TH", "/TH"]
+                )
+                self.assertEqual(len(rows[0].K[0].K), 0)
+                january_table_attributes = next(
+                    item for item in rows[0].K[1].A if str(item.O) == "/Table"
+                )
+                self.assertEqual(str(january_table_attributes.Scope), "/Column")
+                self.assertEqual(len(rows[2].K[1].K), 0)
+                self.assertTrue(
+                    any(str(item.O) == "/Layout" for item in rows[2].K[1].A)
+                )
+
+            serialized = serialize_structure_tree(output)
+            self.assertEqual(serialized["errors"], [])
+            self.assertEqual(
+                [record["role"] for record in serialized["elements"]],
+                ["/H1", "/TH", "/TH", "/TH", "/TD", "/TD", "/TH", "/TD", "/TD"],
+            )
+            self.assertEqual(
+                [record["table_column"] for record in serialized["elements"][1:]],
+                [1, 2, 0, 1, 2, 0, 1, 2],
+            )
+            self.assertEqual(compare_structure_to_plan(serialized, plan), [])
+            candidate = Path(temp) / "candidate.pdf"
+            add_pdfua_declaration(output, candidate, plan)
+            vera_ok, vera_report = run_verapdf(candidate)
+            if vera_ok is not None:
+                self.assertTrue(vera_ok, vera_report)
+
+    def test_table_row_spans_do_not_create_duplicate_placeholder_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=600, height=400)
+            document.save(source)
+            document.close()
+
+            def cell(
+                role: ElementRole,
+                text: str,
+                row: int,
+                column: int,
+                *,
+                scope: TableHeaderScope | None = None,
+                row_span: int = 1,
+            ) -> PageElement:
+                return PageElement(
+                    role=role,
+                    visible_text=text,
+                    accessible_text=text,
+                    table_id="exam-attempts",
+                    table_row=row,
+                    table_column=column,
+                    table_row_span=row_span,
+                    header_scope=scope,
+                    bbox=[100 + 250 * column, 100 + 150 * row, 330 + 250 * column, 220 + 150 * row],
+                )
+
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Exam Attempts",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[
+                            element(ElementRole.H1, "Exam attempts", top=40),
+                            cell(
+                                ElementRole.TH,
+                                "Attempt",
+                                0,
+                                0,
+                                scope=TableHeaderScope.ROW,
+                                row_span=3,
+                            ),
+                            cell(
+                                ElementRole.TH,
+                                "January",
+                                0,
+                                1,
+                                scope=TableHeaderScope.COLUMN,
+                            ),
+                            cell(
+                                ElementRole.TH,
+                                "May",
+                                0,
+                                2,
+                                scope=TableHeaderScope.COLUMN,
+                            ),
+                            cell(ElementRole.TD, "Pass", 1, 1),
+                            cell(ElementRole.TD, "Fail", 1, 2),
+                            cell(ElementRole.TD, "", 2, 1),
+                            cell(ElementRole.TD, "", 2, 2),
+                        ],
+                    )
+                ],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+
+            with pikepdf.Pdf.open(output) as pdf:
+                table = list(pdf.Root.StructTreeRoot.K.K)[1]
+                rows = list(table.K)
+                self.assertEqual([len(row.K) for row in rows], [3, 2, 2])
+                attributes = next(
+                    item for item in rows[0].K[0].A if str(item.O) == "/Table"
+                )
+                self.assertEqual(int(attributes.RowSpan), 3)
+
+            serialized = serialize_structure_tree(output)
+            self.assertEqual(serialized["errors"], [])
+            self.assertEqual(compare_structure_to_plan(serialized, plan), [])
+            self.assertEqual(
+                [record["table_column"] for record in serialized["elements"][1:]],
+                [0, 1, 2, 1, 2, 1, 2],
+            )
+            candidate = Path(temp) / "candidate.pdf"
+            add_pdfua_declaration(output, candidate, plan)
+            vera_ok, vera_report = run_verapdf(candidate)
+            if vera_ok is not None:
+                self.assertTrue(vera_ok, vera_report)
 
     def test_preflight_snapshots_source_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -407,6 +718,241 @@ class CompileTests(unittest.TestCase):
                 self.assertEqual(
                     pdf.pages[0].Contents[-4].read_bytes(), b"EMC\nEMC\nQ\n"
                 )
+
+    def test_fillable_widgets_are_preserved_tagged_described_and_editable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            filled = Path(temp) / "filled.pdf"
+            document = pymupdf.open()
+            page = document.new_page(width=400, height=240)
+            text_widget = pymupdf.Widget()
+            text_widget.field_name = "Text3"
+            text_widget.field_type = pymupdf.PDF_WIDGET_TYPE_TEXT
+            text_widget.rect = pymupdf.Rect(120, 50, 300, 75)
+            page.add_widget(text_widget)
+            checkbox = pymupdf.Widget()
+            checkbox.field_name = "Approved"
+            checkbox.field_label = "Approve this request"
+            checkbox.field_type = pymupdf.PDF_WIDGET_TYPE_CHECKBOX
+            checkbox.rect = pymupdf.Rect(120, 95, 140, 115)
+            page.add_widget(checkbox)
+            document.save(source)
+            document.close()
+            heading = PageElement(
+                role=ElementRole.H1,
+                visible_text="Sample form",
+                accessible_text="Sample form",
+                bbox=[100, 50, 900, 180],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Sample Form",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[heading],
+                        form_widgets=[
+                            FormWidgetPlan(widget_index=0, description="Student name"),
+                            FormWidgetPlan(
+                                widget_index=1,
+                                description="Approve this request",
+                            ),
+                        ],
+                    )
+                ],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+
+            source_snapshot = form_snapshot(source)
+            output_snapshot = form_snapshot(output)
+            self.assertEqual(
+                [widget["name"] for widget in source_snapshot["widgets"]],
+                [widget["name"] for widget in output_snapshot["widgets"]],
+            )
+            self.assertEqual(source_snapshot["widgets_missing_tooltips"], 1)
+            self.assertEqual(source_snapshot["widgets_with_generic_descriptions"], 0)
+            self.assertEqual(output_snapshot["widgets_missing_tooltips"], 0)
+            self.assertEqual(output_snapshot["widgets_with_generic_descriptions"], 0)
+            self.assertEqual(output_snapshot["accessibility_errors"], [])
+            preflight = inspect_pdf(source, RemediationMode.AUTO)
+            self.assertEqual(preflight.widget_count, 2)
+            self.assertGreaterEqual(preflight.form_field_count, 2)
+            self.assertEqual(preflight.widgets_missing_descriptions, 1)
+            self.assertEqual(preflight.widgets_missing_tooltips, 1)
+            self.assertEqual(preflight.widgets_with_generic_descriptions, 0)
+            with pikepdf.Pdf.open(output) as pdf:
+                widgets = [
+                    annotation
+                    for annotation in pdf.pages[0].Annots
+                    if str(annotation.Subtype) == "/Widget"
+                ]
+                self.assertEqual(len(widgets), 2)
+                self.assertTrue(all("/StructParent" in widget for widget in widgets))
+                self.assertEqual(
+                    [str(widget.get("/TU", "")) for widget in widgets],
+                    ["Student name", "Approve this request"],
+                )
+                roles = [str(item.S) for item in pdf.Root.StructTreeRoot.K.K]
+                self.assertEqual(roles, ["/H1", "/Form", "/Form"])
+                form_elements = list(pdf.Root.StructTreeRoot.K.K)[1:]
+                self.assertEqual(
+                    [str(item.Alt) for item in form_elements],
+                    ["Student name", "Approve this request"],
+                )
+                parent_numbers = list(pdf.Root.StructTreeRoot.ParentTree.Nums)
+                parent_keys = [
+                    int(parent_numbers[index])
+                    for index in range(0, len(parent_numbers), 2)
+                ]
+                self.assertEqual(parent_keys, sorted(parent_keys))
+            self.assertEqual(
+                compare_structure_to_plan(serialize_structure_tree(output), plan), []
+            )
+            report = validate_output(
+                source, output, plan, reference_source=source
+            )
+            self.assertTrue(report["form_fields_preserved"])
+            self.assertTrue(report["form_descriptions_match_plan"])
+            self.assertTrue(report["form_accessibility_policy_ok"])
+
+            with pymupdf.open(output) as document:
+                page = document[0]
+                widgets = list(page.widgets())
+                field = next(
+                    widget
+                    for widget in widgets
+                    if widget.field_name == "Text3"
+                )
+                field.field_value = "Ada Lovelace"
+                field.update()
+                document.save(filled)
+            with pymupdf.open(filled) as document:
+                page = document[0]
+                values = {
+                    widget.field_name: widget.field_value
+                    for widget in page.widgets()
+                }
+            self.assertEqual(values["Text3"], "Ada Lovelace")
+
+    def test_field_tooltip_is_written_to_terminal_field_owner(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        widget = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/Annot"),
+                Subtype=pikepdf.Name("/Widget"),
+            )
+        )
+        field = pdf.make_indirect(
+            pikepdf.Dictionary(
+                FT=pikepdf.Name("/Tx"),
+                T=pikepdf.String("Student name"),
+                Kids=pikepdf.Array([widget]),
+            )
+        )
+        widget[pikepdf.Name("/Parent")] = field
+
+        self.assertEqual(terminal_field_dictionary(widget).objgen, field.objgen)
+        set_field_tooltip(widget, "Student name")
+        self.assertEqual(str(field.get("/TU", "")), "Student name")
+        self.assertNotIn("/TU", widget)
+
+        group = pdf.make_indirect(
+            pikepdf.Dictionary(T=pikepdf.String("Committee"))
+        )
+        merged_widget = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/Annot"),
+                Subtype=pikepdf.Name("/Widget"),
+                FT=pikepdf.Name("/Tx"),
+                T=pikepdf.String("Chair"),
+                Parent=group,
+            )
+        )
+        self.assertEqual(
+            terminal_field_dictionary(merged_widget).objgen,
+            merged_widget.objgen,
+        )
+
+    def test_pdfua_form_with_two_missing_tooltips_is_not_passed_through(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            compiled = Path(temp) / "compiled.pdf"
+            damaged = Path(temp) / "missing-tooltips.pdf"
+            document = pymupdf.open()
+            page = document.new_page(width=400, height=240)
+            for index, name in enumerate(
+                ("Co-Chair or Member 1", "Graduate Coordinator Approval")
+            ):
+                widget = pymupdf.Widget()
+                widget.field_name = name
+                widget.field_type = pymupdf.PDF_WIDGET_TYPE_TEXT
+                widget.rect = pymupdf.Rect(80, 60 + index * 50, 300, 85 + index * 50)
+                page.add_widget(widget)
+            document.save(source)
+            document.close()
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Supervisory Committee",
+                pages=[
+                    PagePlan(
+                        page_number=1,
+                        elements=[
+                            PageElement(
+                                role=ElementRole.H1,
+                                visible_text="Supervisory Committee",
+                                accessible_text="Supervisory Committee",
+                                bbox=[100, 50, 900, 180],
+                            )
+                        ],
+                        form_widgets=[
+                            FormWidgetPlan(
+                                widget_index=0,
+                                description="Co-Chair or Committee Member 1 name",
+                            ),
+                            FormWidgetPlan(
+                                widget_index=1,
+                                description="Graduate Coordinator approval",
+                            ),
+                        ],
+                    )
+                ],
+            )
+            compile_tagged_pdf(source, compiled, plan)
+            with pikepdf.Pdf.open(compiled) as pdf:
+                widgets = [
+                    annotation
+                    for annotation in pdf.pages[0].Annots
+                    if str(annotation.get("/Subtype", "")) == "/Widget"
+                ]
+                for widget in widgets:
+                    owner = terminal_field_dictionary(widget)
+                    del owner["/TU"]
+                pdf.save(damaged)
+
+            snapshot = form_snapshot(damaged)
+            self.assertEqual(snapshot["widget_count"], 2)
+            self.assertEqual(snapshot["widgets_missing_tooltips"], 2)
+            self.assertEqual(
+                [
+                    widget["accessible_name_source"]
+                    for widget in snapshot["widgets"]
+                ],
+                ["field_name_fallback", "field_name_fallback"],
+            )
+            with mock.patch(
+                "pdf_accessibility.preflight.run_verapdf",
+                return_value=(True, {}),
+            ):
+                preflight = inspect_pdf(damaged, RemediationMode.AUTO)
+            self.assertTrue(preflight.pdfua_valid)
+            self.assertNotEqual(
+                preflight.selected_mode,
+                RemediationMode.PASS_THROUGH,
+            )
+            self.assertEqual(preflight.widgets_missing_tooltips, 2)
+            self.assertTrue(preflight.form_accessibility_errors)
 
     def test_anchor_font_preserves_circle_glyphs_in_extracted_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1034,6 +1580,70 @@ class CompileTests(unittest.TestCase):
             ):
                 compile_tagged_pdf(source, output, plan, geometry_source=geometry)
 
+    def test_reviewed_fallback_does_not_create_a_new_neighbor_collision(self) -> None:
+        elements = [
+            PageElement(role=ElementRole.P, text="First", bbox=[0, 0, 100, 100]),
+            PageElement(role=ElementRole.P, text="Second", bbox=[0, 0, 100, 100]),
+            PageElement(role=ElementRole.P, text="Third", bbox=[0, 0, 100, 100]),
+        ]
+        for index, element in enumerate(elements, start=1):
+            element.id = f"e{index}"
+
+        def line(text: str, top: float, bottom: float) -> LinePlacement:
+            return LinePlacement(
+                text=text,
+                bbox=(10.0, top, 90.0, bottom),
+                chunks=[],
+            )
+
+        first = line("First", 0.0, 10.0)
+        first_reviewed = line("First", 0.0, 4.0)
+        second = line("Second", 5.0, 15.0)
+        second_reviewed = line("Second", 4.0, 24.0)
+        third = line("Third", 16.0, 26.0)
+        candidates = [
+            RegionLineCandidate(
+                element=elements[0],
+                chunks=[],
+                fragments=[],
+                logical_lines=[first],
+                fragment_lines=[first],
+                reviewed_fragment_lines=[first_reviewed],
+            ),
+            RegionLineCandidate(
+                element=elements[1],
+                chunks=[],
+                fragments=[],
+                logical_lines=[second],
+                fragment_lines=[second],
+                reviewed_fragment_lines=[second_reviewed],
+            ),
+            RegionLineCandidate(
+                element=elements[2],
+                chunks=[],
+                fragments=[],
+                logical_lines=[third],
+                fragment_lines=[third],
+                reviewed_fragment_lines=[third],
+            ),
+        ]
+        font = AnchorFont(
+            resource=None,
+            supported_codepoints=frozenset(),
+            advances={},
+        )
+
+        selected, fragment_anchored = _collision_safe_region_lines(
+            candidates,
+            font,
+            page_width=100.0,
+        )
+
+        self.assertEqual(selected[0], [first_reviewed])
+        self.assertEqual(selected[1], [second])
+        self.assertEqual(selected[2], [third])
+        self.assertEqual(fragment_anchored, {0})
+
     def test_low_agreement_title_uses_reviewed_region_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"
@@ -1215,6 +1825,42 @@ class CompileTests(unittest.TestCase):
         self.assertLess(top, bottom)
         self.assertEqual(planned.visible_fragments[0].alignment_coverage, 1)
 
+    def test_half_matching_neighbor_is_repaired_to_exact_phrase(self) -> None:
+        planned = PageElement(
+            role=ElementRole.H2,
+            visible_fragments=[
+                TextFragment(text="Excellence Awards", bbox=[100, 450, 700, 600])
+            ],
+            visible_text="Excellence Awards",
+            accessible_text="Excellence Awards",
+            bbox=[100, 450, 700, 600],
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+
+        placements = _align_element_fragments(
+            planned,
+            chunks,
+            [
+                (10.0, 20.0, 35.0, 30.0, "Excellence"),
+                (37.0, 20.0, 60.0, 30.0, "Awards"),
+                (10.0, 50.0, 35.0, 60.0, "Graduate"),
+                (37.0, 50.0, 70.0, 60.0, "Excellence"),
+            ],
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertLess(planned.visible_fragments[0].bbox[1], 400)
+        self.assertEqual(planned.visible_fragments[0].alignment_coverage, 1)
+        self.assertTrue(
+            all(
+                placement.bbox[1] < 40
+                for items in placements.values()
+                for placement in items
+            )
+        )
+
     def test_shifted_box_repair_rejects_scattered_common_words(self) -> None:
         original_bbox = [300.0, 50.0, 700.0, 90.0]
         planned = PageElement(
@@ -1238,6 +1884,69 @@ class CompileTests(unittest.TestCase):
                 (30.0, 5.0, 40.0, 8.0, "14th"),
                 (30.0, 50.0, 55.0, 54.0, "Ramanujan"),
                 (30.0, 90.0, 60.0, 94.0, "Colloquium"),
+            ],
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertEqual(planned.visible_fragments[0].bbox, original_bbox)
+
+    def test_shifted_box_repair_rejects_tokens_split_across_adjacent_lines(self) -> None:
+        original_bbox = [100.0, 100.0, 600.0, 180.0]
+        planned = PageElement(
+            role=ElementRole.LI,
+            visible_fragments=[
+                TextFragment(
+                    text="dim maps R to Z",
+                    bbox=list(original_bbox),
+                )
+            ],
+            visible_text="dim maps R to Z",
+            accessible_text="dim maps R to Z",
+            bbox=list(original_bbox),
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+
+        _align_element_fragments(
+            planned,
+            chunks,
+            [
+                (10.0, 10.0, 18.0, 15.0, "dim"),
+                (10.0, 40.0, 22.0, 45.0, "maps"),
+                (24.0, 40.0, 28.0, 45.0, "R"),
+                (30.0, 40.0, 35.0, 45.0, "to"),
+                (37.0, 40.0, 41.0, 45.0, "Z"),
+            ],
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertEqual(planned.visible_fragments[0].bbox, original_bbox)
+
+    def test_shifted_box_repair_rejects_partial_repeated_phrase_elsewhere(self) -> None:
+        original_bbox = [200.0, 100.0, 800.0, 180.0]
+        planned = PageElement(
+            role=ElementRole.P,
+            visible_fragments=[
+                TextFragment(
+                    text="NINTH ULAM COLLOQUIUM",
+                    bbox=list(original_bbox),
+                )
+            ],
+            visible_text="NINTH ULAM COLLOQUIUM",
+            accessible_text="NINTH ULAM COLLOQUIUM",
+            bbox=list(original_bbox),
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+
+        _align_element_fragments(
+            planned,
+            chunks,
+            [
+                (20.0, 80.0, 35.0, 85.0, "ULAM"),
+                (37.0, 80.0, 62.0, 85.0, "COLLOQUIUM"),
             ],
             width=100,
             height=100,
@@ -1272,6 +1981,105 @@ class CompileTests(unittest.TestCase):
 
         self.assertLess(planned.visible_fragments[0].bbox[1], 400)
         self.assertEqual(planned.visible_fragments[0].alignment_coverage, 1)
+
+    def test_shifted_box_repair_accepts_uniquely_near_repeated_short_fragment(self) -> None:
+        planned = PageElement(
+            role=ElementRole.H2,
+            visible_fragments=[
+                TextFragment(text="Integration Bee", bbox=[100, 400, 800, 520])
+            ],
+            visible_text="Integration Bee",
+            accessible_text="Integration Bee",
+            bbox=[100, 400, 800, 520],
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+
+        _align_element_fragments(
+            planned,
+            chunks,
+            [
+                (10.0, 28.0, 45.0, 38.0, "Integration"),
+                (47.0, 28.0, 60.0, 38.0, "Bee"),
+                (10.0, 70.0, 45.0, 80.0, "Integration"),
+                (47.0, 70.0, 60.0, 80.0, "Bee"),
+            ],
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertLess(planned.visible_fragments[0].bbox[1], 400)
+        self.assertEqual(planned.visible_fragments[0].alignment_coverage, 1)
+
+    def test_shifted_box_repair_rejects_ambiguous_repeated_short_fragment(self) -> None:
+        original_bbox = [100.0, 400.0, 800.0, 520.0]
+        planned = PageElement(
+            role=ElementRole.H2,
+            visible_fragments=[
+                TextFragment(text="Integration Bee", bbox=list(original_bbox))
+            ],
+            visible_text="Integration Bee",
+            accessible_text="Integration Bee",
+            bbox=list(original_bbox),
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+
+        _align_element_fragments(
+            planned,
+            chunks,
+            [
+                (10.0, 28.0, 45.0, 38.0, "Integration"),
+                (47.0, 28.0, 60.0, 38.0, "Bee"),
+                (10.0, 54.0, 45.0, 64.0, "Integration"),
+                (47.0, 54.0, 60.0, 64.0, "Bee"),
+            ],
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertEqual(planned.visible_fragments[0].bbox, original_bbox)
+
+    def test_shifted_box_repair_selects_local_repeated_long_fragment(self) -> None:
+        planned = PageElement(
+            role=ElementRole.P,
+            visible_fragments=[
+                TextFragment(
+                    text="Presented by: Konstantina Christodoulopoulou",
+                    bbox=[100, 700, 950, 800],
+                )
+            ],
+            visible_text="Presented by: Konstantina Christodoulopoulou",
+            accessible_text="Presented by: Konstantina Christodoulopoulou",
+            bbox=[100, 700, 950, 800],
+        )
+        chunks = _page_anchor_chunks([planned])[0]
+        phrase = ["Presented", "by:", "Konstantina", "Christodoulopoulou"]
+        words = []
+        for top in (5.0, 44.0):
+            for index, word in enumerate(phrase):
+                words.append(
+                    (10.0 + index * 20, top, 28.0 + index * 20, top + 8.0, word)
+                )
+
+        placements = _align_element_fragments(
+            planned,
+            chunks,
+            words,
+            width=100,
+            height=100,
+            geometry_source="native",
+        )
+
+        self.assertGreater(planned.visible_fragments[0].bbox[1], 400)
+        self.assertEqual(planned.visible_fragments[0].alignment_coverage, 1)
+        self.assertTrue(
+            all(
+                placement.bbox[1] >= 40
+                for items in placements.values()
+                for placement in items
+            )
+        )
 
     def test_structure_serializer_preserves_exact_text_and_detects_parent_tree_damage(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1373,11 +2181,11 @@ class CompileTests(unittest.TestCase):
                 with pdf.open_metadata(set_pikepdf_as_editor=False) as metadata:
                     self.assertEqual(metadata["pdfuaid:part"], "1")
                     self.assertEqual(metadata["llmpr:tool"], REMEDIATION_TOOL)
-                    self.assertEqual(metadata["llmpr:version"], "0.4.0")
+                    self.assertEqual(metadata["llmpr:version"], "0.5.0")
                     self.assertEqual(
                         metadata["llmpr:remediationDate"], "2026-07-19T12:30:00Z"
                     )
-                    self.assertEqual(metadata["llmpr:schemaVersion"], "5")
+                    self.assertEqual(metadata["llmpr:schemaVersion"], "7")
                     self.assertEqual(metadata["llmpr:sourceSha256"], "a" * 64)
                     self.assertIn("llmpr:canonicalPlanSha256", metadata)
                     self.assertEqual(metadata["llmpr:remediation"], REMEDIATION_SUMMARY)
@@ -1462,7 +2270,7 @@ class PlanMigrationTests(unittest.TestCase):
 
             plan = load_document_plan(path)
 
-            self.assertEqual(plan.schema_version, 5)
+            self.assertEqual(plan.schema_version, 7)
             self.assertEqual(plan.pages[0].elements[0].visible_text, "Authored sucess.")
             self.assertEqual(plan.pages[0].elements[0].accessible_text, "Authored sucess.")
             self.assertTrue(path.with_suffix(".legacy.json").exists())
@@ -1501,7 +2309,7 @@ class PlanMigrationTests(unittest.TestCase):
 
             plan = load_document_plan(path)
 
-            self.assertEqual(plan.schema_version, 5)
+            self.assertEqual(plan.schema_version, 7)
             self.assertEqual(plan.pages[0].coordinate_space, CoordinateSpace.PDF_POINTS)
             self.assertTrue(plan_is_approved(plan))
 
@@ -1550,8 +2358,167 @@ class RecentTitleTests(unittest.TestCase):
                 ["Second Document", "First Document", "Third Document"],
             )
 
+    def test_concurrent_history_updates_do_not_lose_titles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / ".recent-titles.json"
+            titles = [f"Concurrent Document {index}" for index in range(24)]
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(lambda title: remember_title(path, title), titles))
+
+            self.assertCountEqual(load_recent_titles(path), titles)
+
 
 class DeterministicRefinementTests(unittest.TestCase):
+    def test_missing_blank_table_cells_are_completed_idempotently(self) -> None:
+        def table_cell(
+            role: ElementRole,
+            text: str,
+            row: int,
+            column: int,
+            scope: TableHeaderScope | None = None,
+        ) -> PageElement:
+            return PageElement(
+                role=role,
+                visible_text=text,
+                accessible_text=text,
+                table_id="exam-grid",
+                table_row=row,
+                table_column=column,
+                header_scope=scope,
+                bbox=[100 + column * 200, 100 + row * 100, 300 + column * 200, 200 + row * 100],
+                review_status=ReviewStatus.MODEL_REVIEWED,
+            )
+
+        page = PagePlan(
+            page_number=1,
+            elements=[
+                table_cell(ElementRole.TH, "January", 0, 1, TableHeaderScope.COLUMN),
+                table_cell(ElementRole.TH, "May", 0, 2, TableHeaderScope.COLUMN),
+                table_cell(ElementRole.TH, "Attempt", 1, 0, TableHeaderScope.ROW),
+                table_cell(ElementRole.TD, "", 1, 1),
+                table_cell(ElementRole.TD, "", 1, 2),
+            ],
+            review_status=ReviewStatus.MODEL_REVIEWED,
+        )
+
+        _complete_rectangular_table_grids(page)
+        first_result = page.model_dump(mode="json")
+        _complete_rectangular_table_grids(page)
+
+        self.assertEqual(page.model_dump(mode="json"), first_result)
+        self.assertEqual(
+            [(element.table_row, element.table_column) for element in page.elements],
+            [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)],
+        )
+        self.assertEqual(page.elements[0].role, ElementRole.TD)
+        self.assertEqual(page.elements[0].visible_text, "")
+        self.assertEqual(len(page.findings), 1)
+
+    def test_reviewed_fixed_form_markers_are_omitted_from_spoken_text(self) -> None:
+        visible = "(Co-Chair? *__Yes__ No)"
+        accessible = "(Co-Chair? Yes No)"
+        row = PageElement(
+            role=ElementRole.P,
+            visible_text=visible,
+            accessible_text=accessible,
+            transformations=[
+                TextTransformation(
+                    kind=TransformationKind.DECORATIVE_MARKER_OMISSION,
+                    source_text=visible,
+                    replacement_text=accessible,
+                    rationale="Reviewed fixed-form blank markers.",
+                )
+            ],
+            bbox=[100, 100, 500, 150],
+        )
+
+        canonicalize_transformations(row)
+
+        self.assertEqual(row.accessible_text, accessible)
+        self.assertTrue(row.transformations)
+        self.assertFalse(
+            any(
+                item.kind == TransformationKind.UNVERIFIED
+                for item in row.transformations
+            )
+        )
+
+    def test_static_form_rules_and_empty_boxes_are_silenced(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            document = pymupdf.open()
+            document.new_page()
+            document.save(source)
+            document.close()
+            visible = (
+                "Student Name: __________ UFID______-______ "
+                "Location: ☐ In-person ☐ Via Zoom ☐ Hybrid"
+            )
+            row = PageElement(
+                role=ElementRole.P,
+                visible_text=visible,
+                accessible_text=visible,
+                bbox=[100, 100, 900, 180],
+            )
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Static form",
+                pages=[PagePlan(page_number=1, elements=[row])],
+            )
+
+            refine_document_plan(source, plan)
+
+            self.assertEqual(
+                row.accessible_text,
+                "Student Name: UFID Location: In-person Via Zoom Hybrid",
+            )
+            self.assertFalse(
+                any(
+                    item.kind == TransformationKind.UNVERIFIED
+                    for item in row.transformations
+                )
+            )
+
+    def test_static_rules_do_not_discard_reviewed_fraction_speech(self) -> None:
+        visible = "1. 0 to 1/3 full _____ 1/3 to 2/3 full _____"
+        accessible = "1. 0 to one third full; one third to two thirds full"
+        row = PageElement(
+            role=ElementRole.LI,
+            visible_text=visible,
+            accessible_text=accessible,
+            transformations=[
+                TextTransformation(
+                    kind=TransformationKind.FORMULA_SPOKEN_EQUIVALENT,
+                    source_text="0 to 1/3 full",
+                    replacement_text="0 to one third full",
+                    rationale="Reviewed fraction speech.",
+                ),
+                TextTransformation(
+                    kind=TransformationKind.FORMULA_SPOKEN_EQUIVALENT,
+                    source_text="1/3 to 2/3 full",
+                    replacement_text="one third to two thirds full",
+                    rationale="Reviewed fraction speech.",
+                ),
+            ],
+            bbox=[100, 100, 900, 180],
+        )
+
+        _normalize_static_form_markers(row)
+        canonicalize_transformations(row)
+
+        self.assertEqual(row.accessible_text, accessible)
+        self.assertEqual(len(row.formula_spans), 2)
+        self.assertFalse(
+            any(finding.severity == ReviewSeverity.CRITICAL for finding in row.findings)
+        )
+        self.assertFalse(
+            any(
+                item.kind == TransformationKind.UNVERIFIED
+                for item in row.transformations
+            )
+        )
+
     def test_formula_mapping_tolerates_layout_line_breaks(self) -> None:
         visible = "The estimate assumes 1 << M\n<< N."
         spoken = "one is much less than M, which is much less than N"

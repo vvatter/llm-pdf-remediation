@@ -1,6 +1,8 @@
 .venv/
 build/
 upload/
+uploads/
+uploads FORMS/
 *.egg-info/
 *.pyc
 __pycache__/
@@ -8,4 +10,6 @@ __pycache__/
 .pytest_cache/
 .env
 /.recent-titles.json
+/.recent-titles.json.lock
+/.recent-titles.json.lock-v2
 /src/*.pdf

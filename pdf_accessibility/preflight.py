@@ -11,6 +11,7 @@ import pymupdf
 from pikepdf.models.metadata import decode_pdf_date
 from pydantic import BaseModel, Field
 
+from .forms import form_snapshot_pdf
 from .models import RemediationMode
 from .plans import sha256_file
 
@@ -58,6 +59,16 @@ class PreflightReport(BaseModel):
     native_text_page_ratio: float
     fonts_embedded: bool
     fonts_unicode_mapped: bool
+    form_field_count: int = 0
+    widget_count: int = 0
+    widgets_missing_descriptions: int = 0
+    widgets_with_generic_descriptions: int = 0
+    widgets_missing_tooltips: int = 0
+    widgets_with_generic_tooltips: int = 0
+    widgets_missing_structure_labels: int = 0
+    widgets_with_mismatched_structure_labels: int = 0
+    form_accessibility_errors: list[str] = Field(default_factory=list)
+    xfa_present: bool = False
     source_metadata: SourceMetadata = Field(default_factory=SourceMetadata)
     pages: list[PagePreflight] = Field(default_factory=list)
     fonts: list[FontFinding] = Field(default_factory=list)
@@ -186,11 +197,13 @@ def inspect_pdf(
     encrypted = False
     already_tagged = False
     source_metadata = SourceMetadata()
+    form_state: dict[str, object] = {}
 
     try:
         source_metadata = read_source_metadata(source)
         with pikepdf.Pdf.open(source) as pdf:
             encrypted = bool(pdf.is_encrypted)
+            form_state = form_snapshot_pdf(pdf)
             already_tagged = bool(
                 pdf.Root.get("/StructTreeRoot")
                 and pdf.Root.get("/MarkInfo", {}).get("/Marked", False)
@@ -246,20 +259,31 @@ def inspect_pdf(
     )
     fonts_embedded = bool(fonts) and all(font.embedded for font in fonts)
     fonts_unicode = bool(fonts) and all(font.unicode_mapping for font in fonts)
+    form_accessibility_errors = [
+        str(error) for error in form_state.get("accessibility_errors", [])
+    ]
     pdfua_valid: bool | None = None
     reasons: list[str] = []
 
     if encrypted:
         automatic = RemediationMode.UNSUPPORTED
         reasons.append("The PDF is encrypted or cannot be opened without a password.")
+    elif bool(form_state.get("xfa_present", False)):
+        automatic = RemediationMode.UNSUPPORTED
+        reasons.append(
+            "The PDF contains XFA forms, whose interaction cannot yet be preserved safely."
+        )
     elif not qpdf_ok or not render_ok:
         automatic = RemediationMode.UNSUPPORTED
         reasons.append("The PDF failed structural or rendering preflight.")
     elif already_tagged:
         pdfua_valid, _ = run_verapdf(source)
-        if pdfua_valid:
+        if pdfua_valid and not form_accessibility_errors:
             automatic = RemediationMode.PASS_THROUGH
-            reasons.append("The existing tagged PDF passes veraPDF PDF/UA-1 validation.")
+            reasons.append(
+                "The existing tagged PDF passes veraPDF PDF/UA-1 validation and "
+                "the project form-accessibility policy."
+            )
         else:
             if native_ratio >= 0.95 and fonts_embedded and fonts_unicode:
                 automatic = RemediationMode.NATIVE
@@ -267,7 +291,15 @@ def inspect_pdf(
                 automatic = RemediationMode.HYBRID
             else:
                 automatic = RemediationMode.FACSIMILE
-            reasons.append("Existing tags are not a validated PDF/UA-1 pass-through candidate.")
+            if not pdfua_valid:
+                reasons.append(
+                    "Existing tags are not a validated PDF/UA-1 pass-through candidate."
+                )
+            if form_accessibility_errors:
+                reasons.append(
+                    "Existing interactive controls fail the project form-accessibility "
+                    "policy and must be remediated."
+                )
     elif native_ratio >= 0.95 and fonts_embedded and fonts_unicode:
         automatic = RemediationMode.NATIVE
         reasons.append("At least 95% of nonblank pages have usable native Unicode text and fonts.")
@@ -297,6 +329,43 @@ def inspect_pdf(
         )
     if requested_mode != RemediationMode.AUTO and selected == requested_mode and selected != automatic:
         reasons.append(f"Automatic mode {automatic.value!r} was overridden with {selected.value!r}.")
+    widget_count = int(form_state.get("widget_count", 0))
+    if widget_count:
+        missing_tooltip_count = int(
+            form_state.get("widgets_missing_tooltips", 0)
+        )
+        generic_widget_count = int(
+            form_state.get("widgets_with_generic_tooltips", 0)
+        )
+        missing_structure_count = int(
+            form_state.get("widgets_missing_structure_labels", 0)
+        )
+        mismatched_structure_count = int(
+            form_state.get("widgets_with_mismatched_structure_labels", 0)
+        )
+        reasons.append(
+            f"The source contains {widget_count} interactive widgets; field identity, "
+            "values, options, geometry, order, and editability must survive release."
+        )
+        if missing_tooltip_count:
+            reasons.append(
+                f"{missing_tooltip_count} widgets lack an explicit terminal-field /TU "
+                "accessible name."
+            )
+        if generic_widget_count:
+            reasons.append(
+                f"{generic_widget_count} widgets use generic /TU descriptions; "
+                "reviewed visible-context tooltips are required."
+            )
+        if missing_structure_count:
+            reasons.append(
+                f"{missing_structure_count} widgets lack a Form structure /Alt label."
+            )
+        if mismatched_structure_count:
+            reasons.append(
+                f"{mismatched_structure_count} widget tooltips disagree with their "
+                "Form structure labels."
+            )
 
     return PreflightReport(
         source=str(source),
@@ -313,6 +382,28 @@ def inspect_pdf(
         native_text_page_ratio=native_ratio,
         fonts_embedded=fonts_embedded,
         fonts_unicode_mapped=fonts_unicode,
+        form_field_count=int(form_state.get("field_count", 0)),
+        widget_count=widget_count,
+        widgets_missing_descriptions=int(
+            form_state.get("widgets_missing_descriptions", 0)
+        ),
+        widgets_with_generic_descriptions=int(
+            form_state.get("widgets_with_generic_descriptions", 0)
+        ),
+        widgets_missing_tooltips=int(
+            form_state.get("widgets_missing_tooltips", 0)
+        ),
+        widgets_with_generic_tooltips=int(
+            form_state.get("widgets_with_generic_tooltips", 0)
+        ),
+        widgets_missing_structure_labels=int(
+            form_state.get("widgets_missing_structure_labels", 0)
+        ),
+        widgets_with_mismatched_structure_labels=int(
+            form_state.get("widgets_with_mismatched_structure_labels", 0)
+        ),
+        form_accessibility_errors=form_accessibility_errors,
+        xfa_present=bool(form_state.get("xfa_present", False)),
         source_metadata=source_metadata,
         pages=pages,
         fonts=fonts,

@@ -125,7 +125,13 @@ def _transformation_kind(source: str, replacement: str) -> TransformationKind:
         return TransformationKind.LINE_BREAK_DEHYPHENATION
     if source and not replacement and not re.sub(r"[\s←→⟵⟶]", "", source):
         return TransformationKind.DECORATIVE_MARKER_OMISSION
-    if source.isspace() and replacement in {"; ", ": "}:
+    if (not source or source.isspace()) and replacement.strip() in {",", ";", ":"}:
+        return TransformationKind.STRUCTURAL_SEPARATOR_NORMALIZATION
+    if (
+        source
+        and not re.sub(r"[\s.·…_]", "", source)
+        and replacement.strip() in {",", ";", ":"}
+    ):
         return TransformationKind.STRUCTURAL_SEPARATOR_NORMALIZATION
     if source.strip() == "|" and replacement.strip() in {",", ";", ":"}:
         return TransformationKind.STRUCTURAL_SEPARATOR_NORMALIZATION
@@ -188,6 +194,8 @@ def canonicalize_transformations(element: PageElement) -> None:
             ElementRole.H3,
             ElementRole.P,
             ElementRole.LI,
+            ElementRole.TH,
+            ElementRole.TD,
         }
         and any(
             (finding.chosen or "").strip() == marker_free.strip()
@@ -196,6 +204,16 @@ def canonicalize_transformations(element: PageElement) -> None:
     ):
         element.accessible_text = marker_free
     visible, accessible = element.visible_text, element.accessible_text
+    declared_decorative_rewrite = any(
+        item.kind
+        in {
+            TransformationKind.DECORATIVE_LEADER_OMISSION,
+            TransformationKind.DECORATIVE_MARKER_OMISSION,
+        }
+        and item.source_text == visible
+        and item.replacement_text == accessible
+        for item in element.transformations
+    )
     declared_formulae = [
         item
         for item in element.transformations
@@ -259,7 +277,7 @@ def canonicalize_transformations(element: PageElement) -> None:
             for term in ("omit", "decorative-marker", "ornamental")
         )
         for finding in element.findings
-    )
+    ) or declared_decorative_rewrite
     unmapped_math = False
 
     def append_gap(
@@ -296,6 +314,8 @@ def canonicalize_transformations(element: PageElement) -> None:
                     ElementRole.H3,
                     ElementRole.P,
                     ElementRole.LI,
+                    ElementRole.TH,
+                    ElementRole.TD,
                 }
                 and not replacement_text
                 and re.fullmatch(r"[\s*•●○▪■+\-–—]+", source_text)
@@ -418,6 +438,38 @@ def canonicalize_transformations(element: PageElement) -> None:
                 )
             )
         canonicalize_transformations(element)
+
+
+def _normalize_static_form_markers(element: PageElement) -> None:
+    if element.role == ElementRole.FIGURE:
+        return
+    visible = element.visible_text
+    if not re.search(r"_{3,}|[☐□◻]", visible):
+        return
+    reviewed_accessible = element.accessible_text or visible
+    accessible = re.sub(r"_{3,}(?:\s*-\s*_{3,})+", "", reviewed_accessible)
+    accessible = re.sub(r"_{3,}", "", accessible)
+    accessible = re.sub(r"[☐□◻]", "", accessible)
+    accessible = " ".join(accessible.split())
+    accessible = re.sub(r"\s+([,;:.])", r"\1", accessible).strip()
+    if not accessible or (
+        accessible == reviewed_accessible and reviewed_accessible != visible
+    ):
+        return
+    element.accessible_text = accessible
+    element.tokens = exact_text_tokens(accessible)
+    if not element.transformations:
+        element.transformations.append(
+            TextTransformation(
+                kind=TransformationKind.DECORATIVE_MARKER_OMISSION,
+                source_text=visible,
+                replacement_text=accessible,
+                rationale=(
+                    "Omits fixed blank writing rules and unselected box outlines from "
+                    "linear speech while retaining their visible labels and options."
+                ),
+            )
+        )
 
 
 def transformation_errors(plan: DocumentPlan) -> list[str]:
@@ -698,6 +750,134 @@ def _mark_resolved_findings(findings: list[ReviewFinding]) -> None:
             finding.chosen = f"Resolved from authoritative page evidence: {finding.chosen}"
 
 
+def _complete_rectangular_table_grids(page: PagePlan) -> None:
+    """Add explicit empty TD cells when a reviewed table omits structural blanks."""
+    index = 0
+    changed = False
+    while index < len(page.elements):
+        first = page.elements[index]
+        if first.role not in {ElementRole.TH, ElementRole.TD}:
+            index += 1
+            continue
+        table_id = first.table_id
+        end = index
+        while (
+            end < len(page.elements)
+            and page.elements[end].role in {ElementRole.TH, ElementRole.TD}
+            and page.elements[end].table_id == table_id
+        ):
+            end += 1
+        cells = page.elements[index:end]
+        rows = sorted({int(cell.table_row) for cell in cells})
+        column_count = max(
+            int(cell.table_column) + int(cell.table_column_span or 1) for cell in cells
+        )
+        covered: set[tuple[int, int]] = set()
+        for cell in cells:
+            for row in range(
+                int(cell.table_row),
+                int(cell.table_row) + int(cell.table_row_span or 1),
+            ):
+                for column in range(
+                    int(cell.table_column),
+                    int(cell.table_column) + int(cell.table_column_span or 1),
+                ):
+                    covered.add((row, column))
+        missing = [
+            (row, column)
+            for row in rows
+            for column in range(column_count)
+            if (row, column) not in covered
+        ]
+        if not missing:
+            index = end
+            continue
+
+        table_left = min(cell.bbox[0] for cell in cells)
+        table_top = min(cell.bbox[1] for cell in cells)
+        table_right = max(cell.bbox[2] for cell in cells)
+        table_bottom = max(cell.bbox[3] for cell in cells)
+        column_bounds: dict[int, tuple[float, float]] = {}
+        for column in range(column_count):
+            portions: list[tuple[float, float]] = []
+            for cell in cells:
+                start_column = int(cell.table_column)
+                span = int(cell.table_column_span or 1)
+                if start_column <= column < start_column + span:
+                    width = (cell.bbox[2] - cell.bbox[0]) / span
+                    portions.append(
+                        (
+                            cell.bbox[0] + width * (column - start_column),
+                            cell.bbox[0] + width * (column - start_column + 1),
+                        )
+                    )
+            column_bounds[column] = (
+                min(portion[0] for portion in portions)
+                if portions
+                else table_left + (table_right - table_left) * column / column_count,
+                max(portion[1] for portion in portions)
+                if portions
+                else table_left + (table_right - table_left) * (column + 1) / column_count,
+            )
+        row_bounds: dict[int, tuple[float, float]] = {}
+        for row in rows:
+            portions = []
+            for cell in cells:
+                start_row = int(cell.table_row)
+                span = int(cell.table_row_span or 1)
+                if start_row <= row < start_row + span:
+                    height = (cell.bbox[3] - cell.bbox[1]) / span
+                    portions.append(
+                        (
+                            cell.bbox[1] + height * (row - start_row),
+                            cell.bbox[1] + height * (row - start_row + 1),
+                        )
+                    )
+            row_bounds[row] = (
+                min(portion[0] for portion in portions) if portions else table_top,
+                max(portion[1] for portion in portions) if portions else table_bottom,
+            )
+
+        complete = list(cells)
+        for row, column in missing:
+            left, right = column_bounds[column]
+            top, bottom = row_bounds[row]
+            complete.append(
+                PageElement(
+                    role=ElementRole.TD,
+                    table_id=table_id,
+                    table_row=row,
+                    table_column=column,
+                    bbox=[left, top, right, bottom],
+                    review_status=page.review_status,
+                )
+            )
+        complete.sort(key=lambda cell: (int(cell.table_row), int(cell.table_column)))
+        page.elements[index:end] = complete
+        index += len(complete)
+        changed = True
+
+    if not changed:
+        return
+    message = (
+        "Reviewed table rows omitted one or more visually blank structural cells; "
+        "deterministic refinement added empty TD cells so every row spans the same columns."
+    )
+    if not any(finding.message == message for finding in page.findings):
+        page.findings.append(
+            ReviewFinding(
+                severity=ReviewSeverity.INFO,
+                category=FindingCategory.SEMANTIC_ROLE,
+                message=message,
+                chosen="Explicit empty data cells required by the rectangular table grid.",
+            )
+        )
+    for element_index, element in enumerate(page.elements, start=1):
+        element.id = f"p{page.page_number:04d}-e{element_index:04d}"
+        for fragment_index, fragment in enumerate(element.visible_fragments, start=1):
+            fragment.id = f"{element.id}-b{fragment_index:03d}"
+
+
 def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
     """Apply deterministic, idempotent corrections after model review."""
     normalize_plan_geometry(source, plan)
@@ -727,6 +907,8 @@ def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
                     existing_artifact_keys.add(key)
                 continue
 
+            if not page.form_widgets:
+                _normalize_static_form_markers(element)
             normalize_spoken_date_ranges(element)
             canonicalize_transformations(element)
             semantic_fragments = []
@@ -761,6 +943,7 @@ def refine_document_plan(source: Path, plan: DocumentPlan) -> DocumentPlan:
             element.findings = _dedupe_findings(element.findings)
             kept.append(element)
         page.elements = kept
+        _complete_rectangular_table_grids(page)
         _order_first_page_epigraph(page)
         page.reconcile_flows()
         _mark_resolved_findings(page.findings)

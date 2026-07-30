@@ -1299,3 +1299,77 @@ identical render at 72, 150, and 300 DPI, and passed qpdf, structure serializati
 PDF/UA-1. Regression coverage now requires a Diaconis-length paragraph printed across six narrow
 lines to compile as one `Tj` run with exact one-line extraction, while the earlier interleaved-list
 test still requires physical fragment placement. The complete suite now contains 52 passing tests.
+
+## 2026-07-21: Form and Table Batch Hardening
+
+A 33-document administrative-form batch added both static writing forms and seven AcroForm
+documents containing 233 interactive widgets. The release path now snapshots and compares the
+source and output field trees, preserves widget order, types, flags, values, options, and actions,
+adds one independently reviewed `/TU` description per widget, and associates each widget with a
+`/Form` structure element. Edit/save/reopen checks on representative fields confirmed that the
+released controls remain usable. Static rules and unselected box outlines remain visibly present
+but are omitted from linear speech; they are not silently converted into interactive controls.
+
+The batch also exercised rosters, schedules, expense grids, academic-progress matrices, and large
+assessment rubrics. Schema version 7 records `/TH` and `/TD` coordinates, header scope, and spans.
+The compiler emits `/Table` and `/TR` containers, deterministic refinement completes omitted blank
+grid cells, and row-span tracking prevents placeholder cells from being duplicated underneath a
+spanning header. veraPDF exposed that row-span defect even though the internal structure transcript
+was self-consistent; the corrected implementation has a dedicated PDF/UA regression.
+
+Two other general failures became regression cases. Incomplete first-model table coordinates are
+now reduced to ordinary proposal text so the independent reviewer can reconstruct the table from
+the page image, while malformed final-review table semantics still fail. Static-marker cleanup now
+preserves reviewed fraction and comparison speech instead of overwriting it with printed notation.
+The source-fidelity gate retains the 0.052 mean-difference limit at 150 DPI and permits 0.060 at
+72 DPI only while the sharper sample and the 0.25 material-difference limit also pass, accounting
+for low-resolution antialiasing of a visually inspected facsimile without weakening the sharper
+comparison.
+
+Concurrent jobs now update the ignored, unbounded recent-title history through an atomic,
+cross-platform lock and replace. The planner/reviewer table guidance explicitly distinguishes
+meaningful blank rosters, schedules, and matrices from ordinary aligned form fields and requires
+rectangular PDF/UA grids.
+
+All 33 form releases passed exact base-to-output rendering, sampled source fidelity, qpdf,
+canonical structure and transformation comparison, extraction compatibility, metadata checks,
+and veraPDF PDF/UA-1. The complete regression suite contains 62 passing tests after the batch.
+
+## 2026-07-30: Explicit AcroForm Tooltip Gate
+
+SiteImprove reported two unlabeled controls in a one-page doctoral supervisory committee form
+that already identified `llm-pdf-remediation 0.4.0` as its producer and passed veraPDF PDF/UA-1.
+Both controls had meaningful internal `/T` field names and associated `/Form` structure elements
+with `/Alt`, but their terminal field dictionaries had no `/TU`. SiteImprove correctly treated
+the internal name and structure alternate text as insufficient substitutes for the field tooltip.
+
+The project audit had collapsed these distinct values: `widget_description()` returned `/TU` or
+fell back to `/T`, and preflight counted that composite value. The PDF therefore reported zero
+missing descriptions. Because veraPDF passed, preflight selected byte-for-byte pass-through and
+never reached the compiler code that writes reviewed names. Output validation used the same
+fallback and the regression test explicitly preserved that false-negative expectation.
+
+Form snapshots now retain `/T`, terminal-field `/TU`, accessible-name source, terminal-field
+owner, and associated `/Form /Alt` separately. Pass-through requires both veraPDF PDF/UA-1 and the
+project form policy: every widget must resolve to a meaningful explicit terminal-field `/TU`, a
+nonempty `/Form /Alt`, and exact agreement between them. Instruction-only values such as
+`Required` are generic rather than valid standalone names. Compilation writes the reviewed name
+to the terminal field owner and uses the same value for `/Form /Alt`; validation compares both
+directly with the canonical plan.
+
+Proposal and review prompt version 18 requires form descriptions to identify their controls when
+announced independently, adds row or sequence context where needed, and rejects stale tooltips
+that describe the wrong control. Regression coverage includes a PDF/UA-valid two-widget form with
+meaningful `/T` names but missing `/TU`, a separate widget/terminal-field hierarchy, exact
+tooltip/structure agreement, pass-through rejection, and edit/save/reopen preservation. The
+complete suite contains 72 passing tests before rebuilding the reported form.
+
+The form was then rebuilt with proposal/review prompt version 18. All 25 widgets received
+context-specific terminal-field `/TU` values exactly matching their `/Form /Alt` labels; the
+output contained zero missing, generic, or mismatched form descriptions. Exact rendering,
+field-tree preservation, edit/save/reopen behavior, qpdf, canonical structure, extraction,
+metadata, and veraPDF PDF/UA-1 checks passed. SiteImprove subsequently reported no form-label
+error on the released PDF.
+
+**Decision:** ship the explicit AcroForm tooltip policy with the accumulated schema-v7,
+table/form, and compiler hardening as version 0.5.0.

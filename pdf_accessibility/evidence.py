@@ -14,6 +14,14 @@ class WordEvidence(BaseModel):
     text: str
 
 
+class FormWidgetEvidence(BaseModel):
+    widget_index: int = Field(ge=0)
+    name: str
+    tooltip: str
+    field_type: str
+    bbox: list[float] = Field(min_length=4, max_length=4)
+
+
 class PageEvidence(BaseModel):
     page_number: int
     width: float
@@ -23,6 +31,7 @@ class PageEvidence(BaseModel):
     ocr_text: str
     native_words: list[WordEvidence]
     ocr_words: list[WordEvidence]
+    form_widgets: list[FormWidgetEvidence] = Field(default_factory=list)
 
 
 class PlanningDiagnostics(BaseModel):
@@ -54,6 +63,21 @@ def evidence_from_packet(packet: PagePacket) -> PageEvidence:
         coordinate_space=CoordinateSpace.NORMALIZED,
         native_words=[normalized(word) for word in packet.native_words],
         ocr_words=[normalized(word) for word in packet.ocr_words],
+        form_widgets=[
+            FormWidgetEvidence(
+                widget_index=widget.widget_index,
+                name=widget.name,
+                tooltip=widget.tooltip,
+                field_type=widget.field_type,
+                bbox=[
+                    widget.bbox[0] / packet.width * 1000,
+                    widget.bbox[1] / packet.height * 1000,
+                    widget.bbox[2] / packet.width * 1000,
+                    widget.bbox[3] / packet.height * 1000,
+                ],
+            )
+            for widget in packet.form_widgets
+        ],
     )
 
 

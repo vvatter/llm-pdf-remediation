@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +28,7 @@ from .models import (
     ArtifactRecord,
     ElementRole,
     FindingCategory,
+    FormWidgetPlan,
     PagePlan,
     PageFlow,
     PageReview,
@@ -35,6 +37,7 @@ from .models import (
     ReviewStatus,
     ConfidenceProfile,
     TextFragment,
+    TableHeaderScope,
     TextTransformation,
     TransformationKind,
     exact_text_tokens,
@@ -42,8 +45,8 @@ from .models import (
 from .plans import load_document_plan, sha256_file, write_document_plan
 
 
-PLANNER_PROMPT_VERSION = "proposal-v8"
-REVIEW_PROMPT_VERSION = "review-v9"
+PLANNER_PROMPT_VERSION = "proposal-v18"
+REVIEW_PROMPT_VERSION = "review-v18"
 COMPATIBLE_PLANNER_PROMPT_VERSIONS = {PLANNER_PROMPT_VERSION}
 COMPATIBLE_REVIEW_PROMPT_VERSIONS = {REVIEW_PROMPT_VERSION}
 
@@ -58,6 +61,51 @@ the primary content title, H2 for peer sections under it, and H3 only for a subs
 nested beneath the preceding H2. Levels express hierarchy, not font size; do not skip a level or
 use H3 for a collection of fields. When no visible heading exists, keep the content as P rather
 than synthesizing one."""
+
+RUNNING_MATTER_GUIDANCE = """Classify text as running furniture only when repetition across pages
+or unmistakable document chrome supports that conclusion. Page position alone is not enough: a
+unique heading-like line near the top or bottom may introduce content that begins on the next page
+and must remain in the semantic flow. Treat an isolated page number as furniture, but do not omit
+an adjacent meaningful title merely because it shares the footer area."""
+
+FORM_GUIDANCE = """When interactive form-widget evidence is supplied, the compiler represents
+those controls separately as Form structure elements. Preserve their visible printed labels and
+instructions in the ordinary text plan, but do not transcribe an empty widget's border, checkbox,
+radio mark, choice area, signature box, or other appearance as a Unicode text character or Figure.
+Do not duplicate a widget's current value as ordinary page text. Return exactly one form_widgets
+entry for every supplied interactive widget, keyed by its widget_index. Its description must be a
+concise accessible name grounded in the visible label and purpose. The compiler writes this exact
+description to both the terminal field's /TU tooltip and its Form structure /Alt, so it must
+identify the control when announced by itself. Do not return an instruction-only label such as
+"Required", "Optional", "Enter", or "Select". Preserve an existing tooltip only when it
+independently and accurately identifies the field; combine a requirement or entry instruction with
+the visible field meaning when useful. Replace generic internal identifiers such as Text3, 10, or
+Check Box 2 with the visible field meaning, and correct a stale tooltip that describes the wrong
+row or control. Distinguish repeated controls with relevant visible row, column, option, or
+sequence context, without inventing a requirement or state. Widgets sharing one named terminal
+field must use the same field-level description. A similar-looking mark without widget evidence is
+a fixed, noninteractive form control. Preserve its label and option wording,
+but do not make a screen reader spell empty writing rules, repeated underscores, or hollow box and
+circle outlines. Omit those purely visual blank markers with an exact declared transformation,
+without implying that an unmarked choice was selected. Preserve a marker only when it conveys a
+supported state or meaning beyond identifying the blank."""
+
+TABLE_GUIDANCE = """Use TH and TD only for a genuine two-dimensional data table whose row or
+column relationships carry meaning. Do not turn ordinary aligned prose, multiple columns, a list,
+or a collection of form labels and blank fields into a table merely because it uses a grid or
+tabular spacing. A repeated roster, schedule, comparison matrix, or similar layout can still be a
+genuine table when visible row or column headers establish meaningful relationships, even when
+some or all data-entry cells are blank; distinguish that from a nonrepeated collection of unrelated
+form fields. For every genuine table cell, provide one shared table_id plus zero-based
+table_row and table_column coordinates, and return cells consecutively in row-major order. Use TH
+for visible row or column headers and set header_scope to Row or Column; use TD for data cells.
+Record table_row_span or table_column_span only for a cell that visibly spans multiple rows or
+columns. A genuinely blank data cell in such a table may be an empty TD with its bbox and table
+coordinates but no visible fragments or invented spoken text; do not emit empty TH elements. Do
+not invent text for an empty corner cell. Include every structurally required blank TD—including
+empty corner cells—so each logical row spans the same number of columns as required by PDF/UA.
+Keep a caption or title outside the table with its
+appropriate ordinary role."""
 
 PROPOSAL_SYSTEM_PROMPT = f"""You propose an accessibility transcription and semantic plan for a
 historical fixed-layout PDF page. The printed page is the historical source of record. Preserve
@@ -84,6 +132,9 @@ Use DocumentTitle once on the first page for the visible overall document or pub
 use P for body copy, bylines, quotations, contents entries, captions, and other meaningful text;
 LI for each item in a genuine list; and Figure for meaningful graphics with concise alt text.
 {HEADING_GUIDANCE}
+{RUNNING_MATTER_GUIDANCE}
+{FORM_GUIDANCE}
+{TABLE_GUIDANCE}
 
 A recipient, participant, officer, or similar explicit roster should use one consecutive LI
 element per logical item, whether its items are line-separated or compactly comma-separated. Give
@@ -112,8 +163,9 @@ DocumentTitle element. Choose a concise title with an eye toward how informative
 it would be in a browser tab or search result. Use only context supported by the page. A date,
 organization, document type, issue, or subject may help, but do not mechanically include every
 available field, keyword-stuff, or make the title long. Recent titles in the user prompt are style
-and consistency context only; follow relevant examples and ignore unrelated ones. On other pages,
-leave document_title_candidate null."""
+and consistency context only; follow relevant examples and ignore unrelated ones. When the printed
+title is generic, use a concise visible purpose or subject from nearby instructions to disambiguate
+the metadata title. On other pages, leave document_title_candidate null."""
 
 REVIEW_SYSTEM_PROMPT = f"""You are the independent final semantic reviewer for a historical PDF
 accessibility plan. The page image and printed content are authoritative. Evidence text may be
@@ -125,6 +177,8 @@ including critical findings, are advisories: always choose a canonical result an
 critical severity only for a defect or unresolved uncertainty that remains in the canonical result
 and should block release. If the canonical result resolves an error found in the proposal, record
 that correction as warning or info rather than critical.
+{FORM_GUIDANCE}
+{TABLE_GUIDANCE}
 For mathematics, preserve exact printed notation in visible_text, put a semantic spoken
 equivalent in accessible_text, and record every complete inline expression as one atomic
 formula_spoken_equivalent transformation. Never split formula speech into character-level or
@@ -139,8 +193,11 @@ manufacture a list from comma-separated prose or an isolated unmarked entry. On 
 masthead, keep any epigraph or attributed quotation after
 publication and issue metadata and before the first article heading. Independently review the
 page-1 document_title_candidate for concise search-result usefulness and consistency with relevant
-recent titles; it is metadata, not a transcription, and must not be copied into visible text.
-{HEADING_GUIDANCE}"""
+recent titles; it is metadata, not a transcription, and must not be copied into visible text. When
+the printed title is generic, use a concise visible purpose or subject from nearby instructions to
+disambiguate the metadata title.
+{HEADING_GUIDANCE}
+{RUNNING_MATTER_GUIDANCE}"""
 
 
 class ModelPageElement(BaseModel):
@@ -150,6 +207,12 @@ class ModelPageElement(BaseModel):
     accessible_text: str
     transformations: list[TextTransformation] = Field(default_factory=list)
     alt_text: str | None = None
+    table_id: str | None = None
+    table_row: int | None = Field(default=None, ge=0)
+    table_column: int | None = Field(default=None, ge=0)
+    table_row_span: int | None = Field(default=None, ge=1)
+    table_column_span: int | None = Field(default=None, ge=1)
+    header_scope: TableHeaderScope | None = None
     bbox: list[float] = Field(min_length=4, max_length=4)
     confidence: ConfidenceProfile
     findings: list[ReviewFinding] = Field(default_factory=list)
@@ -160,6 +223,7 @@ class ModelPagePlan(BaseModel):
     document_title_candidate: str | None = Field(default=None, max_length=240)
     coordinate_space: Literal["normalized_0_1000"] = "normalized_0_1000"
     elements: list[ModelPageElement]
+    form_widgets: list[FormWidgetPlan] = Field(default_factory=list)
     flows: list[PageFlow] = Field(default_factory=list)
     page_ambiguities: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
@@ -175,30 +239,79 @@ class ReviewDecision(BaseModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
 
 
-def _validated_page_plan(page_data: dict, page_number: int) -> PagePlan:
+def _validated_page_plan(
+    page_data: dict,
+    page_number: int,
+    *,
+    recover_incomplete_tables: bool = False,
+) -> PagePlan:
     page_data["page_number"] = page_number
     try:
         return PagePlan.model_validate(page_data)
     except ValidationError as error:
-        if not error.errors() or any(
-            "flow" not in str(item.get("msg", "")).lower()
-            for item in error.errors()
+        errors = error.errors()
+        messages = [str(item.get("msg", "")).lower() for item in errors]
+        if (
+            not errors
+            or (any("table" in message for message in messages) and not recover_incomplete_tables)
+            or any(
+                "flow" not in message and "table" not in message
+                for message in messages
+            )
         ):
             raise
-    normalized = dict(page_data)
-    normalized["flows"] = []
+    normalized = deepcopy(page_data)
+    repaired_tables = any("table" in message for message in messages)
+    repaired_flows = any("flow" in message for message in messages)
+    if repaired_tables:
+        ordinary_elements: list[dict] = []
+        for element in normalized.get("elements", []):
+            role = element.get("role")
+            if role in {ElementRole.TH, ElementRole.TD, "TH", "TD"}:
+                visible_text = str(element.get("visible_text") or "")
+                accessible_text = str(element.get("accessible_text") or "")
+                if not visible_text.strip() and not accessible_text.strip():
+                    continue
+                element["role"] = ElementRole.P
+            for key in (
+                "table_id",
+                "table_row",
+                "table_column",
+                "table_row_span",
+                "table_column_span",
+                "header_scope",
+            ):
+                element[key] = None
+            ordinary_elements.append(element)
+        normalized["elements"] = ordinary_elements
+    if repaired_flows:
+        normalized["flows"] = []
     page = PagePlan.model_validate(normalized)
-    page.findings.append(
-        ReviewFinding(
-            severity=ReviewSeverity.INFO,
-            category=FindingCategory.READING_ORDER,
-            message=(
-                "Model flow grouping was inconsistent with semantic element order; "
-                "the deterministic parser rebuilt a single ordered page flow."
-            ),
-            chosen="Semantic element and fragment order.",
+    if repaired_tables:
+        page.findings.append(
+            ReviewFinding(
+                severity=ReviewSeverity.WARNING,
+                category=FindingCategory.SEMANTIC_ROLE,
+                message=(
+                    "The proposal supplied incomplete or inconsistent table semantics; "
+                    "the parser retained its nonempty cell text as paragraphs so the "
+                    "independent reviewer can reconstruct the table from the page image."
+                ),
+                chosen="Reviewer must determine complete table structure from visible evidence.",
+            )
         )
-    )
+    if repaired_flows:
+        page.findings.append(
+            ReviewFinding(
+                severity=ReviewSeverity.INFO,
+                category=FindingCategory.READING_ORDER,
+                message=(
+                    "Model flow grouping was inconsistent with semantic element order; "
+                    "the deterministic parser rebuilt a single ordered page flow."
+                ),
+                chosen="Semantic element and fragment order.",
+            )
+        )
     return page
 
 
@@ -219,6 +332,17 @@ def _page_prompt(
     recent_titles: list[str] | None = None,
 ) -> str:
     title_context = _recent_title_context(packet.page_number, recent_titles)
+    form_context = (
+        "\nINTERACTIVE FORM WIDGETS (normalized bbox coordinates; controls are tagged separately):\n"
+        + json.dumps(
+            [widget.model_dump(mode="json") for widget in evidence.form_widgets],
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n"
+        if evidence.form_widgets
+        else ""
+    )
     return f"""Analyze page {packet.page_number}, size {packet.width:.1f} by {packet.height:.1f} points.
 
 NATIVE EVIDENCE (advisory):
@@ -226,6 +350,7 @@ NATIVE EVIDENCE (advisory):
 
 OCR EVIDENCE (advisory):
 {evidence.ocr_text or '(none)'}
+{form_context}
 {title_context}
 """
 
@@ -259,7 +384,11 @@ def propose_page(
     if response.output_parsed is None:
         raise RuntimeError(f"{model} returned no parsed proposal for page {packet.page_number}")
     page_data = response.output_parsed.model_dump()
-    page = _validated_page_plan(page_data, packet.page_number)
+    page = _validated_page_plan(
+        page_data,
+        packet.page_number,
+        recover_incomplete_tables=True,
+    )
     page.review_status = ReviewStatus.PROPOSAL
     for element in page.elements:
         element.review_status = ReviewStatus.PROPOSAL
@@ -294,7 +423,10 @@ def review_page(
                             f"Native word count: {len(evidence.native_words)}\n"
                             f"OCR word count: {len(evidence.ocr_words)}\n"
                             f"NATIVE TEXT:\n{evidence.native_text or '(none)'}\n\n"
-                            f"OCR TEXT:\n{evidence.ocr_text or '(none)'}"
+                            f"OCR TEXT:\n{evidence.ocr_text or '(none)'}\n\n"
+                            "INTERACTIVE FORM WIDGETS (normalized bbox coordinates; "
+                            "controls are tagged separately):\n"
+                            f"{json.dumps([widget.model_dump(mode='json') for widget in evidence.form_widgets], ensure_ascii=False, indent=2) if evidence.form_widgets else '(none)'}"
                             f"{_recent_title_context(packet.page_number, recent_titles)}"
                         ),
                     },
