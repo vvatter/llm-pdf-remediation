@@ -584,6 +584,7 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
                     )
                     child_role = str(content_item.get("/S", ""))
                     child_alt = str(content_item.get("/Alt", ""))
+                    child_actual_text = str(content_item.get("/ActualText", ""))
                     if child_role == "/Formula" and not child_alt.strip():
                         errors.append(
                             f"structure element {logical_index} has a Formula child without alternate text"
@@ -600,6 +601,7 @@ def serialize_structure_tree(pdf_path: Path) -> dict[str, object]:
                             "role": child_role,
                             "text": "".join(child_chunks),
                             "alt_text": child_alt,
+                            "actual_text": child_actual_text,
                             "bbox": bbox,
                             "mcrs": child_mcrs,
                         }
@@ -853,7 +855,7 @@ def compare_structure_to_plan(serialized: dict[str, object], plan: DocumentPlan)
     cursor = 0
     for index, element in enumerate(expected):
         expected_role = EXPECTED_PDF_ROLES[element.role]
-        expected_text = "" if element.role == ElementRole.FIGURE else element.extraction_text
+        expected_text = "" if element.role == ElementRole.FIGURE else element.accessible_text
         if element.role == ElementRole.FIGURE:
             records = actual[cursor : cursor + 1]
             cursor += len(records)
@@ -896,13 +898,17 @@ def compare_structure_to_plan(serialized: dict[str, object], plan: DocumentPlan)
         for formula_index, (actual_formula, expected_formula) in enumerate(
             zip(actual_formulae, expected_formulae)
         ):
-            if actual_formula.get("text") != expected_formula.text:
+            if actual_formula.get("text") != expected_formula.alt_text:
                 errors.append(
-                    f"element {index} formula {formula_index} notation does not match canonical plan"
+                    f"element {index} formula {formula_index} ActualText does not match canonical speech"
                 )
             if actual_formula.get("alt_text") != expected_formula.alt_text:
                 errors.append(
                     f"element {index} formula {formula_index} alternate text does not match canonical plan"
+                )
+            if actual_formula.get("actual_text") != expected_formula.alt_text:
+                errors.append(
+                    f"element {index} formula {formula_index} structure ActualText does not match canonical speech"
                 )
         if (
             element.role == ElementRole.FIGURE
@@ -984,7 +990,7 @@ def _extraction_compatibility(
         check=False,
     )
     expected_text = "\n".join(
-        element.extraction_text
+        element.accessible_text
         for page in plan.pages
         for element in page.elements
         if element.role != ElementRole.FIGURE

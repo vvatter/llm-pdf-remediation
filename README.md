@@ -155,10 +155,12 @@ equality, qpdf integrity, every MCID and ParentTree relationship, and an exact
 element-by-element structure-tree transcript. It also proves that exact transformation
 spans reconstruct the accessible text, checks that every visual block has one ordered
 flow owner and block-local geometry, and requires `pdftotext -raw` to agree with the
-copy/search transcript without duplication. Inline mathematical notation remains
-extractable while each reviewed formula receives a separate spoken alternative in a
-`Formula` structure element. Formula rewrites that cannot be mapped atomically to the
-printed notation block release. Text elements use the explicit semantic line boundaries
+reader-facing transcript without duplication. Each reviewed inline formula emits its
+spoken equivalent directly in the marked-content Unicode run and as both `/Alt` and
+`/ActualText` on its `Formula` structure element. This makes speech-first readers that ignore
+Formula semantics announce fractions and other notation intelligibly; copying a formula therefore
+returns the reviewed speech rather than its visual glyph sequence. Formula rewrites that
+cannot be mapped atomically to the printed notation block release. Text elements use the explicit semantic line boundaries
 in the reviewed transcript rather than the printed line positions, so ordinary visual
 wrapping does not become hard wrapping in copy/paste. The selected base is compared with the
 original at 72 and 150 DPI, and the final PDF must match that base exactly. Only a

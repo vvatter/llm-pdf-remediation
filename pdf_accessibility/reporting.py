@@ -305,7 +305,7 @@ def build_manifest(
         "compiler_strategy": {
             "marked_content_granularity": "visual_region_with_inline_formula_mcids",
             "unicode_text_strategy": "one_direct_unicode_run_per_semantic_line",
-            "actual_text_strategy": "exceptional_character_fallback_only",
+            "actual_text_strategy": "formula_structure_speech_and_exceptional_character_fallback",
             "paragraph_copy_strategy": "canonical_semantic_lines_without_visual_wraps",
             "geometry_alignment": "block_local_with_ocr_line_identity",
             "structure_regions": "direct_visual_regions_integer_mcids",
@@ -315,7 +315,7 @@ def build_manifest(
             "content_stream_scope": "visual_region",
             "figure_proxy": "nonpainting_geometry_with_structural_alt",
             "layout_attributes": "word_union_bbox",
-            "formula_strategy": "extractable_notation_with_structural_spoken_alt",
+            "formula_strategy": "direct_spoken_unicode_with_structural_alt_and_actualtext",
             "parent_tree_granularity": "visual_region_and_inline_formula",
             "target_reader_profile": "acrobat",
         },

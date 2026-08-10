@@ -989,7 +989,7 @@ class CompileTests(unittest.TestCase):
 
             self.assertIn("● ○ Full and open circles", extracted)
 
-    def test_inline_formula_preserves_notation_and_has_spoken_alt(self) -> None:
+    def test_inline_formula_uses_spoken_actual_text_and_structural_alt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.pdf"
             output = Path(temp) / "output.pdf"
@@ -1069,10 +1069,10 @@ class CompileTests(unittest.TestCase):
                 text=True,
                 check=True,
             ).stdout
-            self.assertIn("p = p₁p₂...pₙ ∈ Sₙ", extracted)
-            self.assertIn("pᵢ₁ < pᵢ₂ < ... < pᵢₖ", extracted)
-            self.assertNotIn("subscript", extracted)
-            self.assertEqual(extracted.strip(), extraction_text)
+            self.assertIn("p subscript 1", extracted)
+            self.assertIn("symmetric group S subscript n", extracted)
+            self.assertNotIn("p₁p₂", extracted)
+            self.assertEqual(extracted.strip(), accessible)
 
             serialized = serialize_structure_tree(output)
             self.assertEqual(compare_structure_to_plan(serialized, plan), [])
@@ -1083,12 +1083,69 @@ class CompileTests(unittest.TestCase):
             ]
             self.assertEqual(
                 [block["text"] for block in formula_blocks],
-                extracted_formulae,
+                [item[1] for item in formulae],
             )
             self.assertEqual(
                 [block["alt_text"] for block in formula_blocks],
                 [item[1] for item in formulae],
             )
+            self.assertEqual(
+                [block["actual_text"] for block in formula_blocks],
+                [item[1] for item in formulae],
+            )
+
+    def test_stacked_fraction_uses_reviewed_speech_in_plain_text_readers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.pdf"
+            output = Path(temp) / "output.pdf"
+            document = pymupdf.open()
+            document.new_page(width=300, height=150)
+            document.save(source)
+            document.close()
+
+            visible = "The fraction ²⁄₁₁."
+            accessible = "The fraction two elevenths."
+            paragraph = PageElement(
+                role=ElementRole.P,
+                visible_text=visible,
+                accessible_text=accessible,
+                transformations=[
+                    TextTransformation(
+                        kind=TransformationKind.FORMULA_SPOKEN_EQUIVALENT,
+                        source_text="²⁄₁₁",
+                        replacement_text="two elevenths",
+                        rationale="Reviewed spoken fraction.",
+                    )
+                ],
+                bbox=[100, 100, 900, 300],
+            )
+            canonicalize_transformations(paragraph)
+            plan = DocumentPlan(
+                source_file=source.name,
+                title="Fraction",
+                pages=[PagePlan(page_number=1, elements=[paragraph])],
+            )
+
+            compile_tagged_pdf(source, output, plan)
+
+            extracted = subprocess.run(
+                ["pdftotext", "-raw", "-enc", "UTF-8", str(output), "-"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertEqual(extracted.strip(), accessible)
+            serialized = serialize_structure_tree(output)
+            self.assertEqual(compare_structure_to_plan(serialized, plan), [])
+            formula = serialized["elements"][0]["blocks"][0]
+            self.assertEqual(formula["text"], "two elevenths")
+            self.assertEqual(formula["alt_text"], "two elevenths")
+            self.assertEqual(formula["actual_text"], "two elevenths")
+            with pikepdf.Pdf.open(output) as pdf:
+                formula_stream = pdf.pages[0].Contents[-1].read_bytes()
+            encoded_speech = "two elevenths".encode("utf-16-be").hex().upper().encode()
+            self.assertIn(encoded_speech, formula_stream)
+            self.assertNotIn(b"/ActualText", formula_stream)
 
     def test_structure_comparison_uses_emitted_nonempty_regions(self) -> None:
         paragraph = PageElement(

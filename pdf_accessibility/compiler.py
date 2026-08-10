@@ -424,7 +424,8 @@ def _make_anchor_font(pdf: pikepdf.Pdf, plan: DocumentPlan) -> AnchorFont:
         ord(character)
         for page in plan.pages
         for element in page.elements
-        for character in element.extraction_text
+        for text in (element.extraction_text, element.accessible_text)
+        for character in text
         if ord(character) <= 0xFFFF
     }
     fallback = ord("?")
@@ -1684,8 +1685,17 @@ def _anchor_stream(
 
     commands: list[str] = ["BT"]
     for line_index, line in enumerate(region.lines):
+        line_segments = [
+            item for item in region.segments if item.line_index == line_index
+        ]
+        reader_line = "".join(
+            (segment.formula_alt or "")
+            if segment.formula_index is not None
+            else "".join(chunk.text for chunk in segment.chunks)
+            for segment in line_segments
+        )
         direct_line = _direct_unicode_text(
-            line.text, anchor_font.supported_codepoints
+            reader_line, anchor_font.supported_codepoints
         )
         x0, y0, x1, y1 = line.bbox
         font_size, horizontal_scale = _anchor_text_metrics(
@@ -1696,30 +1706,34 @@ def _anchor_stream(
             f"/A11yAnchor {font_size:.3f} Tf 3 Tr {horizontal_scale:.3f} Tz "
             f"1 0 0 1 {x0:.3f} {baseline:.3f} Tm"
         )
-        for segment in (
-            item for item in region.segments if item.line_index == line_index
-        ):
+        for segment in line_segments:
             exact_text = "".join(chunk.text for chunk in segment.chunks)
+            reader_text = (
+                segment.formula_alt or ""
+                if segment.formula_index is not None
+                else exact_text
+            )
             direct_text = _direct_unicode_text(
-                exact_text, anchor_font.supported_codepoints
+                reader_text, anchor_font.supported_codepoints
             )
             properties = f"/MCID {segment.mcid}"
-            if direct_text != exact_text:
-                actual_text = b"\xfe\xff" + exact_text.encode("utf-16-be")
-                properties += f" /ActualText <{actual_text.hex().upper()}>"
+            replacement_text = reader_text if direct_text != reader_text else ""
             content_role = (
                 Name("/Formula")
-                if segment.formula_alt
+                if segment.formula_index is not None
                 else ROLE_NAMES[region.element.role]
             )
             encoded = direct_text.encode("utf-16-be")
-            commands.extend(
-                [
-                    f"{content_role} <<{properties}>> BDC",
-                    f"<{encoded.hex().upper()}> Tj",
-                    "EMC",
-                ]
-            )
+            commands.append(f"{content_role} <<{properties}>> BDC")
+            if replacement_text:
+                actual_text = b"\xfe\xff" + replacement_text.encode("utf-16-be")
+                commands.append(
+                    f"/Span <</ActualText <{actual_text.hex().upper()}>>> BDC"
+                )
+            commands.append(f"<{encoded.hex().upper()}> Tj")
+            if replacement_text:
+                commands.append("EMC")
+            commands.append("EMC")
     commands.append("ET")
     return ("\n".join(commands) + "\n").encode("ascii")
 
@@ -1852,6 +1866,10 @@ def _make_role_element(
                 if len(segments) == 1
                 else Array([segment.mcid for segment in segments])
             )
+            formula_alt = next(
+                (segment.formula_alt for segment in segments if segment.formula_alt),
+                "",
+            )
             formula = pdf.make_indirect(
                 Dictionary(
                     Type=Name.StructElem,
@@ -1859,7 +1877,8 @@ def _make_role_element(
                     P=role_element,
                     Pg=page_obj,
                     K=formula_content,
-                    Alt=String(segments[0].formula_alt or ""),
+                    Alt=String(formula_alt),
+                    ActualText=String(formula_alt),
                 )
             )
             formula_boxes = [
@@ -2116,11 +2135,19 @@ def compile_tagged_pdf(
                             )
                             next_region_mcid += 1
                         else:
+                            announced_formula_indices: set[int] = set()
                             for line_index, line in enumerate(lines):
                                 for formula_index, grouped_chunks in groupby(
                                     line.chunks, key=lambda chunk: chunk.formula_index
                                 ):
                                     segment_chunks = list(grouped_chunks)
+                                    formula_alt = None
+                                    if (
+                                        formula_index is not None
+                                        and formula_index not in announced_formula_indices
+                                    ):
+                                        formula_alt = segment_chunks[0].formula_alt
+                                        announced_formula_indices.add(formula_index)
                                     segments.append(
                                         StructureSegment(
                                             element=candidate.element,
@@ -2129,11 +2156,7 @@ def compile_tagged_pdf(
                                             mcid=next_region_mcid,
                                             line_index=line_index,
                                             formula_index=formula_index,
-                                            formula_alt=(
-                                                segment_chunks[0].formula_alt
-                                                if formula_index is not None
-                                                else None
-                                            ),
+                                            formula_alt=formula_alt,
                                         )
                                     )
                                     next_region_mcid += 1

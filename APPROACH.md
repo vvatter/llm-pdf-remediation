@@ -239,14 +239,16 @@ It:
 - emits one semantic marked-content sequence and MCID per connected visual region;
 - emits each reviewed visual region as a separate page content stream containing one
   invisible `BT`/`ET` text object;
-- preserves normalized mathematical notation in the copy/search layer while wrapping
-  each exact inline expression in a `/Formula` child with the independently reviewed
-  spoken alternative in `/Alt`; formula and prose segments share the same logical line
-  so Formula boundaries do not introduce extraction breaks;
+- retains normalized mathematical notation internally for source alignment while emitting
+  each exact inline expression's independently reviewed spoken equivalent directly in its
+  invisible Unicode run; its `/Formula` child carries the same speech in both `/Alt` and
+  `/ActualText`. Formula and prose segments share the same logical line so Formula boundaries
+  do not introduce extraction breaks. Copying a formula returns its reviewed speech because
+  simpler readers such as Preview may ignore Formula structure semantics;
 - maps tab and newline controls as zero-width Unicode codes so exact joiners remain
   direct text rather than region-wide replacements;
-- uses `/ActualText` only as a fallback when the embedded font cannot represent an
-  exceptional character;
+- uses structure-level `/ActualText` for reviewed formula speech and marked-content
+  `/ActualText` as a fallback when the embedded font cannot represent an exceptional character;
 - creates headings, figures, and single-block paragraphs directly under `/Document`;
 - groups consecutive list items as `/L` containers with `/LI` and `/LBody` descendants;
 - groups reviewed table cells into `/Table` and `/TR` containers, with scoped `/TH`, `/TD`,
@@ -316,8 +318,8 @@ The draft deliberately omits the PDF/UA identification metadata. Validation then
    back to `/ActualText` where explicitly present.
 7. Verifies every ParentTree entry and detects missing, duplicate, or orphan MCIDs.
 8. Requires nonempty text elements and alternate text for figures and formulas.
-9. Compares role, exact extractable notation, formula alternatives, and element text
-   with the canonical plan.
+9. Compares role, exact reader-facing text, and both formula `/Alt` and `/ActualText`
+   with the canonical spoken equivalents.
 10. Compares table grids, header scopes, and spans and verifies the source/output form
     field tree, every terminal field `/TU`, every widget's `/Form /Alt`, and their exact
     agreement with the reviewed canonical description.

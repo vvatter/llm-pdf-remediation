@@ -170,7 +170,7 @@ class TextTransformation(BaseModel):
 
 @dataclass(frozen=True)
 class FormulaSpan:
-    """Notation retained for extraction plus its reviewed spoken alternative."""
+    """Printed notation used for placement plus its reviewed spoken alternative."""
 
     start: int
     end: int
@@ -429,7 +429,7 @@ class PageElement(BaseModel):
 
     @property
     def extraction_text(self) -> str:
-        """Text used for search/copy; math notation is not replaced by speech."""
+        """Notation-bearing transcript used to align the invisible text layer."""
         if self.role == ElementRole.FIGURE:
             return ""
         ordered = self._exact_transformations()
@@ -454,7 +454,7 @@ class PageElement(BaseModel):
 
     @property
     def formula_spans(self) -> list[FormulaSpan]:
-        """Return exact formula ranges in extraction_text with reviewed speech."""
+        """Return exact formula ranges in the alignment transcript with reviewed speech."""
         ordered = self._exact_transformations()
         if ordered is None:
             return []

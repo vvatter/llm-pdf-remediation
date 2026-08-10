@@ -1373,3 +1373,24 @@ error on the released PDF.
 
 **Decision:** ship the explicit AcroForm tooltip policy with the accumulated schema-v7,
 table/form, and compiler hardening as version 0.5.0.
+
+## 2026-08-10: Formula Speech for Plain-Text Readers
+
+A slope worksheet exposed a compatibility failure in the inline-mathematics strategy. The
+canonical plan correctly described `²⁄₁₁` as “two elevenths,” and the PDF contained that speech
+in the `/Formula /Alt`, but Preview's read-aloud feature ignored the structure alternative and
+announced the invisible notation glyphs as “211.” A structurally correct alternate was therefore
+not sufficient for the actual reader environment.
+
+Formula MCIDs now emit the reviewed spoken equivalent directly in their invisible Unicode run.
+The `/Formula` structure element retains `/Alt` and also carries the same value in structure-level
+`/ActualText`. Plain-text extraction and readers that ignore Formula semantics now receive the
+reviewed speech, while the printed page remains unchanged and the notation-bearing transcript
+remains available internally for exact alignment. Direct Unicode is necessary because macOS
+PDFKit, like Preview, ignores marked-content `/ActualText` during ordinary page-text extraction.
+Copying a formula consequently yields speech such as “two elevenths”; this deliberate tradeoff
+prioritizes intelligible access over reproducing fragile superscript/subscript glyph sequences.
+
+Validation now requires the extracted formula text, structural `/Alt`, and structural
+`/ActualText` all to equal the canonical spoken alternative. Regression coverage includes a
+stacked fraction and the existing multi-expression permutation example.
